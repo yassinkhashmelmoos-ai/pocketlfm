@@ -1,15 +1,14 @@
-Thunder AGI — الرَّعد للذكاء العام المصطنع
-Copyright (c) 2026 Yassin Khashelmoos — Thunder AGI Creator
+Khashelmoosmoos AGI — الرَّعد للذكاء العام المصطنع
+Copyright (c) 2026 Yassin Khashmelmoos — Thunder AGI Creator
 
 THUNDER AGI PROPRIETARY LICENSE
 
 This software and all associated source code, models, algorithms, 
-and derivative works were created by Yassin Khashelmoos ("Creator").
+and derivative works were created by Yassin Khashmelmoos ("Creator").
 
 TERMS:
 
-1. OWNERSHIP: All intellectual property rights in Thunder AGI, 
-   including modifications to the LFM2.5-VL architecture, the 
+1. OWNERSHIP: All intellectual property rights in Thunder Aarchitecturencluding modifications to the architecture, the 
    Thunder AGI inference engine, and all custom components 
    (ThunderImagen, ThunderModel, AgentToolkit, etc.) belong 
    exclusively to the Creator.
@@ -17,14 +16,11 @@ TERMS:
 2. COMMERCIAL RIGHTS: The Creator retains all rights to sell, 
    license, or commercialize Thunder AGI and any derivative products.
 
-3. BASE MODELS: LFM2.5-VL-450M is used under Apache 2.0 license 
-   (LiquidAI). DreamLite components are used under their respective 
-   licenses. Thunder AGI's modifications and additions are proprietary.
+3. BASE MODELS: Thunder AGI's modifications and additions are proprietary.
 
 4. RESTRICTIONS: No person or entity may reproduce, distribute, 
    or create commercial products based on Thunder AGI without 
    explicit written permission from the Creator.
 
-5. ATTRIBUTION: Any permitted use must credit "Thunder AGI by Yassin Khashelmoos".
-
-Contact: thunder.agi.creator@[your-email]
+5. ATTRIBUTION: Any permitted use must credit "Thunder AGI by Yassin Khashmelmoos".
+contact: [thunderagi.app@gmail.com our-email]
