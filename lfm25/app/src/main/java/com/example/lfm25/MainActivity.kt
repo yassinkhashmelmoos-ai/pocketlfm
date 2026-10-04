@@ -51,7 +51,11 @@ class MainActivity : ComponentActivity() {
                         onSaveUserName       = vm::saveUserName,
                         onSaveSystemPrompt   = vm::saveSystemPrompt,
                         currentSystemPrompt  = vm::fetchSystemPrompt,
-                        onClearCrash         = vm::clearCrashLog
+                        onClearCrash         = vm::clearCrashLog,
+                        onToggleImageGen     = vm::toggleImageGen,
+                        onExportResponse     = vm::exportLastResponse,
+                        onExportConversation = vm::exportConversation,
+                        onClearExport        = vm::clearExportResult
                     )
                 }
             }
