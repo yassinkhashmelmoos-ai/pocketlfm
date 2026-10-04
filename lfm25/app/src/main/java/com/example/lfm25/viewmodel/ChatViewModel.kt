@@ -24,6 +24,8 @@ import com.example.lfm25.agent.AgentToolkit
 import com.example.lfm25.agent.CodeExecutor
 import com.example.lfm25.agent.CrashReporter
 import com.example.lfm25.agent.EmotionDetector
+import com.example.lfm25.agent.FileExporter
+import com.example.lfm25.imaging.ImageGenerator
 import com.example.lfm25.notification.UpdateNotificationListener
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -119,7 +121,10 @@ data class ChatUiState(
     val webSearchEnabled: Boolean = false,
     val userName: String = "You",
     val pendingImageUri: Uri? = null,
-    val crashLog: String? = null
+    val crashLog: String? = null,
+    val exportResult: com.example.lfm25.agent.FileExporter.ExportResult? = null,
+    val imageGenAvailable: Boolean = false,
+    val imageGenEnabled: Boolean = false
 )
 
 // ── ViewModel ─────────────────────────────────────────────────────────────────
@@ -139,7 +144,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val softPromptFile = File(application.filesDir, "soft_prompt_cache.txt")
     private val agentToolkit  = AgentToolkit(application)
     private val codeExecutor  = CodeExecutor(application)
-    private val crashReporter = CrashReporter.install(application)
+    private val crashReporter  = CrashReporter.install(application)
+    private val imageGenerator = ImageGenerator(application)
+    val fileExporter           = FileExporter(application)
     private val selfImprover  = SelfImprover(application)
     val peerSync = PeerSync(application)
     private var sessionJob: Job? = null
@@ -312,25 +319,61 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             try {
-                // Image generation request detection
+                // Agentic image generation — LFM decides when to generate
                 val lowerText = userText.lowercase()
-                if (_ui.value.webSearchEnabled &&
-                    lowerText.contains(Regex("generate|create|draw|make|show me|image of|picture of"))) {
-                    val imageSubject = userText
-                        .replace(Regex("generate|create|draw|make|show me a?n?|image of|picture of", RegexOption.IGNORE_CASE), "")
-                        .trim().take(100)
-                    if (imageSubject.length > 3) {
-                        val encoded = java.net.URLEncoder.encode(imageSubject, "UTF-8")
-                        val imageUrl = "https://image.pollinations.ai/prompt/$encoded?width=512&height=512&nologo=true"
-                        withContext(Dispatchers.Main) {
-                            val imageMsg = ChatMessage(
-                                content = "🎨 Generated: $imageSubject",
-                                isUser = false,
-                                mediaPath = imageUrl,
-                                mediaType = "image_url"
-                            )
-                            persistAndShow(imageMsg, sessionId)
+                val isImageRequest = _ui.value.imageGenEnabled ||
+                    lowerText.contains(Regex("generate|create|draw|make|paint|sketch|image of|picture of|show me a|visualize|render"))
+                val isEditRequest = isImageRequest &&
+                    lowerText.contains(Regex("edit|modify|change|update|alter|fix|image #\d+|picture #\d+"))
+
+                if (isImageRequest) {
+                    // Extract which image to edit if specified
+                    val editIdMatch = Regex("(?:image|picture) #(\d+)").find(lowerText)
+                    val editId = editIdMatch?.groupValues?.get(1)?.toIntOrNull()
+
+                    withContext(Dispatchers.Main) {
+                        _ui.update { s -> s.copy(messages = s.messages.map {
+                            if (it.isLoading) it.copy(thinkingStep = "🎨 Generating image…") else it
+                        })}
+                    }
+
+                    // Agentic retry loop (max 3 attempts)
+                    var attempts = 0
+                    var genResult: com.example.lfm25.imaging.ImageGenerator.GenerationResult? = null
+                    while (attempts < 3) {
+                        genResult = if (editId != null) {
+                            imageGenerator.editImage(editId, userText, _ui.value.webSearchEnabled)
+                        } else {
+                            val cleanPrompt = userText
+                                .replace(Regex("generate|create|draw|make|paint|image of|picture of|show me a?n?", RegexOption.IGNORE_CASE), "")
+                                .trim().ifBlank { userText }
+                            imageGenerator.generate(cleanPrompt, null, _ui.value.webSearchEnabled,
+                                progressCallback = { step, total ->
+                                    _ui.update { s -> s.copy(messages = s.messages.map {
+                                        if (it.isLoading) it.copy(thinkingStep = "🎨 Step $step/$total") else it
+                                    })}
+                                })
                         }
+                        if (genResult is com.example.lfm25.imaging.ImageGenerator.GenerationResult.Success) break
+                        attempts++
+                        Log.w("ChatViewModel", "Image gen attempt $attempts failed")
+                    }
+
+                    when (val r = genResult) {
+                        is com.example.lfm25.imaging.ImageGenerator.GenerationResult.Success -> {
+                            withContext(Dispatchers.IO) {
+                                persistAndShow(ChatMessage(
+                                    content = "🎨 Image #${r.imageId}: ${r.prompt} (${r.source})",
+                                    isUser = false,
+                                    mediaPath = r.imagePath,
+                                    mediaType = "image"
+                                ), sessionId)
+                            }
+                        }
+                        is com.example.lfm25.imaging.ImageGenerator.GenerationResult.Failure -> {
+                            Log.e("ChatViewModel", "Image gen failed after 3 attempts: ${r.reason}")
+                        }
+                        else -> {}
                     }
                 }
 
@@ -575,6 +618,43 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // ── Crash reporter ────────────────────────────────────────────────────────
 
     fun clearCrashLog() = _ui.update { it.copy(crashLog = null) }
+
+    fun exportLastResponse(format: FileExporter.ExportFormat = FileExporter.ExportFormat.TXT) {
+        val lastAI = _ui.value.messages.lastOrNull { !it.isUser && !it.isLoading } ?: run {
+            _ui.update { it.copy(snackbar = "No response to export") }; return
+        }
+        val lastUser = _ui.value.messages.takeWhile { it.id != lastAI.id }.lastOrNull { it.isUser }
+        viewModelScope.launch {
+            val result = fileExporter.exportResponse(lastAI.content, lastUser?.content ?: "", format)
+            if (result != null) {
+                _ui.update { it.copy(exportResult = result, snackbar = "✅ Saved as ${result.file.name}") }
+            } else {
+                _ui.update { it.copy(snackbar = "❌ Export failed") }
+            }
+        }
+    }
+
+    fun exportConversation() {
+        val sid = _ui.value.currentSessionId ?: return
+        val title = _ui.value.sessions.find { it.id == sid }?.title ?: "conversation"
+        val msgs = _ui.value.messages.map { Pair(it.isUser, it.content) }
+        viewModelScope.launch {
+            val result = fileExporter.exportConversation(msgs, title)
+            if (result != null) {
+                _ui.update { it.copy(exportResult = result, snackbar = "✅ Conversation exported") }
+            } else {
+                _ui.update { it.copy(snackbar = "❌ Export failed") }
+            }
+        }
+    }
+
+    fun clearExportResult() = _ui.update { it.copy(exportResult = null) }
+
+    fun toggleImageGen() = _ui.update { it.copy(imageGenEnabled = !it.imageGenEnabled) }
+
+    fun checkImageGenAvailable() {
+        _ui.update { it.copy(imageGenAvailable = imageGenerator.isDreamLiteAvailable()) }
+    }
 
     // ── Misc ──────────────────────────────────────────────────────────────────
 
