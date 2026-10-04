@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.lfm25"
+    namespace = "com.thunder.agi"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.example.lfm25"
+        applicationId = "com.thunder.agi"
         minSdk = 26
         targetSdk = 36
         versionCode = 1
