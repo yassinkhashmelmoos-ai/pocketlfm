@@ -1,6 +1,7 @@
 package com.example.lfm25.ui.components
 
 import android.Manifest
+import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -62,6 +63,10 @@ fun ChatScreen(
     onSaveSystemPrompt: (String) -> Unit,
     currentSystemPrompt: () -> String,
     onClearCrash: () -> Unit,
+    onToggleImageGen: () -> Unit,
+    onExportResponse: () -> Unit,
+    onExportConversation: () -> Unit,
+    onClearExport: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val listState     = rememberLazyListState()
@@ -86,6 +91,36 @@ fun ChatScreen(
 
     LaunchedEffect(uiState.snackbar) {
         uiState.snackbar?.let { snackbarHost.showSnackbar(it); onClearSnackbar() }
+    }
+
+    // Export result dialog
+    uiState.exportResult?.let { result ->
+        val ctx = LocalContext.current
+        AlertDialog(
+            onDismissRequest = onClearExport,
+            title = { Text("✅ Exported", color = ThunderWhite) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(result.file.name, color = ThunderElectric,
+                        style = MaterialTheme.typography.bodyMedium)
+                    Text("Size: ${result.sizeKb}KB • Format: ${result.format.extension.uppercase()}",
+                        color = ThunderGray, style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val intent = Intent(Intent.ACTION_SEND).apply {
+                        type = result.format.mimeType
+                        putExtra(Intent.EXTRA_STREAM, result.uri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    ctx.startActivity(Intent.createChooser(intent, "Share file"))
+                    onClearExport()
+                }) { Text("Share / Save", color = ThunderElectric) }
+            },
+            dismissButton = { TextButton(onClick = onClearExport) { Text("Close", color = ThunderGray) } },
+            containerColor = ThunderDeepBlue
+        )
     }
 
     // Crash reporter dialog
@@ -159,10 +194,21 @@ fun ChatScreen(
                     }
                 },
                 actions = {
+                    // Image generation toggle
+                    IconButton(onClick = onToggleImageGen) {
+                        Icon(Icons.Default.Image, "Image generation",
+                            tint = if (uiState.imageGenEnabled) ThunderPurple else ThunderGray)
+                    }
                     // Web search toggle
                     IconButton(onClick = onToggleWebSearch) {
                         Icon(Icons.Default.Search, "Web search",
                             tint = if (uiState.webSearchEnabled) ThunderElectric else ThunderGray)
+                    }
+                    // Export last response
+                    if (uiState.messages.any { !it.isUser && !it.isLoading }) {
+                        IconButton(onClick = onExportResponse) {
+                            Icon(Icons.Default.SaveAlt, "Export response", tint = ThunderGray)
+                        }
                     }
                     IconButton(onClick = onNewSession) {
                         Icon(Icons.Default.Add, "New chat", tint = ThunderGray)
