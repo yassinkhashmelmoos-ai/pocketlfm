@@ -82,7 +82,7 @@ static std::string trim_str(const std::string& s) {
 extern "C" {
 
 JNIEXPORT jboolean JNICALL
-Java_com_example_lfm25_llama_LlamaModel_nativeLoadModel(
+Java_com_example_thunder_agi_llama_ThunderModel_nativeLoadModel(
         JNIEnv* env, jclass, jstring model_path) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_loaded) { LOGI("Already loaded"); return JNI_TRUE; }
@@ -132,7 +132,7 @@ Java_com_example_lfm25_llama_LlamaModel_nativeLoadModel(
 }
 
 JNIEXPORT jstring JNICALL
-Java_com_example_lfm25_llama_LlamaModel_nativeGenerate(
+Java_com_example_thunder_agi_llama_ThunderModel_nativeGenerate(
         JNIEnv* env, jclass,
         jstring j_prompt,
         jfloat temperature, jfloat top_p, jint top_k,
@@ -239,14 +239,14 @@ Java_com_example_lfm25_llama_LlamaModel_nativeGenerate(
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_lfm25_llama_LlamaModel_nativeResetContext(JNIEnv*, jclass) {
+Java_com_example_thunder_agi_llama_ThunderModel_nativeResetContext(JNIEnv*, jclass) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_ctx) llama_memory_clear(llama_get_memory(g_ctx), true);
     LOGI("Context reset");
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_lfm25_llama_LlamaModel_nativeUnloadModel(JNIEnv*, jclass) {
+Java_com_example_thunder_agi_llama_ThunderModel_nativeUnloadModel(JNIEnv*, jclass) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_sampler) { llama_sampler_free(g_sampler); g_sampler = nullptr; }
     if (g_ctx)     { llama_free(g_ctx);             g_ctx     = nullptr; }
@@ -257,17 +257,17 @@ Java_com_example_lfm25_llama_LlamaModel_nativeUnloadModel(JNIEnv*, jclass) {
 }
 
 JNIEXPORT jstring JNICALL
-Java_com_example_lfm25_llama_LlamaModel_nativeGetSystemInfo(JNIEnv* env, jclass) {
+Java_com_example_thunder_agi_llama_ThunderModel_nativeGetSystemInfo(JNIEnv* env, jclass) {
     return env->NewStringUTF(llama_print_system_info());
 }
 
 JNIEXPORT jint JNICALL
-Java_com_example_lfm25_llama_LlamaModel_nativeGetContextSize(JNIEnv*, jclass) {
+Java_com_example_thunder_agi_llama_ThunderModel_nativeGetContextSize(JNIEnv*, jclass) {
     return g_ctx_size;
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_example_lfm25_llama_LlamaModel_nativeIsLoaded(JNIEnv*, jclass) {
+Java_com_example_thunder_agi_llama_ThunderModel_nativeIsLoaded(JNIEnv*, jclass) {
     return g_loaded ? JNI_TRUE : JNI_FALSE;
 }
 
