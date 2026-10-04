@@ -193,7 +193,7 @@ static SchemeVal eval(const std::string& expr) {
 extern "C" {
 
 JNIEXPORT jstring JNICALL
-Java_com_example_lfm25_agent_SchemeInterpreter_nativeEval(
+Java_com_example_thunder_agi_agent_SchemeInterpreter_nativeEval(
         JNIEnv* env, jclass, jstring code) {
     const char* c = env->GetStringUTFChars(code, nullptr);
     std::string script(c);
@@ -212,7 +212,7 @@ Java_com_example_lfm25_agent_SchemeInterpreter_nativeEval(
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_lfm25_agent_SchemeInterpreter_nativeDefine(
+Java_com_example_thunder_agi_agent_SchemeInterpreter_nativeDefine(
         JNIEnv* env, jclass, jstring name, jstring value) {
     const char* n = env->GetStringUTFChars(name, nullptr);
     const char* v = env->GetStringUTFChars(value, nullptr);
@@ -222,7 +222,7 @@ Java_com_example_lfm25_agent_SchemeInterpreter_nativeDefine(
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_lfm25_agent_SchemeInterpreter_nativeReset(JNIEnv*, jclass) {
+Java_com_example_thunder_agi_agent_SchemeInterpreter_nativeReset(JNIEnv*, jclass) {
     g_env.clear();
     g_output = "";
 }
