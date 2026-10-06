@@ -67,6 +67,9 @@ fun ChatScreen(
     onExportResponse: () -> Unit,
     onExportConversation: () -> Unit,
     onClearExport: () -> Unit,
+    onShowAbout: () -> Unit = {},
+    trialDaysRemaining: Long = -1L,
+    isAdmin: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     val listState     = rememberLazyListState()
