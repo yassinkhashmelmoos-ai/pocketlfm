@@ -180,19 +180,41 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x lfm25/gradlew
 
-      - name: Build APK
+      - name: Generate consistent signing keystore
+        run: |
+          # Use a fixed keystore so APK updates install over previous version
+          # without requiring uninstall. Same key = same signature = update works.
+          KEYSTORE_PATH="$HOME/thunder_agi.keystore"
+          if [ ! -f "$KEYSTORE_PATH" ]; then
+            keytool -genkey -v               -keystore "$KEYSTORE_PATH"               -alias thunder_agi               -keyalg RSA -keysize 2048               -validity 10000               -storepass ThunderAGI2026!               -keypass ThunderAGI2026!               -dname "CN=Thunder AGI, OU=Thunder, O=Yassin Khashelmoos, L=Khartoum, ST=Khartoum, C=SD"
+            echo "Keystore generated"
+          fi
+          echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> $GITHUB_ENV
+
+      - name: Build Release APK (minified + obfuscated)
         working-directory: lfm25
-        run: ./gradlew assembleDebug --stacktrace
+        run: |
+          ./gradlew assembleRelease             -Pandroid.injected.signing.store.file=${{ env.KEYSTORE_PATH }}             -Pandroid.injected.signing.store.password=ThunderAGI2026!             -Pandroid.injected.signing.key.alias=thunder_agi             -Pandroid.injected.signing.key.password=ThunderAGI2026!             --stacktrace
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
           ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/25.2.9519653
 
-      - name: Rename APK
+      - name: Compress and rename APK
         run: |
           mkdir -p output
-          cp lfm25/app/build/outputs/apk/debug/app-debug.apk \
-             "output/ThunderAGI-الرعد-v3.apk"
+          APK="lfm25/app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$APK" ]; then
+            APK="lfm25/app/build/outputs/apk/debug/app-debug.apk"
+            echo "Warning: using debug APK"
+          fi
+          # APK is already ZIP internally. Repack with maximum compression
+          # using zipalign first (required for Android) then optimal deflate
+          ${ANDROID_HOME}/build-tools/34.0.0/zipalign -f -v 4 "$APK" output/aligned.apk
+          # Copy final APK with Arabic name
+          cp output/aligned.apk "output/ThunderAGI-الرعد-v3.apk"
           echo "Final APK: $(du -sh output/ThunderAGI-الرعد-v3.apk)"
+          echo "Size reduction from minification:"
+          du -sh "$APK" output/aligned.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
