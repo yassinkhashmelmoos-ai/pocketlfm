@@ -62,6 +62,13 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+    // Large binary assets must be stored uncompressed in the APK.
+    // Android cannot memory-map compressed assets over 1 MB, and the
+    // installer rejects APKs where such entries are deflated.
+    androidResources {
+        noCompress += listOf("gguf", "zip", "onnx", "bin", "tflite")
+    }
+
     buildFeatures {
         compose = true
         buildConfig = true
