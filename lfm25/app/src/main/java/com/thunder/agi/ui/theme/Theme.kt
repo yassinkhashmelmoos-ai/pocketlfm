@@ -35,7 +35,7 @@ private val ThunderColorScheme = darkColorScheme(
 fun ThunderAGITheme(content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = ThunderColorScheme,
-        typography  = Typography,
+        typography  = androidx.compose.material3.Typography()
         content     = content
     )
 }
