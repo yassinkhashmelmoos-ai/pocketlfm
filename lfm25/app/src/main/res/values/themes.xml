@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-
-    <style name="Theme.Lfm25" parent="android:Theme.Material.Light.NoActionBar" />
+    <!-- Thunder AGI app theme - no action bar since we use Compose -->
+    <style name="Theme.ThunderAGI" parent="android:Theme.Material.Light.NoActionBar" />
 </resources>
