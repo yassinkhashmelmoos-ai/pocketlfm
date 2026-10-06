@@ -2,11 +2,11 @@
 
 **The most advanced on-device AI assistant for Android.**
 
-Created by **Yassin Khashelmoos**
+Created by **Yassin Khashmelmoos**
 
 ## Features
 
-- 🧠 **LFM2.5-VL-450M** — Hybrid recurrent + attention architecture, runs 100% offline
+- 🧠 Hybrid recurrent + attention architecture, runs 100% offline
 - 🎨 **ThunderImagen** — On-device image generation (Gemini-quality config)
 - 🔍 **Web-augmented AI** — Wikipedia, weather, dictionary, currency, DuckDuckGo
 - 💬 **Persistent sessions** — Full conversation history, never loses context
@@ -19,5 +19,5 @@ Created by **Yassin Khashelmoos**
 
 ## License
 
-Copyright (c) 2026 Yassin Khashelmoos. All rights reserved.
+Copyright (c) 2026 Yassin Khashmelmoos. All rights reserved.
 See [LICENSE](LICENSE) for full terms.
