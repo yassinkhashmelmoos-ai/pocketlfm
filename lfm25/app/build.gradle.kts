@@ -38,6 +38,13 @@ android {
         }
     }
 
+    androidResources {
+        // CRITICAL: large assets must NOT be compressed inside APK
+        // Android cannot install or mmap compressed assets > 1MB
+        // model.gguf (218MB) and any other large files need this
+        noCompress += listOf("gguf", "zip", "bin", "onnx", "tflite", "pb", "pt")
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -62,13 +69,6 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
-    // Large binary assets must be stored uncompressed in the APK.
-    // Android cannot memory-map compressed assets over 1 MB, and the
-    // installer rejects APKs where such entries are deflated.
-    androidResources {
-        noCompress += listOf("gguf", "zip", "onnx", "bin", "tflite")
-    }
-
     buildFeatures {
         compose = true
         buildConfig = true
