@@ -430,7 +430,8 @@ class ImageGenerator(private val context: Context) {
     // ── Self-improvement via SSIM comparison ──────────────────────────────────
 
     private fun launchSelfImprovementComparison(prompt: String, offlinePath: String) {
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob()).launch {
+        val scope = kotlinx.coroutines.CoroutineScope(Dispatchers.IO + kotlinx.coroutines.SupervisorJob())
+        scope.launch {
             try {
                 val onlineResult = this@ImageGenerator.generateOnlineSync(prompt)
                 if (onlineResult is GenerationResult.Success) {
