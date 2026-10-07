@@ -278,9 +278,14 @@ class ImageGenerator(private val context: Context) {
             val buf = java.nio.LongBuffer.wrap(tokens)
             val tensor = OnnxTensor.createTensor(onnxEnv, buf, longArrayOf(1, 77))
             val output = session.run(mapOf("input_ids" to tensor))
-            val result = (output[0].value as Array<Array<FloatArray>>)[0]
+            val rawOutput = output[0].value
             tensor.close()
-            result.flatMap { it.toList() }.toFloatArray()
+            @Suppress("UNCHECKED_CAST")
+            val arr3d = rawOutput as? Array<Array<FloatArray>>
+                ?: throw IllegalStateException(
+                    "Text encoder returned unexpected type: ${rawOutput?.javaClass?.simpleName}"
+                )
+            arr3d[0].flatMap { it.toList() }.toFloatArray()
         } catch (e: Exception) {
             Log.w(TAG, "Text encode error: ${e.message}")
             FloatArray(768) { (it.toFloat() / 768f) }
@@ -298,9 +303,9 @@ class ImageGenerator(private val context: Context) {
             val buffer = FloatBuffer.wrap(latent)
             val tensor = OnnxTensor.createTensor(onnxEnv, buffer, shape)
             val output = session.run(mapOf("latent_sample" to tensor))
-            val pixels = (output[0].value as Array<Array<FloatArray>>)
+            val rawOutput = output[0].value
             tensor.close()
-            pixelArrayToBitmap(pixels)
+            pixelArrayToBitmap(onnxOutputToPixelArray(rawOutput))
         } catch (e: Exception) {
             Log.w(TAG, "VAE decode error: ${e.message}")
             latentToFallbackBitmap(latent)
@@ -328,6 +333,43 @@ class ImageGenerator(private val context: Context) {
             }
         }
         return latent
+    }
+
+    /**
+     * Converts raw ONNX output to the [batch, H, W*channels] interleaved format
+     * that pixelArrayToBitmap expects.
+     *
+     * ONNX VAE decoders emit NCHW [1, 3, H, W] — channels-first.
+     * pixelArrayToBitmap expects HWC-like [1, H, W*3] — interleaved RGB.
+     * A direct cast would either crash (wrong type) or produce scrambled colours.
+     */
+    private fun onnxOutputToPixelArray(raw: Any?): Array<Array<FloatArray>> {
+        if (raw !is Array<*> || raw.isEmpty())
+            throw IllegalStateException("VAE output is null or empty")
+
+        return when (val first = raw[0]) {
+            // 4D NCHW: Array<Array<Array<FloatArray>>> shape [batch, C, H, W]
+            is Array<*> -> when {
+                (first as Array<*>).firstOrNull() is Array<*> -> {
+                    @Suppress("UNCHECKED_CAST")
+                    val nchw = raw as Array<Array<Array<FloatArray>>>
+                    val c = nchw[0].size           // channels (3)
+                    val h = nchw[0][0].size        // height
+                    val w = nchw[0][0][0].size     // width
+                    // Convert NCHW → [1, H, W*C] interleaved:
+                    // index i in row y → channel = i%c, pixel x = i/c
+                    Array(1) { Array(h) { y -> FloatArray(w * c) { i -> nchw[0][i % c][y][i / c] } } }
+                }
+                // 3D [batch, H, W*channels] — already interleaved, cast directly
+                else -> {
+                    @Suppress("UNCHECKED_CAST")
+                    raw as Array<Array<FloatArray>>
+                }
+            }
+            else -> throw IllegalStateException(
+                "Unexpected VAE output element type: ${first?.javaClass?.simpleName}"
+            )
+        }
     }
 
     private fun pixelArrayToBitmap(pixels: Array<Array<FloatArray>>): Bitmap {
