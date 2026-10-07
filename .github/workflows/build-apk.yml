@@ -12,7 +12,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -155,20 +155,12 @@ jobs:
           print("Available ONNX files:", os.listdir("dreamlite_onnx"))
           PYEOF
 
-      - name: Pack DreamLite ONNX into assets
+      - name: Create DreamLite manifest (model downloaded on first use)
         run: |
-          if [ -d "dreamlite_onnx" ] && [ "$(ls dreamlite_onnx/*.onnx 2>/dev/null | wc -l)" -gt "0" ]; then
-            # Pack all ONNX files into a single zip for the assets
-            cd dreamlite_onnx
-            zip -r ../lfm25/app/src/main/assets/dreamlite.zip .
-            cd ..
-            echo "DreamLite package: $(du -sh lfm25/app/src/main/assets/dreamlite.zip)"
-          else
-            echo "No ONNX files generated, skipping DreamLite pack"
-            # Create a placeholder manifest so the app knows to download later
-            echo '{"status":"not_bundled","download_url":"https://huggingface.co/carlofkl/DreamLite-base"}' \
-              > lfm25/app/src/main/assets/dreamlite_manifest.json
-          fi
+          # DreamLite is NOT bundled - too large for APK
+          # App downloads it on first image generation request
+          echo '{"status":"download_on_demand","version":"1.0","params":{"num_inference_steps":50,"guidance_scale":7.0,"negative_prompt":"blurry, distorted, ugly, bad anatomy, text, watermark"}}'             > lfm25/app/src/main/assets/dreamlite_manifest.json
+          echo "DreamLite manifest written (model will download on demand)"
           ls -lh lfm25/app/src/main/assets/
 
       - name: Install NDK and CMake
@@ -199,23 +191,56 @@ jobs:
           ANDROID_HOME: /usr/local/lib/android/sdk
           ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/25.2.9519653
 
-      - name: Rename APK
+      - name: Copy APK to output
         run: |
           mkdir -p output
+          # Use Gradle output directly - it already does zipalign + signing
+          # DO NOT run zipalign manually after signing - it breaks the signature
           APK="lfm25/app/build/outputs/apk/release/app-release.apk"
           if [ ! -f "$APK" ]; then
             APK="lfm25/app/build/outputs/apk/debug/app-debug.apk"
-            echo "Warning: using debug APK"
+            echo "Using debug APK"
           fi
-          # Gradle assembleRelease already runs zipalign + apksigner internally.
-          # Running zipalign again after signing breaks the signature and causes
-          # "package appears invalid" on device. Just copy the finished APK.
           cp "$APK" "output/ThunderAGI-الرعد-v3.apk"
-          echo "Final APK: $(du -sh output/ThunderAGI-الرعد-v3.apk)"
+          echo "APK size: $(du -sh output/ThunderAGI-الرعد-v3.apk)"
+
+      - name: Verify APK is valid
+        run: |
+          APK="output/ThunderAGI-الرعد-v3.apk"
+          # Verify it's a valid ZIP/APK
+          python3 -c "
+          import zipfile, sys
+          try:
+              with zipfile.ZipFile('$APK') as z:
+                  files = z.namelist()
+                  has_manifest = 'AndroidManifest.xml' in files
+                  has_dex = any(f.endswith('.dex') for f in files)
+                  has_lib = any(f.startswith('lib/') for f in files)
+                  print(f'APK valid: manifest={has_manifest} dex={has_dex} lib={has_lib}')
+                  print(f'Files: {len(files)}')
+                  if not has_manifest or not has_dex:
+                      print('ERROR: APK missing required components!')
+                      sys.exit(1)
+                  print('APK validation PASSED')
+          except Exception as e:
+              print(f'APK validation FAILED: {e}')
+              sys.exit(1)
+          "
 
       - name: Upload APK
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: ThunderAGI-الرعد-v3
           path: output/ThunderAGI-الرعد-v3.apk
           retention-days: 30
+
+      - name: Show install instructions
+        run: |
+          echo ""
+          echo "=== HOW TO INSTALL ==="
+          echo "1. Download the artifact ZIP from GitHub"
+          echo "2. EXTRACT the ZIP - you will find ThunderAGI-الرعد-v3.apk inside"
+          echo "3. Copy ONLY the .apk file to your phone"
+          echo "4. Tap the .apk file to install"
+          echo "DO NOT try to install the .zip - extract it first!"
+          echo "APK size: $(du -sh output/ThunderAGI-الرعد-v3.apk)"
