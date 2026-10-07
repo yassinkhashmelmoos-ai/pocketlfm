@@ -75,6 +75,6 @@ endif()
 
 target_link_libraries(llama ggml)
 
-add_library(llama-jni SHARED llama-jni.cpp chibi_scheme_jni.cpp)
-target_link_libraries(llama-jni llama ggml android log dl)
-target_include_directories(llama-jni PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_library(thunder-engine SHARED llama-jni.cpp chibi_scheme_jni.cpp)
+target_link_libraries(thunder-engine llama ggml android log dl)
+target_include_directories(thunder-engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
