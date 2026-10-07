@@ -155,12 +155,21 @@ jobs:
           print("Available ONNX files:", os.listdir("dreamlite_onnx"))
           PYEOF
 
-      - name: Create DreamLite manifest (model downloaded on first use)
+      - name: Pack DreamLite ONNX into assets
         run: |
-          # DreamLite is NOT bundled - too large for APK
-          # App downloads it on first image generation request
-          echo '{"status":"download_on_demand","version":"1.0","params":{"num_inference_steps":50,"guidance_scale":7.0,"negative_prompt":"blurry, distorted, ugly, bad anatomy, text, watermark"}}'             > lfm25/app/src/main/assets/dreamlite_manifest.json
-          echo "DreamLite manifest written (model will download on demand)"
+          mkdir -p lfm25/app/src/main/assets
+          if [ -d "dreamlite_onnx" ] && [ "$(ls dreamlite_onnx/*.onnx 2>/dev/null | wc -l)" -gt "0" ]; then
+            cd dreamlite_onnx
+            zip -r ../lfm25/app/src/main/assets/dreamlite.zip .
+            cd ..
+            echo "DreamLite bundled: $(du -sh lfm25/app/src/main/assets/dreamlite.zip)"
+            # IMPORTANT: noCompress in build.gradle.kts stores this zip uncompressed
+            # inside the APK so Android can read it directly without double-decompression.
+          else
+            echo "ERROR: No ONNX files in dreamlite_onnx/ — conversion step above failed"
+            ls -la dreamlite_onnx/ 2>/dev/null || echo "dreamlite_onnx/ missing"
+            exit 1
+          fi
           ls -lh lfm25/app/src/main/assets/
 
       - name: Install NDK and CMake
