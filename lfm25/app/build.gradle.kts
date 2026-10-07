@@ -42,7 +42,7 @@ android {
         // CRITICAL: large assets must NOT be compressed inside APK
         // Android cannot install or mmap compressed assets > 1MB
         // model.gguf (218MB) and any other large files need this
-        noCompress += listOf("gguf", "zip", "bin", "onnx", "tflite", "pb", "pt")
+        noCompress += listOf("gguf", "zip", "bin", "onnx", "tflite", "pb", "pt", "gz")
     }
 
     buildTypes {
