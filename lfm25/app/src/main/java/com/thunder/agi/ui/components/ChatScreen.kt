@@ -158,6 +158,7 @@ fun ChatScreen(
             onSaveSystemPrompt = onSaveSystemPrompt,
             onExportFeedback = onExportFeedback,
             onImportFineTune = { ftPicker.launch("*/*") },
+            onShowAbout = onShowAbout,
             onDismiss = onToggleSettings
         )
         return
@@ -273,6 +274,7 @@ private fun SettingsSheet(
     onSaveSystemPrompt: (String) -> Unit,
     onExportFeedback: () -> Unit,
     onImportFineTune: () -> Unit,
+    onShowAbout: () -> Unit,
     onDismiss: () -> Unit
 ) {
     var nameEdit   by remember { mutableStateOf(userName) }
@@ -347,6 +349,21 @@ private fun SettingsSheet(
                 "are treated as model instructions; others are saved as training data.",
                 style = MaterialTheme.typography.bodySmall, color = ThunderGray
             )
+
+            HorizontalDivider(color = ThunderMidBlue)
+
+            OutlinedButton(
+                onClick = {
+                    onSaveUserName(nameEdit)
+                    onSaveSystemPrompt(promptEdit)
+                    onDismiss()
+                    onShowAbout()
+                },
+                modifier = Modifier.fillMaxWidth(),
+                border = BorderStroke(1.dp, ThunderElectric)
+            ) {
+                Text("About Thunder AGI", color = ThunderElectric)
+            }
         }
     }
 }
