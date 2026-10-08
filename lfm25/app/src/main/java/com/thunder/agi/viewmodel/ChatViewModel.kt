@@ -363,7 +363,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         is com.thunder.agi.imaging.ImageGenerator.GenerationResult.Success -> {
                             withContext(Dispatchers.IO) {
                                 persistAndShow(ChatMessage(
-                                    content = "🎨 Image #${r.imageId}: ${r.prompt} (${r.source})",
+                                    content = "🎨 Image #${r.imageId}: ${r.prompt}",
                                     isUser = false,
                                     mediaPath = r.imagePath,
                                     mediaType = "image"
@@ -476,7 +476,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         withContext(Dispatchers.Main) {
             if (_ui.value.currentSessionId == sessionId) {
-                _ui.update { it.copy(messages = it.messages + msg) }
+                // distinctBy prevents duplicate-key crash in LazyColumn when the
+                // scroll animation triggers a remeasure mid-update
+                _ui.update { it.copy(messages = (it.messages + msg).distinctBy { m -> m.id }) }
             }
         }
     }
@@ -583,10 +585,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 override fun onError(e: Int) {
                     val msg = when(e) {
-                        SpeechRecognizer.ERROR_NO_MATCH -> "No speech detected"
-                        SpeechRecognizer.ERROR_NETWORK -> "Network error"
-                        SpeechRecognizer.ERROR_AUDIO -> "Audio error"
-                        else -> "Speech error ($e)"
+                        SpeechRecognizer.ERROR_NO_MATCH        -> "No speech detected — try speaking again"
+                        SpeechRecognizer.ERROR_NETWORK,
+                        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Voice needs internet — type instead, or enable Wi-Fi"
+                        SpeechRecognizer.ERROR_AUDIO           -> "Microphone error — check mic permissions"
+                        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Recognizer busy — tap mic again"
+                        SpeechRecognizer.ERROR_SERVER          -> "Voice server error — try again"
+                        else -> "Speech error ($e) — try again"
                     }
                     _ui.update { it.copy(isRecording = false, snackbar = msg) }
                 }
@@ -602,6 +607,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ar-SA,en-US")
+            // Prefer on-device recognition to avoid network errors when offline
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
         }
         try {
             speechRecognizer?.startListening(intent)
@@ -675,16 +682,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     /** Strip any leaked prompt tokens from model output */
     private fun cleanModelOutput(raw: String): String {
         var s = raw.trim()
-        // Remove any leaked template tokens
-        val stopPatterns = listOf(
+
+        // Stop at template/format tokens — truncate everything from the token onward
+        val stopTokens = listOf(
             "<|user|>", "<|assistant|>", "<|system|>", "<|endoftext|>",
             "</s>", "<|end|>", "<|im_end|>", "|assistant|>", "|user|>",
-            "|assistant|/>", "</|user>", "</|assistant>"
+            "|assistant|/>", "</|user>", "</|assistant>", "[INST]", "[/INST]"
         )
-        for (token in stopPatterns) {
+        for (token in stopTokens) {
             val idx = s.indexOf(token)
             if (idx != -1) s = s.substring(0, idx)
         }
+
+        // Strip echoed prompt blocks the model sometimes regurgitates:
+        // [Image provided: /path/to/file] and [Tool Results — use this information]
+        s = s.replace(Regex("""\[Image provided:[^\]]*\]"""), "").trim()
+        s = s.replace(Regex("""\[Tool Results[^\]]*\]""", RegexOption.DOT_MATCHES_ALL), "").trim()
+        // Also strip bare "Image provided: /path" lines (without brackets, model drops them)
+        s = s.replace(Regex("""(?m)^Image provided:.*$"""), "").trim()
+        // Strip leftover "/> " artifacts
+        s = s.replace(Regex("""^\s*/>""", RegexOption.MULTILINE), "").trim()
+
         // Remove trailing incomplete tokens like "<|"
         s = s.trimEnd().trimEnd('<').trimEnd('|').trim()
         return s.ifBlank { "…" }
