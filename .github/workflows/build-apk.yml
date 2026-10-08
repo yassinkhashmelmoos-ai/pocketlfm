@@ -14,6 +14,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Remove adaptive icon overrides (use density-specific webp icons instead)
+        run: |
+          # The mipmap-anydpi XMLs define an adaptive icon using the lightning bolt
+          # vector drawable, which overrides ALL density-specific webp files on
+          # Android 8+. Deleting them forces Android to use the correctly-sized
+          # webp files generated in the icon step below.
+          rm -f lfm25/app/src/main/res/mipmap-anydpi/ic_launcher.xml
+          rm -f lfm25/app/src/main/res/mipmap-anydpi/ic_launcher_round.xml
+          echo "Adaptive icon XMLs removed"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:
