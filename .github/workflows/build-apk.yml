@@ -68,96 +68,117 @@ jobs:
       - name: Download and convert DreamLite to ONNX for Android
         run: |
           python3 << 'PYEOF'
-          import os, sys, torch
+          import os, sys, torch, json
           print("=== DreamLite ONNX Export Pipeline ===")
           
-          # ── Download components ────────────────────────────────────────────
-          from huggingface_hub import hf_hub_download, snapshot_download
-          from diffusers import AutoencoderKL
-          from transformers import AutoTokenizer, CLIPTextModel
+          from huggingface_hub import snapshot_download
+          from diffusers import AutoencoderKL, UNet2DConditionModel, AutoPipelineForText2Image
+          from transformers import CLIPTextModel, CLIPTokenizer
           import numpy as np
           
           os.makedirs("dreamlite_onnx", exist_ok=True)
           
-          print("Downloading DreamLite-base UNet (public, no token needed)...")
-          try:
-              # Download just the UNet config and weights from diffusers branch
-              unet_path = snapshot_download(
-                  "carlofkl/DreamLite-base",
-                  revision="diffusers",
-                  ignore_patterns=["*.safetensors", "*.bin"],  # configs only first
-                  local_dir="dreamlite_base"
-              )
-              print(f"Config downloaded to {unet_path}")
-          except Exception as e:
-              print(f"DreamLite download failed: {e}")
-              print("Falling back to SDXL-based lightweight pipeline...")
-          
+          # ── 1. VAE decoder ─────────────────────────────────────────────────
           print("Downloading HD VAE (madebyollin/sdxl-vae-fp16-fix)...")
           try:
               vae = AutoencoderKL.from_pretrained(
-                  "madebyollin/sdxl-vae-fp16-fix",
-                  torch_dtype=torch.float32  # fp32 for ONNX export
-              )
-              print("VAE downloaded")
-              
-              # Export VAE decoder to ONNX
+                  "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float32)
               vae.eval()
-              latent_sample = torch.randn(1, 4, 64, 64)
               torch.onnx.export(
-                  vae.decoder,
-                  latent_sample,
+                  vae.decoder, torch.randn(1, 4, 64, 64),
                   "dreamlite_onnx/vae_decoder.onnx",
-                  input_names=["latent_sample"],
-                  output_names=["image"],
-                  dynamic_axes={"latent_sample": {0: "batch"}},
-                  opset_version=17
-              )
-              print("✓ VAE decoder exported to ONNX")
+                  input_names=["latent_sample"], output_names=["image"],
+                  dynamic_axes={"latent_sample": {0: "batch"}}, opset_version=17)
+              print(f"✓ VAE decoder: {os.path.getsize('dreamlite_onnx/vae_decoder.onnx')//1024//1024} MB")
+              del vae
           except Exception as e:
               print(f"VAE export failed: {e}")
           
-          # Export a minimal text encoder stub (CLIP ViT-L/14 as proxy)
-          print("Downloading text encoder (CLIP ViT-L/14)...")
+          # ── 2. CLIP text encoder ──────────────────────────────────────────
+          print("Downloading CLIP text encoder...")
           try:
-              from transformers import CLIPTextModel, CLIPTokenizer
               tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-              text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=torch.float32)
+              text_encoder = CLIPTextModel.from_pretrained(
+                  "openai/clip-vit-large-patch14", torch_dtype=torch.float32)
               text_encoder.eval()
-              
-              dummy_ids = torch.zeros((1, 77), dtype=torch.long)
               torch.onnx.export(
-                  text_encoder,
-                  dummy_ids,
+                  text_encoder, torch.zeros((1, 77), dtype=torch.long),
                   "dreamlite_onnx/text_encoder.onnx",
-                  input_names=["input_ids"],
-                  output_names=["last_hidden_state"],
-                  dynamic_axes={"input_ids": {0: "batch"}},
-                  opset_version=17
-              )
+                  input_names=["input_ids"], output_names=["last_hidden_state"],
+                  dynamic_axes={"input_ids": {0: "batch"}}, opset_version=17)
               tokenizer.save_pretrained("dreamlite_onnx/tokenizer")
-              print("✓ Text encoder exported to ONNX")
+              print(f"✓ Text encoder: {os.path.getsize('dreamlite_onnx/text_encoder.onnx')//1024//1024} MB")
+              del text_encoder, tokenizer
           except Exception as e:
               print(f"Text encoder export failed: {e}")
           
-          # Create model manifest
-          import json
+          # ── 3. UNet — try DreamLite first, fall back to TinySD ────────────
+          # The UNet is the core denoising network — without it the pipeline
+          # produces noise, not real images. DreamLite-base may have one;
+          # TinySD (~200 MB) is a reliable mobile-optimised fallback.
+          unet_exported = False
+          num_steps = 20  # default for full UNet
+          
+          print("Trying DreamLite UNet (full weights, no ignore_patterns)...")
+          try:
+              dl_path = snapshot_download(
+                  "carlofkl/DreamLite-base",
+                  revision="diffusers",
+                  local_dir="dreamlite_base"
+                  # No ignore_patterns — we need the .safetensors weights
+              )
+              unet = UNet2DConditionModel.from_pretrained(
+                  f"{dl_path}/unet", torch_dtype=torch.float32)
+              unet.eval()
+              torch.onnx.export(
+                  unet,
+                  (torch.randn(2, 4, 64, 64),
+                   torch.tensor([999, 999]),
+                   torch.randn(2, 77, 768)),
+                  "dreamlite_onnx/unet.onnx",
+                  input_names=["sample", "timestep", "encoder_hidden_states"],
+                  output_names=["out_sample"], opset_version=17)
+              unet_exported = True
+              print(f"✓ DreamLite UNet: {os.path.getsize('dreamlite_onnx/unet.onnx')//1024//1024} MB")
+              del unet
+          except Exception as e:
+              print(f"DreamLite UNet not available ({e}), using TinySD fallback...")
+          
+          if not unet_exported:
+              # TinySD: distilled from SD1.5, ~40% smaller, works in 20 steps
+              print("Downloading TinySD UNet (segmind/tiny-sd)...")
+              try:
+                  pipe = AutoPipelineForText2Image.from_pretrained(
+                      "segmind/tiny-sd", torch_dtype=torch.float32)
+                  pipe.unet.eval()
+                  torch.onnx.export(
+                      pipe.unet,
+                      (torch.randn(2, 4, 64, 64),
+                       torch.tensor([999, 999]),
+                       torch.randn(2, 77, 768)),
+                      "dreamlite_onnx/unet.onnx",
+                      input_names=["sample", "timestep", "encoder_hidden_states"],
+                      output_names=["out_sample"], opset_version=17)
+                  unet_exported = True
+                  num_steps = 20  # TinySD works well with 20 steps
+                  print(f"✓ TinySD UNet: {os.path.getsize('dreamlite_onnx/unet.onnx')//1024//1024} MB")
+                  del pipe
+              except Exception as e:
+                  print(f"TinySD export also failed: {e}")
+                  print("WARNING: No UNet available — offline image generation disabled")
+          
+          # ── 4. Manifest ────────────────────────────────────────────────────
           manifest = {
-              "version": "1.0",
-              "model_type": "dreamlite_gemini_config",
-              "components": ["text_encoder.onnx", "vae_decoder.onnx"],
+              "version": "2.0",
+              "components": ["text_encoder.onnx", "vae_decoder.onnx", "unet.onnx"],
+              "has_unet": unet_exported,
               "params": {
-                  "num_inference_steps": 50,
+                  "num_inference_steps": num_steps,
                   "guidance_scale": 7.0,
-                  "image_guidance_scale": 1.5,
-                  "negative_prompt": "blurry, distorted, ugly, bad anatomy, text, watermark, pixelated, low resolution",
+                  "negative_prompt": "blurry, distorted, ugly, bad anatomy, text, watermark",
                   "resolution": 512,
-                  "vae": "sdxl-vae-fp16-fix",
-                  "text_encoder": "clip-vit-large-patch14",
-                  "precision": "fp16",
-                  "attention_slicing": True
-              },
-              "note": "Gemini-config: HD VAE + CLIP encoder + DreamLite UNet for best quality"
+                  "latent_dim": 64
+              }
           }
           with open("dreamlite_onnx/manifest.json", "w") as f:
               json.dump(manifest, f, indent=2)
