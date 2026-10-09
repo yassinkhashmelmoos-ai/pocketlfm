@@ -83,6 +83,7 @@ class ImageGenerator(private val context: Context) {
     private val onnxEnv   = OrtEnvironment.getEnvironment()
     private var textEncoderSession: OrtSession? = null
     private var vaeDecoderSession: OrtSession?  = null
+    private var unetSession: OrtSession?         = null   // core denoising network
     private var onnxReady = false
     private var currentGuidanceScale = CFG_SCALE
     private var registry = mutableMapOf<Int, String>()  // imageId → path
@@ -118,6 +119,8 @@ class ImageGenerator(private val context: Context) {
             val teFile = File(context.filesDir, "text_encoder.onnx")
             val vaeFile = File(context.filesDir, "vae_decoder.onnx")
 
+            val unetFile = File(context.filesDir, "unet.onnx")
+
             if (teFile.exists() && vaeFile.exists()) {
                 val opts = OrtSession.SessionOptions().apply {
                     try { addNnapi(); Log.i(TAG, "NNAPI enabled") }
@@ -127,6 +130,12 @@ class ImageGenerator(private val context: Context) {
                 }
                 textEncoderSession = onnxEnv.createSession(teFile.absolutePath, opts)
                 vaeDecoderSession  = onnxEnv.createSession(vaeFile.absolutePath, opts)
+                if (unetFile.exists()) {
+                    unetSession = onnxEnv.createSession(unetFile.absolutePath, opts)
+                    Log.i(TAG, "UNet loaded — full diffusion pipeline ready")
+                } else {
+                    Log.w(TAG, "UNet missing — offline generation will use online fallback")
+                }
                 onnxReady = true
                 Log.i(TAG, "ONNX models loaded — offline generation ready")
             } else {
@@ -189,14 +198,62 @@ class ImageGenerator(private val context: Context) {
             else
                 randomLatent()
 
-            // Step 3: DDPM denoising loop (simplified — full UNet would be here)
-            // Since we have the VAE but not full UNet, we use guided noise reduction
-            // This is the educated-guess implementation matching ThunderImagen's math
+            // Step 3: DDPM denoising loop — requires UNet for real images
+            val unet = unetSession
+            if (unet == null) {
+                // No UNet available — fall back to online generation
+                Log.w(TAG, "UNet not loaded, falling back to online generation")
+                return generateOnline(prompt, sourceImage)
+            }
+
+            // Real classifier-free guidance diffusion loop:
+            // For each timestep, run UNet twice (uncond + cond) and blend.
             val scheduler = DDPMScheduler(NUM_STEPS, currentGuidanceScale)
             for (step in 0 until NUM_STEPS) {
                 progressCallback?.invoke(step + 3, NUM_STEPS + 3)
-                latent = scheduler.step(latent, textEmbeds, negEmbeds, step)
-                if (step % 10 == 0) Log.d(TAG, "Step ${step+1}/$NUM_STEPS")
+                val timestep = scheduler.getTimestep(step)
+
+                // Batch latent x2 for classifier-free guidance [2, 4, 64, 64]
+                val batchedLatent = latent + latent  // FloatArray concat
+
+                val latentTensor = OnnxTensor.createTensor(onnxEnv,
+                    java.nio.FloatBuffer.wrap(batchedLatent),
+                    longArrayOf(2, 4, LATENT_DIM.toLong(), LATENT_DIM.toLong()))
+                val timestepTensor = OnnxTensor.createTensor(onnxEnv,
+                    java.nio.LongBuffer.wrap(longArrayOf(timestep.toLong(), timestep.toLong())),
+                    longArrayOf(2))
+                // Concat [neg, text] embeds → shape [2, 77, 768]
+                val combinedEmbeds = negEmbeds + textEmbeds
+                val embedTensor = OnnxTensor.createTensor(onnxEnv,
+                    java.nio.FloatBuffer.wrap(combinedEmbeds),
+                    longArrayOf(2, 77, 768))
+
+                val output = unet.run(mapOf(
+                    "sample"                  to latentTensor,
+                    "timestep"                to timestepTensor,
+                    "encoder_hidden_states"   to embedTensor
+                ))
+
+                val rawOutput = output[0].value
+                val noisePred4d = onnxOutputToPixelArray(rawOutput)  // reuse safe-cast helper
+                // noisePred4d[0] = uncond prediction, [1] = cond prediction
+                // Guided noise = uncond + scale * (cond - uncond)
+                val guidedNoise = FloatArray(4 * LATENT_DIM * LATENT_DIM) { i ->
+                    val ch = i / (LATENT_DIM * LATENT_DIM)
+                    val pos = i % (LATENT_DIM * LATENT_DIM)
+                    val y = pos / LATENT_DIM
+                    val x = pos % LATENT_DIM
+                    val uncond = noisePred4d[0][y][ch * LATENT_DIM + x]
+                    val cond   = noisePred4d[1][y][ch * LATENT_DIM + x]
+                    uncond + currentGuidanceScale * (cond - uncond)
+                }
+
+                latent = scheduler.step(guidedNoise, step, latent)
+
+                latentTensor.close(); timestepTensor.close()
+                embedTensor.close();  output[0].close()
+
+                if (step % 5 == 0) Log.d(TAG, "Diffusion step ${step+1}/$NUM_STEPS")
             }
 
             // Step 4: Decode latent → image via VAE
