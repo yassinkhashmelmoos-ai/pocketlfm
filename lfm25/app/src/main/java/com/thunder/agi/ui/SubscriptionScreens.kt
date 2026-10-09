@@ -20,96 +20,301 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.*
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.*
+import androidx.compose.ui.res.painterResource
 import coil.compose.AsyncImage
+import com.thunder.agi.R
 import com.thunder.agi.ui.theme.*
 
-// ── First Launch — Username Entry ─────────────────────────────────────────────
+// ── Activation Screen — License Key OR Bank of Khartoum Receipt ──────────────
 
 @Composable
-fun OnboardingScreen(
-    onRegister: (String) -> Unit
+fun ActivationScreen(
+    // License key path
+    onActivateLicense: (username: String, key: String) -> Boolean,
+    // Bank receipt path (existing logic)
+    onVerifyReceipt: (Uri, String, String) -> Unit,
+    receiptVerificationMessage: String,
+    isVerifyingReceipt: Boolean,
+    // Status message from license path
+    statusMessage: String = ""
 ) {
-    var username by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf("") }
+    var selectedTab by remember { mutableIntStateOf(0) }
 
     Column(
         Modifier
             .fillMaxSize()
             .background(ThunderBlack)
-            .padding(32.dp)
             .verticalScroll(rememberScrollState()),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Text("⚡", fontSize = 72.sp)
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(48.dp))
+
+        // Header
+        Image(
+            painter = painterResource(R.mipmap.ic_launcher_round),
+            contentDescription = "Thunder AGI",
+            modifier = Modifier.size(96.dp)
+        )
+        Spacer(Modifier.height(12.dp))
         Text("Thunder AGI", style = MaterialTheme.typography.headlineMedium,
             color = ThunderElectric, fontWeight = FontWeight.Bold)
         Text("الرَّعد للذكاء العام المصطنع",
             style = MaterialTheme.typography.titleMedium, color = ThunderGray)
-        Spacer(Modifier.height(8.dp))
+        Spacer(Modifier.height(4.dp))
         Text("بسم الله الرحمن الرحيم",
-            style = MaterialTheme.typography.bodyMedium, color = ThunderGray,
-            textAlign = TextAlign.Center)
+            style = MaterialTheme.typography.bodySmall, color = ThunderGray)
 
-        Spacer(Modifier.height(40.dp))
+        Spacer(Modifier.height(32.dp))
 
-        Text("أدخل اسم المستخدم للبدء",
-            style = MaterialTheme.typography.titleSmall, color = ThunderWhite)
-        Spacer(Modifier.height(8.dp))
-        Text("تحصل على شهر كامل مجاناً",
-            style = MaterialTheme.typography.bodySmall, color = ThunderGreen)
+        Text("تفعيل التطبيق", style = MaterialTheme.typography.titleMedium,
+            color = ThunderWhite, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(4.dp))
+        Text("اختر طريقة التفعيل",
+            style = MaterialTheme.typography.bodySmall, color = ThunderGray)
+
         Spacer(Modifier.height(16.dp))
 
-        OutlinedTextField(
-            value = username,
-            onValueChange = { username = it; error = "" },
-            modifier = Modifier.fillMaxWidth(),
-            placeholder = { Text("اسم المستخدم", color = ThunderGray) },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(
-                imeAction = ImeAction.Done,
-                capitalization = KeyboardCapitalization.None
-            ),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = ThunderElectric,
-                unfocusedBorderColor = ThunderMidBlue,
-                focusedTextColor = ThunderWhite,
-                unfocusedTextColor = ThunderWhite,
-                cursorColor = ThunderElectric,
-                focusedContainerColor = ThunderDeepBlue,
-                unfocusedContainerColor = ThunderDeepBlue
-            ),
-            shape = RoundedCornerShape(12.dp)
-        )
-
-        if (error.isNotBlank()) {
-            Spacer(Modifier.height(8.dp))
-            Text(error, color = ThunderRed, style = MaterialTheme.typography.bodySmall)
+        // Tab selector
+        TabRow(
+            selectedTabIndex = selectedTab,
+            containerColor = ThunderDeepBlue,
+            contentColor = ThunderElectric,
+            modifier = Modifier.padding(horizontal = 24.dp)
+        ) {
+            Tab(
+                selected = selectedTab == 0,
+                onClick = { selectedTab = 0 },
+                text = { Text("مفتاح الترخيص", color = if (selectedTab == 0) ThunderElectric else ThunderGray) }
+            )
+            Tab(
+                selected = selectedTab == 1,
+                onClick = { selectedTab = 1 },
+                text = { Text("إيصال بنك الخرطوم", color = if (selectedTab == 1) ThunderElectric else ThunderGray) }
+            )
         }
 
         Spacer(Modifier.height(24.dp))
 
+        when (selectedTab) {
+            0 -> LicenseKeyTab(onActivateLicense = onActivateLicense, statusMessage = statusMessage)
+            1 -> BankReceiptTab(
+                onVerifyReceipt = onVerifyReceipt,
+                verificationMessage = receiptVerificationMessage,
+                isVerifying = isVerifyingReceipt
+            )
+        }
+
+        Spacer(Modifier.height(32.dp))
+        Text("تطبيق سوداني المنشأ • يعمل بدون إنترنت",
+            style = MaterialTheme.typography.labelSmall, color = ThunderGray,
+            textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 32.dp))
+        Spacer(Modifier.height(16.dp))
+    }
+}
+
+@Composable
+private fun LicenseKeyTab(
+    onActivateLicense: (String, String) -> Boolean,
+    statusMessage: String
+) {
+    var username   by remember { mutableStateOf("") }
+    var licenseKey by remember { mutableStateOf("") }
+    var error      by remember { mutableStateOf("") }
+    var success    by remember { mutableStateOf(false) }
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        val fieldColors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor     = ThunderElectric,
+            unfocusedBorderColor   = ThunderMidBlue,
+            focusedTextColor       = ThunderWhite,
+            unfocusedTextColor     = ThunderWhite,
+            cursorColor            = ThunderElectric,
+            focusedContainerColor  = ThunderDeepBlue,
+            unfocusedContainerColor = ThunderDeepBlue
+        )
+
+        OutlinedTextField(
+            value = username,
+            onValueChange = { username = it; error = ""; success = false },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("اسم المستخدم", color = ThunderGray) },
+            singleLine = true,
+            colors = fieldColors,
+            shape = RoundedCornerShape(12.dp)
+        )
+
+        Spacer(Modifier.height(12.dp))
+
+        OutlinedTextField(
+            value = licenseKey,
+            onValueChange = { licenseKey = it; error = ""; success = false },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("مفتاح الترخيص", color = ThunderGray) },
+            singleLine = true,
+            colors = fieldColors,
+            shape = RoundedCornerShape(12.dp),
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Ascii,
+                imeAction = ImeAction.Done
+            )
+        )
+
+        if (error.isNotBlank()) {
+            Spacer(Modifier.height(8.dp))
+            Text(error, color = ThunderRed, style = MaterialTheme.typography.bodySmall,
+                textAlign = TextAlign.Center)
+        }
+        if (success) {
+            Spacer(Modifier.height(8.dp))
+            Text("✅ تم التفعيل بنجاح!", color = ThunderGreen,
+                style = MaterialTheme.typography.bodySmall)
+        }
+
+        Spacer(Modifier.height(20.dp))
+
         Button(
             onClick = {
-                if (username.trim().isBlank()) {
-                    error = "يرجى إدخال اسم المستخدم"
-                } else {
-                    onRegister(username.trim())
+                when {
+                    username.trim().isBlank() -> error = "يرجى إدخال اسم المستخدم"
+                    licenseKey.trim().isBlank() -> error = "يرجى إدخال مفتاح الترخيص"
+                    else -> {
+                        val ok = onActivateLicense(username.trim(), licenseKey.trim())
+                        if (ok) success = true
+                        else error = "مفتاح غير صحيح أو منتهي الصلاحية"
+                    }
                 }
             },
             modifier = Modifier.fillMaxWidth().height(52.dp),
             colors = ButtonDefaults.buttonColors(containerColor = ThunderElectric),
             shape = RoundedCornerShape(12.dp)
         ) {
-            Text("ابدأ الاستخدام المجاني", color = ThunderBlack,
+            Text("تفعيل", color = ThunderBlack,
                 style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
         }
+    }
+}
 
-        Spacer(Modifier.height(32.dp))
-        Text("تطبيق سوداني المنشأ • يعمل بدون إنترنت",
-            style = MaterialTheme.typography.labelSmall, color = ThunderGray,
+@Composable
+private fun BankReceiptTab(
+    onVerifyReceipt: (Uri, String, String) -> Unit,
+    verificationMessage: String,
+    isVerifying: Boolean
+) {
+    var processNumber by remember { mutableStateOf("") }
+    var receiptDate   by remember { mutableStateOf("") }
+    var receiptUri    by remember { mutableStateOf<Uri?>(null) }
+
+    val picker = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri -> receiptUri = uri }
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text("ارفع إيصال بنك الخرطوم",
+            style = MaterialTheme.typography.titleSmall, color = ThunderWhite)
+        Spacer(Modifier.height(4.dp))
+        Text("يتم مراجعة الإيصال تلقائياً بالذكاء الاصطناعي",
+            style = MaterialTheme.typography.bodySmall, color = ThunderGray,
             textAlign = TextAlign.Center)
+
+        Spacer(Modifier.height(16.dp))
+
+        // Receipt image picker
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(160.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(ThunderDeepBlue)
+                .border(2.dp, if (receiptUri != null) ThunderGreen else ThunderMidBlue, RoundedCornerShape(12.dp))
+                .clickable { picker.launch("image/*") },
+            contentAlignment = Alignment.Center
+        ) {
+            if (receiptUri != null) {
+                AsyncImage(model = receiptUri, contentDescription = null,
+                    modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(12.dp)))
+            } else {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Default.AddPhotoAlternate, null, tint = ThunderGray,
+                        modifier = Modifier.size(36.dp))
+                    Spacer(Modifier.height(8.dp))
+                    Text("اضغط لاختيار صورة الإيصال",
+                        color = ThunderGray, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+
+        val fieldColors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = ThunderElectric,
+            unfocusedBorderColor = ThunderMidBlue,
+            focusedTextColor = ThunderWhite,
+            unfocusedTextColor = ThunderWhite,
+            cursorColor = ThunderElectric,
+            focusedContainerColor = ThunderDeepBlue,
+            unfocusedContainerColor = ThunderDeepBlue
+        )
+
+        OutlinedTextField(
+            value = processNumber,
+            onValueChange = { processNumber = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("رقم العملية", color = ThunderGray) },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            colors = fieldColors, shape = RoundedCornerShape(12.dp)
+        )
+
+        Spacer(Modifier.height(8.dp))
+
+        OutlinedTextField(
+            value = receiptDate,
+            onValueChange = { receiptDate = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("تاريخ الإيصال (YYYY-MM-DD)", color = ThunderGray) },
+            singleLine = true,
+            colors = fieldColors, shape = RoundedCornerShape(12.dp)
+        )
+
+        if (verificationMessage.isNotBlank()) {
+            Spacer(Modifier.height(8.dp))
+            Text(verificationMessage,
+                color = if (verificationMessage.startsWith("✅")) ThunderGreen else ThunderRed,
+                style = MaterialTheme.typography.bodySmall, textAlign = TextAlign.Center)
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        Button(
+            onClick = {
+                receiptUri?.let { uri ->
+                    onVerifyReceipt(uri, processNumber, receiptDate)
+                }
+            },
+            modifier = Modifier.fillMaxWidth().height(52.dp),
+            enabled = receiptUri != null && processNumber.isNotBlank() &&
+                      receiptDate.isNotBlank() && !isVerifying,
+            colors = ButtonDefaults.buttonColors(containerColor = ThunderElectric),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            if (isVerifying) {
+                CircularProgressIndicator(Modifier.size(20.dp), color = ThunderBlack, strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+            }
+            Text(if (isVerifying) "جارٍ التحقق…" else "تحقق من الإيصال",
+                color = ThunderBlack, style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold)
+        }
     }
 }
 
@@ -142,7 +347,11 @@ fun PaymentScreen(
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Spacer(Modifier.height(32.dp))
-        Text("⚡", fontSize = 48.sp)
+        Image(
+            painter = painterResource(R.mipmap.ic_launcher_round),
+            contentDescription = "Thunder AGI",
+            modifier = Modifier.size(72.dp)
+        )
         Spacer(Modifier.height(8.dp))
         Text("Thunder AGI", style = MaterialTheme.typography.headlineSmall,
             color = ThunderElectric, fontWeight = FontWeight.Bold)
@@ -354,7 +563,11 @@ fun AboutScreen(onDismiss: () -> Unit) {
         ) {
             // Logo + name
             Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text("⚡", fontSize = 64.sp)
+                Image(
+            painter = painterResource(R.mipmap.ic_launcher_round),
+            contentDescription = "Thunder AGI",
+            modifier = Modifier.size(80.dp)
+        )
                 Text("Thunder AGI",
                     style = MaterialTheme.typography.headlineMedium,
                     color = ThunderElectric, fontWeight = FontWeight.Bold)
