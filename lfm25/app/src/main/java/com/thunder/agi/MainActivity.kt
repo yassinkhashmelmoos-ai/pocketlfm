@@ -9,14 +9,15 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.thunder.agi.license.LicenseValidator
 import com.thunder.agi.subscription.SubscriptionManager
 import com.thunder.agi.ui.AboutScreen
-import com.thunder.agi.ui.OnboardingScreen
-import com.thunder.agi.ui.PaymentScreen
+import com.thunder.agi.ui.ActivationScreen
 import com.thunder.agi.ui.components.ChatScreen
 import com.thunder.agi.ui.theme.ThunderAGITheme
 import com.thunder.agi.viewmodel.ChatViewModel
@@ -38,97 +39,92 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun ThunderAGIApp() {
     val context = LocalContext.current
-    val sub = remember { SubscriptionManager(context) }
-    var subState by remember { mutableStateOf(sub.getState()) }
-    var showAbout by remember { mutableStateOf(false) }
-    var verifyMessage by remember { mutableStateOf("") }
-    var isVerifying by remember { mutableStateOf(false) }
 
-    // About screen overlay
+    // ── License check: BOTH paths must be checked ────────────────────────────
+    // Path 1: HMAC-signed license key (LicenseValidator)
+    // Path 2: Bank of Khartoum receipt (SubscriptionManager — keeps AI receipt check)
+    val sub = remember { SubscriptionManager(context) }
+    var licenseInfo by remember { mutableStateOf(LicenseValidator.check(context)) }
+    var subState    by remember { mutableStateOf(sub.getState()) }
+
+    // User is allowed in if EITHER path is valid
+    val isActivated = licenseInfo.status == LicenseValidator.Status.VALID ||
+            subState == SubscriptionManager.SubscriptionState.PAID_ACTIVE ||
+            subState == SubscriptionManager.SubscriptionState.ADMIN
+
+    var showAbout      by remember { mutableStateOf(false) }
+    var verifyMessage  by remember { mutableStateOf("") }
+    var isVerifying    by remember { mutableStateOf(false) }
+
     if (showAbout) {
         AboutScreen(onDismiss = { showAbout = false })
         return
     }
 
-    when (subState) {
-        // ── First launch: ask for username ────────────────────────────────────
-        SubscriptionManager.SubscriptionState.FIRST_LAUNCH -> {
-            OnboardingScreen(
-                onRegister = { username ->
-                    sub.registerUser(username)
-                    subState = sub.getState()
-                }
-            )
-        }
-
-        // ── Trial expired: show payment screen ────────────────────────────────
-        SubscriptionManager.SubscriptionState.TRIAL_EXPIRED -> {
-            PaymentScreen(
-                username = sub.getUsername(),
-                onVerifyReceipt = { uri, process, date ->
-                    isVerifying = true
-                    val result = sub.verifyReceipt(uri, process, date)
-                    verifyMessage = result.reason
-                    isVerifying = false
-                    if (result.valid) subState = sub.getState()
-                },
-                onResetKey = { key ->
-                    if (sub.applyResetKey(key)) {
-                        subState = sub.getState()
-                        Toast.makeText(context, "تم تفعيل شهر جديد! ⚡", Toast.LENGTH_LONG).show()
-                    } else {
-                        verifyMessage = "مفتاح غير صحيح"
-                    }
-                },
-                verificationMessage = verifyMessage,
-                isVerifying = isVerifying
-            )
-        }
-
-        // ── Active (trial or paid or admin): show main app ────────────────────
-        SubscriptionManager.SubscriptionState.TRIAL_ACTIVE,
-        SubscriptionManager.SubscriptionState.PAID_ACTIVE,
-        SubscriptionManager.SubscriptionState.ADMIN -> {
-            val vm: ChatViewModel = viewModel()
-            val ui by vm.uiState.collectAsStateWithLifecycle()
-            val ctx = LocalContext.current
-
-            ChatScreen(
-                uiState              = ui,
-                onInputChanged       = vm::onInputChanged,
-                onSendMessage        = vm::sendMessage,
-                onClearChat          = vm::clearChat,
-                onRetryLoadModel     = vm::retryLoadModel,
-                onNewSession         = vm::newSession,
-                onSwitchSession      = vm::switchSession,
-                onDeleteSession      = vm::deleteSession,
-                onRenameSession      = vm::renameSession,
-                onToggleDrawer       = vm::toggleDrawer,
-                onStartVoice         = { vm.startVoice(ctx) },
-                onStopVoice          = vm::stopVoice,
-                onThumbsUp           = { vm.submitFeedback(it, true) },
-                onThumbsDown         = { vm.submitFeedback(it, false) },
-                onDeleteMessage      = vm::deleteMessage,
-                onImportFineTune     = vm::importFineTune,
-                onExportFeedback     = vm::exportFeedbackLog,
-                onClearSnackbar      = vm::clearSnackbar,
-                onToggleWebSearch    = vm::toggleWebSearch,
-                onSetPendingImage    = vm::setPendingImage,
-                onToggleSettings     = vm::toggleSettings,
-                onToggleImageGen     = vm::toggleImageGen,
-                onSaveUserName       = vm::saveUserName,
-                onSaveSystemPrompt   = vm::saveSystemPrompt,
-                currentSystemPrompt  = vm::fetchSystemPrompt,
-                onClearCrash         = vm::clearCrashLog,
-                onExportResponse     = vm::exportLastResponse,
-                onExportConversation = vm::exportConversation,
-                onClearExport        = vm::clearExportResult,
-                onShowAbout          = { showAbout = true },
-                // Show days remaining in drawer if trial
-                trialDaysRemaining   = if (subState == SubscriptionManager.SubscriptionState.TRIAL_ACTIVE)
-                    sub.getDaysRemaining() else -1L,
-                isAdmin              = subState == SubscriptionManager.SubscriptionState.ADMIN
-            )
-        }
+    if (!isActivated) {
+        // ── Not activated: show activation screen (first launch AND every launch) ─
+        ActivationScreen(
+            onActivateLicense = { username, key ->
+                val ok = LicenseValidator.activate(context, username, key)
+                if (ok) licenseInfo = LicenseValidator.check(context)
+                ok
+            },
+            onVerifyReceipt = { uri, process, date ->
+                isVerifying = true
+                val result = sub.verifyReceipt(uri, process, date)
+                verifyMessage = result.reason
+                isVerifying = false
+                if (result.valid) subState = sub.getState()
+            },
+            receiptVerificationMessage = verifyMessage,
+            isVerifyingReceipt = isVerifying
+        )
+        return
     }
+
+    // ── Activated: show main app ─────────────────────────────────────────────
+    val vm: ChatViewModel = viewModel()
+    val ui by vm.uiState.collectAsStateWithLifecycle()
+    val ctx = LocalContext.current
+
+    // Pass the stored username (from whichever path activated)
+    val activatedUsername = licenseInfo.username.ifBlank { sub.getUsername() }
+    LaunchedEffect(activatedUsername) {
+        if (activatedUsername.isNotBlank()) vm.saveUserName(activatedUsername)
+    }
+
+    ChatScreen(
+        uiState              = ui,
+        onInputChanged       = vm::onInputChanged,
+        onSendMessage        = vm::sendMessage,
+        onClearChat          = vm::clearChat,
+        onRetryLoadModel     = vm::retryLoadModel,
+        onNewSession         = vm::newSession,
+        onSwitchSession      = vm::switchSession,
+        onDeleteSession      = vm::deleteSession,
+        onRenameSession      = vm::renameSession,
+        onToggleDrawer       = vm::toggleDrawer,
+        onStartVoice         = { vm.startVoice(ctx) },
+        onStopVoice          = vm::stopVoice,
+        onThumbsUp           = { vm.submitFeedback(it, true) },
+        onThumbsDown         = { vm.submitFeedback(it, false) },
+        onDeleteMessage      = vm::deleteMessage,
+        onImportFineTune     = vm::importFineTune,
+        onExportFeedback     = vm::exportFeedbackLog,
+        onClearSnackbar      = vm::clearSnackbar,
+        onToggleWebSearch    = vm::toggleWebSearch,
+        onSetPendingImage    = vm::setPendingImage,
+        onToggleSettings     = vm::toggleSettings,
+        onToggleImageGen     = vm::toggleImageGen,
+        onSaveUserName       = vm::saveUserName,
+        onSaveSystemPrompt   = vm::saveSystemPrompt,
+        currentSystemPrompt  = vm::fetchSystemPrompt,
+        onClearCrash         = vm::clearCrashLog,
+        onExportResponse     = vm::exportLastResponse,
+        onExportConversation = vm::exportConversation,
+        onClearExport        = vm::clearExportResult,
+        onShowAbout          = { showAbout = true },
+        trialDaysRemaining   = licenseInfo.daysRemaining,
+        isAdmin              = subState == SubscriptionManager.SubscriptionState.ADMIN
+    )
 }
