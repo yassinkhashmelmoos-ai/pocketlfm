@@ -11,6 +11,14 @@ jobs:
     # Large runner needed for DreamLite conversion (~8GB RAM required)
 
     steps:
+    - name: Free Disk Space (Ubuntu)
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android/sdk/ndk
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          
       - name: Checkout code
         uses: actions/checkout@v4
 
