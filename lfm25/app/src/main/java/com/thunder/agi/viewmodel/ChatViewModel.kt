@@ -50,13 +50,14 @@ private fun buildZephyrPrompt(
     val sb = StringBuilder()
     sb.append("<|system|>\n$systemPrompt<|endoftext|>\n")
 
-    // Inject soft-prompt learned examples if available
+    // Inject up to 500 chars of learned examples — cap prevents context bloat
+    // which causes the model to echo examples instead of responding to the user
     if (softPromptCache.isNotBlank()) {
-        sb.append(softPromptCache).append("\n")
+        val capped = softPromptCache.take(500)
+        sb.append(capped).append("\n")
     }
 
     // Last 6 turns of THIS session only (3 user + 3 AI pairs)
-    // Keeping it short prevents the repetition loop seen in testing
     val recent = sessionHistory.takeLast(6)
     recent.forEach { msg ->
         if (msg.isUser) sb.append("<|user|>\n${msg.content}<|endoftext|>\n")
@@ -313,7 +314,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.Default + SupervisorJob()) {
             withContext(Dispatchers.Main) {
                 _ui.update { it.copy(isGenerating = true) }
-                _ui.update { it.copy(messages = it.messages +
+                _ui.update { s -> s.copy(messages =
+                        // Remove any stale loading message before adding the new one
+                        // — this prevents duplicate "Generating response" bubbles
+                        s.messages.filterNot { m -> m.isLoading } +
                         ChatMessage(content = "", isUser = false, isLoading = true,
                             thinkingStep = "Processing your request…")) }
             }
@@ -703,8 +707,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // Strip leftover "/> " artifacts
         s = s.replace(Regex("""^\s*/>""", RegexOption.MULTILINE), "").trim()
 
-        // Remove trailing incomplete tokens like "<|"
-        s = s.trimEnd().trimEnd('<').trimEnd('|').trim()
+        // Remove trailing incomplete template tokens like "<|" in one pass
+        s = s.trimEnd { it == '<' || it == '|' || it == ' ' || it == '\n' }
         return s.ifBlank { "…" }
     }
 
