@@ -100,7 +100,8 @@ data class ChatMessage(
     val isLoading: Boolean = false,
     val thinkingStep: String? = null,   // shown in collapsible thought box
     val mediaPath: String? = null,
-    val mediaType: String? = null
+    val mediaType: String? = null,
+    val timestamp: Long = System.currentTimeMillis()  // millis since epoch
 )
 
 data class ChatSession(val id: String, val title: String, val updatedAt: Long)
