@@ -206,15 +206,30 @@ class ImageGenerator(private val context: Context) {
                 return generateOnline(prompt, sourceImage)
             }
 
-            // Real classifier-free guidance diffusion loop:
-            // For each timestep, run UNet twice (uncond + cond) and blend.
-            val scheduler = DDPMScheduler(NUM_STEPS, currentGuidanceScale)
+            // Real classifier-free guidance diffusion loop.
+            // We replicate the DDPM math from DDPMScheduler inline so we can
+            // plug in the UNet noise prediction instead of the fake text-math.
+            val betas         = FloatArray(NUM_STEPS) { i -> 0.00085f + (0.012f - 0.00085f) * i / (NUM_STEPS - 1) }
+            val alphas        = FloatArray(NUM_STEPS) { i -> 1f - betas[i] }
+            val alphasCumprod = FloatArray(NUM_STEPS).also { ac ->
+                ac[0] = alphas[0]; for (i in 1 until NUM_STEPS) ac[i] = ac[i-1] * alphas[i]
+            }
+
             for (step in 0 until NUM_STEPS) {
                 progressCallback?.invoke(step + 3, NUM_STEPS + 3)
-                val timestep = scheduler.getTimestep(step)
 
-                // Batch latent x2 for classifier-free guidance [2, 4, 64, 64]
-                val batchedLatent = latent + latent  // FloatArray concat
+                // Map denoising step to UNet's 0-999 timestep range
+                val t         = NUM_STEPS - 1 - step                     // reversal index
+                val timestep  = (t.toLong() * 999L / (NUM_STEPS - 1)).toInt()  // scaled to 0-999
+
+                // Batch latent ×2 for classifier-free guidance → [2, 4, 64, 64]
+                val batchedLatent = FloatArray(latent.size * 2) { i ->
+                    if (i < latent.size) latent[i] else latent[i - latent.size]
+                }
+                // Concat [neg, text] embeds → [2, 77, 768]
+                val combinedEmbeds = FloatArray(negEmbeds.size + textEmbeds.size) { i ->
+                    if (i < negEmbeds.size) negEmbeds[i] else textEmbeds[i - negEmbeds.size]
+                }
 
                 val latentTensor = OnnxTensor.createTensor(onnxEnv,
                     java.nio.FloatBuffer.wrap(batchedLatent),
@@ -222,33 +237,40 @@ class ImageGenerator(private val context: Context) {
                 val timestepTensor = OnnxTensor.createTensor(onnxEnv,
                     java.nio.LongBuffer.wrap(longArrayOf(timestep.toLong(), timestep.toLong())),
                     longArrayOf(2))
-                // Concat [neg, text] embeds → shape [2, 77, 768]
-                val combinedEmbeds = negEmbeds + textEmbeds
                 val embedTensor = OnnxTensor.createTensor(onnxEnv,
                     java.nio.FloatBuffer.wrap(combinedEmbeds),
                     longArrayOf(2, 77, 768))
 
                 val output = unet.run(mapOf(
-                    "sample"                  to latentTensor,
-                    "timestep"                to timestepTensor,
-                    "encoder_hidden_states"   to embedTensor
+                    "sample"                to latentTensor,
+                    "timestep"              to timestepTensor,
+                    "encoder_hidden_states" to embedTensor
                 ))
 
-                val rawOutput = output[0].value
-                val noisePred4d = onnxOutputToPixelArray(rawOutput)  // reuse safe-cast helper
-                // noisePred4d[0] = uncond prediction, [1] = cond prediction
-                // Guided noise = uncond + scale * (cond - uncond)
-                val guidedNoise = FloatArray(4 * LATENT_DIM * LATENT_DIM) { i ->
-                    val ch = i / (LATENT_DIM * LATENT_DIM)
-                    val pos = i % (LATENT_DIM * LATENT_DIM)
-                    val y = pos / LATENT_DIM
-                    val x = pos % LATENT_DIM
-                    val uncond = noisePred4d[0][y][ch * LATENT_DIM + x]
-                    val cond   = noisePred4d[1][y][ch * LATENT_DIM + x]
-                    uncond + currentGuidanceScale * (cond - uncond)
-                }
+                // UNet output: [2, 4, 64, 64] — uncond=[0], cond=[1]
+                @Suppress("UNCHECKED_CAST")
+                val noisePred4d = output[0].value as? Array<Array<Array<FloatArray>>>
+                    ?: throw IllegalStateException("UNet output unexpected type: ${output[0].value?.javaClass?.simpleName}")
 
-                latent = scheduler.step(guidedNoise, step, latent)
+                // Classifier-free guidance: guided = uncond + scale * (cond - uncond)
+                val alphaT  = alphasCumprod[t]
+                val sigma   = sqrt((1f - alphaT) / alphaT)
+                val alphaT1 = if (t > 0) alphasCumprod[t - 1] else 1f
+
+                latent = FloatArray(latent.size) { i ->
+                    val ch  = i / (LATENT_DIM * LATENT_DIM)
+                    val pos = i % (LATENT_DIM * LATENT_DIM)
+                    val y   = pos / LATENT_DIM
+                    val x   = pos % LATENT_DIM
+                    val uncond = noisePred4d[0][ch][y][x]
+                    val cond   = noisePred4d[1][ch][y][x]
+                    val guidedNoise = uncond + currentGuidanceScale * (cond - uncond)
+
+                    // DDPM denoising step
+                    val predX0 = (latent[i] - sigma * guidedNoise) / sqrt(alphaT)
+                    val noise  = if (t > 0) kotlin.random.Random.nextFloat() * 0.01f else 0f
+                    sqrt(alphaT1) * predX0 + sqrt(1f - alphaT1) * noise
+                }
 
                 latentTensor.close(); timestepTensor.close()
                 embedTensor.close();  output[0].close()
