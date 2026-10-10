@@ -277,8 +277,7 @@ private fun SettingsSheet(
     onShowAbout: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    var nameEdit   by remember { mutableStateOf(userName) }
-    var promptEdit by remember { mutableStateOf(systemPrompt) }
+    var nameEdit by remember { mutableStateOf(userName) }
 
     Column(
         Modifier
@@ -291,7 +290,6 @@ private fun SettingsSheet(
             navigationIcon = {
                 IconButton(onClick = {
                     onSaveUserName(nameEdit)
-                    onSaveSystemPrompt(promptEdit)
                     onDismiss()
                 }) { Icon(Icons.Default.Check, null, tint = ThunderElectric) }
             },
@@ -309,14 +307,8 @@ private fun SettingsSheet(
                 placeholder = { Text("e.g. Yassin") }
             )
 
-            Text("AI Personality / System Prompt", style = MaterialTheme.typography.labelMedium, color = ThunderGray)
-            OutlinedTextField(
-                value = promptEdit,
-                onValueChange = { promptEdit = it },
-                modifier = Modifier.fillMaxWidth().height(160.dp),
-                maxLines = 8,
-                colors = outlinedTextFieldColors()
-            )
+            // System prompt is managed internally by the model's learning system —
+            // no need to expose it to the user.
 
             HorizontalDivider(color = ThunderMidBlue)
 
@@ -342,6 +334,8 @@ private fun SettingsSheet(
                 Text("View Feedback Log Path", color = ThunderGray)
             }
 
+            HorizontalDivider(color = ThunderMidBlue)
+
             Text("WhatsApp Sync", style = MaterialTheme.typography.labelMedium, color = ThunderGray)
             Text(
                 "Create a WhatsApp chat named \"Thunder AGI\". The app reads update " +
@@ -352,16 +346,18 @@ private fun SettingsSheet(
 
             HorizontalDivider(color = ThunderMidBlue)
 
+            // About — always visible at the bottom of Settings
             OutlinedButton(
                 onClick = {
                     onSaveUserName(nameEdit)
-                    onSaveSystemPrompt(promptEdit)
                     onDismiss()
                     onShowAbout()
                 },
                 modifier = Modifier.fillMaxWidth(),
                 border = BorderStroke(1.dp, ThunderElectric)
             ) {
+                Icon(Icons.Default.Info, null, tint = ThunderElectric)
+                Spacer(Modifier.width(8.dp))
                 Text("About Thunder AGI", color = ThunderElectric)
             }
         }
@@ -517,8 +513,15 @@ private fun MessageBubble(
 ) {
     val isUser = msg.isUser
     val clipboard = LocalClipboardManager.current
-    var showMenu by remember { mutableStateOf(false) }
-    var showThinking by remember { mutableStateOf(false) }
+    var showMenu      by remember { mutableStateOf(false) }
+    var showThinking  by remember { mutableStateOf(false) }
+    var showTimestamp by remember { mutableStateOf(false) }
+
+    // Format timestamp as HH:mm  dd/MM/yyyy
+    val formattedTime = remember(msg.timestamp) {
+        java.text.SimpleDateFormat("HH:mm  dd/MM/yyyy", java.util.Locale.getDefault())
+            .format(java.util.Date(msg.timestamp))
+    }
 
     Row(
         modifier = Modifier.fillMaxWidth(),
