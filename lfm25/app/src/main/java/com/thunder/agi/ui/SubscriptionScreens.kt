@@ -20,6 +20,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.*
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.*
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
 import coil.compose.AsyncImage
 import com.thunder.agi.R
@@ -138,6 +139,33 @@ private fun LicenseKeyTab(
             unfocusedContainerColor = ThunderDeepBlue
         )
 
+        // WhatsApp hint — how to get a key
+        val uriHandlerLic = LocalUriHandler.current
+        Card(
+            Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = ThunderDeepBlue),
+            border = BorderStroke(1.dp, ThunderGreen.copy(alpha = 0.4f))
+        ) {
+            Row(
+                Modifier
+                    .clickable { uriHandlerLic.openUri("https://wa.me/message/thunder.agi") }
+                    .padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("📱", fontSize = 16.sp)
+                Spacer(Modifier.width(8.dp))
+                Column {
+                    Text("للحصول على مفتاح الترخيص:",
+                        color = ThunderGray, style = MaterialTheme.typography.labelSmall)
+                    Text("واتساب: @thunder.agi",
+                        color = ThunderGreen, style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+
         OutlinedTextField(
             value = username,
             onValueChange = { username = it; error = ""; success = false },
@@ -225,6 +253,40 @@ private fun BankReceiptTab(
         Text("يتم مراجعة الإيصال تلقائياً بالذكاء الاصطناعي",
             style = MaterialTheme.typography.bodySmall, color = ThunderGray,
             textAlign = TextAlign.Center)
+
+        // WhatsApp contact card
+        Spacer(Modifier.height(12.dp))
+        val uriHandler = LocalUriHandler.current
+        Card(
+            Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = ThunderDeepBlue),
+            border = BorderStroke(1.dp, ThunderGreen.copy(alpha = 0.4f))
+        ) {
+            Column(
+                Modifier.padding(12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Text("للحصول على مفاتيح الدخول أو الدعم، تواصل معنا:",
+                    color = ThunderGray, style = MaterialTheme.typography.bodySmall,
+                    textAlign = TextAlign.Center)
+                Row(
+                    Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(ThunderGreen.copy(alpha = 0.15f))
+                        .clickable { uriHandler.openUri("https://wa.me/message/thunder.agi") }
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("📱", fontSize = 16.sp)
+                    Spacer(Modifier.width(8.dp))
+                    Text("واتساب: @thunder.agi",
+                        color = ThunderGreen,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold)
+                }
+            }
+        }
 
         Spacer(Modifier.height(16.dp))
 
@@ -578,15 +640,19 @@ fun AboutScreen(onDismiss: () -> Unit) {
 
             HorizontalDivider(color = ThunderMidBlue)
 
-            // Arabic description
+            // ── Arabic description (exact text as provided) ────────────────
             Card(
                 Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = ThunderDeepBlue)
             ) {
                 Text(
-                    """بسم الله الرحمن الرحيم
-
-تطبيق الرَّعد للذكاء العام المصطنع هو تطبيق سوداني المنشأ بالدفع الآجل وهو تطبيق ذو صلاحيات كبيرة وموزع يعمل بدون إنترنت وبالإنترنت وبالتواصل مع بقية التطبيقات عند مختلف المستخدمين، يستعمل معلومات المستخدم وطبيعتها لبناء شخصية رقمية عنه ومشاركة مهارات المستخدم مع بقية المستخدمين من خلال التطبيق الموزع حيث يتطور النموذج من التفاعل مع المستخدمين وغيره ويستطيع أداء مختلف المهام الموكلة إليه.""",
+                    "بسم الله الرحمن الرحيم\n\n" +
+                    "تطبيق الرَّعد للذكاء العام المصطنع هو تطبيق سوداني المنشأ بالدفع الاجل " +
+                    "و هو تطبيق ذو صلاحيات كبيرة وموزع يعمل بدون انترنت و بالانترنت وبالتواصل " +
+                    "مع بقية التطبيقات عند مختلف المستخدمين، يستعمل معلومات المستخدم و طبيعتها " +
+                    "لبناء شخصية رقمية عنه و مشاركة مهارات المستخدم مع بقية المستخدمين من خلال " +
+                    "التطبيق الموزع حيث يتطور النموذج من التفاعل مع المستخدمين و غيره و يستطيع " +
+                    "اداء مختلف المهام الموكلة إليه.",
                     Modifier.padding(20.dp),
                     color = ThunderWhite,
                     style = MaterialTheme.typography.bodyMedium,
@@ -597,7 +663,7 @@ fun AboutScreen(onDismiss: () -> Unit) {
 
             HorizontalDivider(color = ThunderMidBlue)
 
-            // Technical info
+            // ── Technical info ─────────────────────────────────────────────
             InfoRow("الإصدار", "v3.0 — Thunder AGI")
             InfoRow("النموذج", "LFM2.5-VL-450M (Q4_K_M)")
             InfoRow("المطور", "ياسين خشيلموس")
@@ -606,28 +672,58 @@ fun AboutScreen(onDismiss: () -> Unit) {
 
             HorizontalDivider(color = ThunderMidBlue)
 
-            // Contact
+            // ── Contact ────────────────────────────────────────────────────
+            val uriHandler = LocalUriHandler.current
             Card(
                 Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = ThunderDeepBlue)
+                colors = CardDefaults.cardColors(containerColor = ThunderDeepBlue),
+                border = BorderStroke(1.dp, ThunderMidBlue)
             ) {
-                Column(Modifier.padding(16.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("يمكنك التواصل معنا عبر الإيميل:",
+                Column(
+                    Modifier.padding(20.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text("يمكنك التواصل معنا عبر الايميل:",
                         color = ThunderGray, style = MaterialTheme.typography.bodySmall,
                         textAlign = TextAlign.Center)
-                    Spacer(Modifier.height(4.dp))
-                    Text("thunderagi.app@gmail.com",
+                    Text(
+                        "thunderagi.app@gmail.com",
                         color = ThunderElectric,
                         style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold)
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.clickable {
+                            uriHandler.openUri("mailto:thunderagi.app@gmail.com")
+                        }
+                    )
+
+                    HorizontalDivider(color = ThunderMidBlue)
+
+                    Text("أو الواتساب:", color = ThunderGray,
+                        style = MaterialTheme.typography.bodySmall,
+                        textAlign = TextAlign.Center)
+                    Row(
+                        Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(ThunderGreen.copy(alpha = 0.15f))
+                            .clickable { uriHandler.openUri("https://wa.me/message/thunder.agi") }
+                            .padding(horizontal = 20.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Text("📱", fontSize = 18.sp)
+                        Spacer(Modifier.width(8.dp))
+                        Text("@thunder.agi",
+                            color = ThunderGreen,
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold)
+                    }
                 }
             }
 
-            // License note
+            // ── Release date & copyright ───────────────────────────────────
             Text(
-                "© 2026 ياسين خشيلموس — جميع الحقوق محفوظة\n" +
-                "Thunder AGI Proprietary License",
+                "23/6/2026\n© 2026 ياسين خشيلموس — جميع الحقوق محفوظة",
                 color = ThunderGray,
                 style = MaterialTheme.typography.labelSmall,
                 textAlign = TextAlign.Center,
