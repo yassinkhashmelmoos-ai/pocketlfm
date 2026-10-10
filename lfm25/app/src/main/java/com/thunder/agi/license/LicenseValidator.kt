@@ -71,7 +71,7 @@ object LicenseValidator {
         getPrefs(context).getString(KEY_USERNAME, "") ?: ""
 
     /** Clear stored credentials (e.g. user wants to enter a new key). */
-    fun clear(context: Context) = getPrefs(context).edit().clear().apply()
+    fun clear(context: Context) { getPrefs(context).edit().clear().apply() }
 
     // ── Internal helpers ───────────────────────────────────────────────────
 
