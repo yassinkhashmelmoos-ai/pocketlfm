@@ -74,32 +74,76 @@ class UpdateNotificationListener : NotificationListenerService() {
     }
 
     private fun processUpdateMessage(text: String) {
-        val filesDir = applicationContext.filesDir
-
         when {
-            // Model update instructions from central hub
+            // [UPDATE] → TinyRL params. Format: temp=0.72,top_p=0.88,rep=1.13,topic=general
+            // These are applied immediately to SharedPreferences — TinyRL reads them on next inference.
             text.startsWith(UPDATE_PREFIX, ignoreCase = true) -> {
                 val content = text.removePrefix(UPDATE_PREFIX).trim()
-                File(filesDir, "pending_update.txt").appendText("$content\n")
-                Log.i(TAG, "Update instruction queued: ${content.take(50)}")
+                applyTinyRLParams(content)
             }
 
-            // Sync acknowledgment from hub
+            // [SYNC] → base64-gzipped JSONL fine-tune data.
+            // Decompressed and appended to channel_finetune.jsonl for NightlyTrainer to read at 2AM.
             text.startsWith(SYNC_PREFIX, ignoreCase = true) -> {
                 val content = text.removePrefix(SYNC_PREFIX).trim()
-                File(filesDir, "sync_log.txt").appendText(
-                    "${System.currentTimeMillis()}: $content\n"
-                )
-                Log.i(TAG, "Sync confirmed: ${content.take(50)}")
+                applyCompressedData(content, applicationContext.filesDir)
             }
 
-            // Any other message in Thunder AGI chat → store as fine-tune data
+            // Plain text messages in the Thunder AGI chat → training data
+            // (File-download notifications like "John sent a file" are ignored;
+            //  WhatsAppFolderWatcher handles the actual files)
             else -> {
-                File(filesDir, "channel_finetune.jsonl").appendText(
-                    """{"source":"whatsapp_channel","text":${text.jsonStr()},"ts":${System.currentTimeMillis()}}""" + "\n"
-                )
-                Log.i(TAG, "Channel message stored for fine-tuning")
+                Log.i(TAG, "Plain message in Thunder AGI chat — ignored (file watcher handles files)")
             }
+        }
+    }
+
+    /**
+     * Parse and immediately apply TinyRL hyperparameters.
+     * Format: temp=0.72,top_p=0.88,rep=1.13,topic=general
+     * Values are clamped to safe ranges before storing.
+     */
+    private fun applyTinyRLParams(content: String) {
+        try {
+            val map = content.split(",").associate {
+                val parts = it.trim().split("=")
+                parts[0].trim() to parts[1].trim()
+            }
+            val topic = map["topic"] ?: "general"
+            val key   = topic.lowercase().take(32)
+
+            applicationContext
+                .getSharedPreferences("tinyrl_prefs", Context.MODE_PRIVATE)
+                .edit().apply {
+                    map["temp"]?.toFloatOrNull()
+                        ?.coerceIn(0.15f, 0.95f)?.let { putFloat("${key}_temp",  it) }
+                    map["top_p"]?.toFloatOrNull()
+                        ?.coerceIn(0.70f, 0.98f)?.let { putFloat("${key}_top_p", it) }
+                    map["rep"]?.toFloatOrNull()
+                        ?.coerceIn(1.05f, 1.30f)?.let { putFloat("${key}_rep",   it) }
+                }.apply()
+
+            Log.i(TAG, "TinyRL params applied: $content")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to apply TinyRL params: ${e.message}")
+        }
+    }
+
+    /**
+     * Decompress base64-gzipped JSONL data and append to channel_finetune.jsonl.
+     * NightlyTrainer reads this file automatically at 2AM.
+     */
+    private fun applyCompressedData(b64: String, filesDir: File) {
+        try {
+            val bytes = android.util.Base64.decode(b64, android.util.Base64.NO_WRAP)
+            val text  = java.util.zip.GZIPInputStream(
+                java.io.ByteArrayInputStream(bytes)
+            ).bufferedReader(Charsets.UTF_8).readText()
+
+            File(filesDir, "channel_finetune.jsonl").appendText(text + "\n")
+            Log.i(TAG, "Sync data applied: ${text.lines().size} lines added to channel_finetune.jsonl")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to decompress sync data: ${e.message}")
         }
     }
 
