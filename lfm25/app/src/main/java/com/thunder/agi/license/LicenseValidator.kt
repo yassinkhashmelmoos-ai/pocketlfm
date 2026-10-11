@@ -99,12 +99,16 @@ object LicenseValidator {
 
     private fun isExpired(expiryDate: String): Boolean = daysUntil(expiryDate) < 0
 
-    private fun daysUntil(expiryDate: String): Long = try {
-        val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
-        sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
-        val exp = sdf.parse(expiryDate)?.time ?: return -1L
-        (exp - System.currentTimeMillis()) / (1000L * 60 * 60 * 24)
-    } catch (e: Exception) { -1L }
+    private fun daysUntil(expiryDate: String): Long {
+        return try {
+            val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+            sdf.timeZone = java.util.TimeZone.getTimeZone("UTC")
+            val exp = sdf.parse(expiryDate)?.time ?: return -1L
+            (exp - System.currentTimeMillis()) / (1000L * 60 * 60 * 24)
+        } catch (e: Exception) {
+            -1L
+        }
+    }
 
     private fun getPrefs(context: Context): android.content.SharedPreferences {
         val masterKey = MasterKey.Builder(context)
