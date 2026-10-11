@@ -68,6 +68,7 @@ fun ChatScreen(
     onExportConversation: () -> Unit,
     onClearExport: () -> Unit,
     onShowAbout: () -> Unit = {},
+    onGetPeerSync: () -> com.thunder.agi.p2p.PeerSync,
     trialDaysRemaining: Long = -1L,
     isAdmin: Boolean = false,
     modifier: Modifier = Modifier
@@ -159,6 +160,7 @@ fun ChatScreen(
             onExportFeedback = onExportFeedback,
             onImportFineTune = { ftPicker.launch("*/*") },
             onShowAbout = onShowAbout,
+            onGetPeerSync = onGetPeerSync,
             onDismiss = onToggleSettings
         )
         return
@@ -275,6 +277,7 @@ private fun SettingsSheet(
     onExportFeedback: () -> Unit,
     onImportFineTune: () -> Unit,
     onShowAbout: () -> Unit,
+    onGetPeerSync: () -> com.thunder.agi.p2p.PeerSync,
     onDismiss: () -> Unit
 ) {
     var nameEdit by remember { mutableStateOf(userName) }
@@ -345,6 +348,9 @@ private fun SettingsSheet(
             )
 
             HorizontalDivider(color = ThunderMidBlue)
+
+            // WiFi Direct peer sync panel
+            PeerSyncPanel(peerSync = onGetPeerSync())
 
             // About — always visible at the bottom of Settings
             OutlinedButton(
@@ -1041,3 +1047,73 @@ private fun outlinedTextFieldColors() = OutlinedTextFieldDefaults.colors(
     focusedContainerColor = ThunderDeepBlue,
     unfocusedContainerColor = ThunderDeepBlue
 )
+
+// ── WiFi Direct Peer Sync Panel ───────────────────────────────────────────────
+
+@Composable
+fun PeerSyncPanel(peerSync: com.thunder.agi.p2p.PeerSync) {
+    val state by peerSync.state.collectAsState()
+
+    Column(Modifier.fillMaxWidth()) {
+        Text("WiFi Sync مزامنة لاسلكية",
+            style = MaterialTheme.typography.labelMedium, color = ThunderGray)
+
+        Spacer(Modifier.height(6.dp))
+
+        // Status
+        Text(
+            text = when {
+                state.error != null             -> "⚠ ${state.error}"
+                state.transferProgress != null  -> "⟳ ${state.transferProgress}"
+                state.lastSyncResult != null    -> "✓ ${state.lastSyncResult}"
+                state.isConnected               -> "متصل بـ ${state.connectedDevice}"
+                state.isDiscovering             -> "جارٍ البحث عن الأجهزة القريبة…"
+                else                            -> "غير نشط"
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = when {
+                state.error != null            -> ThunderRed
+                state.lastSyncResult != null   -> ThunderGreen
+                else                           -> ThunderGray
+            }
+        )
+
+        Spacer(Modifier.height(8.dp))
+
+        // Discover / Stop button
+        OutlinedButton(
+            onClick = {
+                if (state.isDiscovering || state.isConnected) peerSync.disconnect()
+                else peerSync.discoverPeers()
+            },
+            modifier = Modifier.fillMaxWidth(),
+            border = BorderStroke(1.dp, ThunderMidBlue)
+        ) {
+            Text(
+                if (state.isDiscovering || state.isConnected) "إيقاف المزامنة" else "بحث عن الأجهزة القريبة",
+                color = ThunderElectric
+            )
+        }
+
+        // Peer list
+        if (state.peers.isNotEmpty()) {
+            Spacer(Modifier.height(6.dp))
+            Text("الأجهزة المكتشفة:", style = MaterialTheme.typography.labelSmall, color = ThunderGray)
+            state.peers.forEach { device ->
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        device.deviceName.ifBlank { device.deviceAddress },
+                        style = MaterialTheme.typography.bodySmall, color = ThunderWhite
+                    )
+                    TextButton(onClick = { peerSync.connectToPeer(device) }) {
+                        Text("مزامنة", color = ThunderElectric)
+                    }
+                }
+            }
+        }
+    }
+}
