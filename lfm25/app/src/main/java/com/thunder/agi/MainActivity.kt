@@ -86,6 +86,12 @@ fun ThunderAGIApp() {
     val vm: ChatViewModel = viewModel()
     val ui by vm.uiState.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
+    val peerSync = remember { com.thunder.agi.p2p.PeerSync(ctx) }
+
+    DisposableEffect(Unit) {
+        peerSync.register()
+        onDispose { peerSync.unregister() }
+    }
 
     // Pass the stored username (from whichever path activated)
     val activatedUsername = licenseInfo.username.ifBlank { sub.getUsername() }
@@ -124,6 +130,7 @@ fun ThunderAGIApp() {
         onExportConversation = vm::exportConversation,
         onClearExport        = vm::clearExportResult,
         onShowAbout          = { showAbout = true },
+        onGetPeerSync        = { peerSync },
         trialDaysRemaining   = licenseInfo.daysRemaining,
         isAdmin              = subState == SubscriptionManager.SubscriptionState.ADMIN
     )
