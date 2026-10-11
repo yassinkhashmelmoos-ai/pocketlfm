@@ -146,17 +146,31 @@ class PeerSync(private val context: Context) {
     private fun startServer() {
         serverJob?.cancel()
         serverJob = scope.launch {
+            var server: ServerSocket? = null
             try {
-                val server = ServerSocket(SYNC_PORT)
+                server = ServerSocket(SYNC_PORT)
+                server.soTimeout = 120_000   // stop waiting after 2 minutes idle
                 Log.i(TAG, "Server listening on $SYNC_PORT")
-                _state.value = _state.value.copy(transferProgress = "Waiting for peer…")
 
-                val client = server.accept()
-                server.close()
-                handleConnection(client, isServer = true)
+                // Accept multiple peers one after another without restarting the app
+                while (isActive) {
+                    _state.value = _state.value.copy(transferProgress = "Waiting for peer…")
+                    try {
+                        val client = server.accept()
+                        handleConnection(client, isServer = true)
+                    } catch (e: java.net.SocketTimeoutException) {
+                        Log.i(TAG, "Server timeout — no more peers expected")
+                        break
+                    }
+                }
             } catch (e: Exception) {
-                Log.e(TAG, "Server error: ${e.message}")
-                _state.value = _state.value.copy(error = "Sync error: ${e.message}")
+                if (isActive) {
+                    Log.e(TAG, "Server error: ${e.message}")
+                    _state.value = _state.value.copy(error = "Sync error: ${e.message}")
+                }
+            } finally {
+                server?.close()
+                _state.value = _state.value.copy(transferProgress = null)
             }
         }
     }
@@ -208,7 +222,7 @@ class PeerSync(private val context: Context) {
             }
             out.flush()
 
-            // Receive peer's files
+            // Receive peer's files and merge intelligently
             val count = inp.readInt()
             var received = 0
             for (i in 0 until count) {
@@ -217,9 +231,36 @@ class PeerSync(private val context: Context) {
                 if (size > 0) {
                     val bytes = ByteArray(size)
                     inp.readFully(bytes)
-                    // Merge into our file (append, don't overwrite)
-                    val dest = File(filesDir, "peer_$name")
-                    dest.writeBytes(bytes)
+                    val dest = File(filesDir, name)  // same name, no peer_ prefix
+
+                    when {
+                        // JSONL: append only new lines, skip duplicates
+                        name.endsWith(".jsonl") -> {
+                            val existing = if (dest.exists())
+                                dest.readLines().toHashSet()
+                            else
+                                hashSetOf()
+                            val incoming = String(bytes, Charsets.UTF_8)
+                                .lines()
+                                .filter { it.isNotBlank() && it !in existing }
+                            if (incoming.isNotEmpty()) {
+                                dest.appendText(incoming.joinToString("\n") + "\n")
+                                Log.i(TAG, "Merged ${incoming.size} new lines into $name")
+                            }
+                        }
+                        // TXT: overwrite only if peer's version is newer/larger
+                        name.endsWith(".txt") -> {
+                            if (!dest.exists() || bytes.size > dest.length()) {
+                                dest.writeBytes(bytes)
+                                Log.i(TAG, "Updated $name from peer")
+                            }
+                        }
+                        // Anything else: write directly
+                        else -> {
+                            dest.writeBytes(bytes)
+                            Log.i(TAG, "Received $name from peer")
+                        }
+                    }
                     received++
                 }
             }
