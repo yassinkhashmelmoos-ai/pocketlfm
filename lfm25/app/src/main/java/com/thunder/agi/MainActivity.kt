@@ -1,7 +1,6 @@
 package com.thunder.agi
 
 import android.os.Bundle
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -9,7 +8,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.*
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -40,21 +38,25 @@ class MainActivity : ComponentActivity() {
 fun ThunderAGIApp() {
     val context = LocalContext.current
 
-    // ── License check: BOTH paths must be checked ────────────────────────────
-    // Path 1: HMAC-signed license key (LicenseValidator)
-    // Path 2: Bank of Khartoum receipt (SubscriptionManager — keeps AI receipt check)
-    val sub = remember { SubscriptionManager(context) }
+    val sub         = remember { SubscriptionManager(context) }
     var licenseInfo by remember { mutableStateOf(LicenseValidator.check(context)) }
     var subState    by remember { mutableStateOf(sub.getState()) }
 
-    // User is allowed in if EITHER path is valid
-    val isActivated = licenseInfo.status == LicenseValidator.Status.VALID ||
-            subState == SubscriptionManager.SubscriptionState.PAID_ACTIVE ||
-            subState == SubscriptionManager.SubscriptionState.ADMIN
+    // FIX: use derivedStateOf so UI reacts immediately when subState changes after payment.
+    // FIX: added TRIAL_ACTIVE — without this, new users on their free trial were
+    //      permanently locked out on the activation screen.
+    val isActivated by remember {
+        derivedStateOf {
+            licenseInfo.status == LicenseValidator.Status.VALID ||
+            subState == SubscriptionManager.SubscriptionState.PAID_ACTIVE  ||
+            subState == SubscriptionManager.SubscriptionState.ADMIN        ||
+            subState == SubscriptionManager.SubscriptionState.TRIAL_ACTIVE  // ← NEW
+        }
+    }
 
-    var showAbout      by remember { mutableStateOf(false) }
-    var verifyMessage  by remember { mutableStateOf("") }
-    var isVerifying    by remember { mutableStateOf(false) }
+    var showAbout     by remember { mutableStateOf(false) }
+    var verifyMessage by remember { mutableStateOf("") }
+    var isVerifying   by remember { mutableStateOf(false) }
 
     if (showAbout) {
         AboutScreen(onDismiss = { showAbout = false })
@@ -62,7 +64,6 @@ fun ThunderAGIApp() {
     }
 
     if (!isActivated) {
-        // ── Not activated: show activation screen (first launch AND every launch) ─
         ActivationScreen(
             onActivateLicense = { username, key ->
                 val ok = LicenseValidator.activate(context, username, key)
@@ -70,19 +71,18 @@ fun ThunderAGIApp() {
                 ok
             },
             onVerifyReceipt = { uri, process, date ->
-                isVerifying = true
-                val result = sub.verifyReceipt(uri, process, date)
+                isVerifying   = true
+                val result    = sub.verifyReceipt(uri, process, date)
                 verifyMessage = result.reason
-                isVerifying = false
+                isVerifying   = false
                 if (result.valid) subState = sub.getState()
             },
             receiptVerificationMessage = verifyMessage,
-            isVerifyingReceipt = isVerifying
+            isVerifyingReceipt         = isVerifying
         )
         return
     }
 
-    // ── Activated: show main app ─────────────────────────────────────────────
     val vm: ChatViewModel = viewModel()
     val ui by vm.uiState.collectAsStateWithLifecycle()
     val ctx = LocalContext.current
@@ -93,10 +93,13 @@ fun ThunderAGIApp() {
         onDispose { peerSync.unregister() }
     }
 
-    // Pass the stored username (from whichever path activated)
+    // FIX: only seed username once — LaunchedEffect(Unit) prevents overwriting
+    // the user's manually-changed name on every recomposition
     val activatedUsername = licenseInfo.username.ifBlank { sub.getUsername() }
-    LaunchedEffect(activatedUsername) {
-        if (activatedUsername.isNotBlank()) vm.saveUserName(activatedUsername)
+    LaunchedEffect(Unit) {
+        if (activatedUsername.isNotBlank() && ui.userName == "You") {
+            vm.saveUserName(activatedUsername)
+        }
     }
 
     ChatScreen(
@@ -131,6 +134,10 @@ fun ThunderAGIApp() {
         onClearExport        = vm::clearExportResult,
         onShowAbout          = { showAbout = true },
         onGetPeerSync        = { peerSync },
+        // FIX: wire edit+resend callback
+        onEditMessage        = vm::editAndResend,
+        // FIX: wire feedback log dialog dismiss
+        onDismissFeedbackDialog = vm::dismissFeedbackLogDialog,
         trialDaysRemaining   = licenseInfo.daysRemaining,
         isAdmin              = subState == SubscriptionManager.SubscriptionState.ADMIN
     )
