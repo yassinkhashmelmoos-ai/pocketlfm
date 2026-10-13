@@ -86,13 +86,16 @@ llm_build_lfm2::llm_build_lfm2(const llama_model & model, const llm_graph_params
         }
 
         // IMPROVEMENT 5: learnable residual scale α per layer
-        // α is stored in attn_q_norm weight of recurrent layers (unused there for QK norm).
-        // For attention layers attn_q_norm is used for QK norm so we skip scaling there.
-        // This is a no-op with existing weights (α initialised to ones by llama.cpp for
-        // missing tensors), but enables future fine-tuning to tune residual depth.
+        // ggml_scale() takes a float, not a tensor, in this ggml version.
+        // We read the scalar value from the weight tensor at inference time.
+        // This is a no-op with existing weights (defaults to 1.0) but enables
+        // fine-tuning to adjust residual depth without architecture changes.
         if (hparams.is_recurrent(il) && model.layers[il].attn_q_norm != nullptr
                 && ggml_nelements(model.layers[il].attn_q_norm) == 1) {
-            cur = ggml_scale(ctx0, cur, model.layers[il].attn_q_norm);
+            const float alpha = ggml_get_f32_1d(model.layers[il].attn_q_norm, 0);
+            if (alpha != 1.0f) {
+                cur = ggml_scale(ctx0, cur, alpha);
+            }
         }
 
         cur = ggml_add(ctx0, prev_cur, cur);
