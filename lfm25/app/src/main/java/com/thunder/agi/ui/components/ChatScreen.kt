@@ -20,8 +20,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.*
 import androidx.compose.ui.draw.*
 import androidx.compose.ui.graphics.*
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.*
 import androidx.compose.ui.text.font.FontFamily
@@ -32,51 +30,54 @@ import androidx.compose.ui.unit.*
 import coil.compose.AsyncImage
 import com.thunder.agi.ui.theme.*
 import com.thunder.agi.viewmodel.*
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
-    uiState: ChatUiState,
-    onInputChanged: (String) -> Unit,
-    onSendMessage: () -> Unit,
-    onClearChat: () -> Unit,
-    onRetryLoadModel: () -> Unit,
-    onNewSession: () -> Unit,
-    onSwitchSession: (String) -> Unit,
-    onDeleteSession: (String) -> Unit,
-    onRenameSession: (String, String) -> Unit,
-    onToggleDrawer: () -> Unit,
-    onStartVoice: () -> Unit,
-    onStopVoice: () -> Unit,
-    onThumbsUp: (String) -> Unit,
-    onThumbsDown: (String) -> Unit,
-    onDeleteMessage: (String) -> Unit,
-    onImportFineTune: (Uri) -> Unit,
-    onExportFeedback: () -> Unit,
-    onClearSnackbar: () -> Unit,
-    onToggleWebSearch: () -> Unit,
-    onSetPendingImage: (Uri?) -> Unit,
-    onToggleSettings: () -> Unit,
-    onSaveUserName: (String) -> Unit,
-    onSaveSystemPrompt: (String) -> Unit,
+    uiState:             ChatUiState,
+    onInputChanged:      (String) -> Unit,
+    onSendMessage:       () -> Unit,
+    onClearChat:         () -> Unit,
+    onRetryLoadModel:    () -> Unit,
+    onNewSession:        () -> Unit,
+    onSwitchSession:     (String) -> Unit,
+    onDeleteSession:     (String) -> Unit,
+    onRenameSession:     (String, String) -> Unit,
+    onToggleDrawer:      () -> Unit,
+    onStartVoice:        () -> Unit,
+    onStopVoice:         () -> Unit,
+    onThumbsUp:          (String) -> Unit,
+    onThumbsDown:        (String) -> Unit,
+    onDeleteMessage:     (String) -> Unit,
+    onImportFineTune:    (Uri) -> Unit,
+    onExportFeedback:    () -> Unit,
+    onClearSnackbar:     () -> Unit,
+    onToggleWebSearch:   () -> Unit,
+    onSetPendingImage:   (Uri?) -> Unit,
+    onToggleSettings:    () -> Unit,
+    onSaveUserName:      (String) -> Unit,
+    onSaveSystemPrompt:  (String) -> Unit,
     currentSystemPrompt: () -> String,
-    onClearCrash: () -> Unit,
-    onToggleImageGen: () -> Unit,
-    onExportResponse: () -> Unit,
-    onExportConversation: () -> Unit,
-    onClearExport: () -> Unit,
-    onShowAbout: () -> Unit = {},
-    onGetPeerSync: () -> com.thunder.agi.p2p.PeerSync,
-    trialDaysRemaining: Long = -1L,
-    isAdmin: Boolean = false,
-    modifier: Modifier = Modifier
+    onClearCrash:        () -> Unit,
+    onToggleImageGen:    () -> Unit,
+    onExportResponse:    () -> Unit,
+    onExportConversation:() -> Unit,
+    onClearExport:       () -> Unit,
+    onShowAbout:         () -> Unit = {},
+    onGetPeerSync:       () -> com.thunder.agi.p2p.PeerSync,
+    onEditMessage:       ((String, String) -> Unit)? = null,   // FIX: edit+resend
+    onDismissFeedbackDialog: (() -> Unit)? = null,             // FIX: feedback dialog
+    trialDaysRemaining:  Long    = -1L,
+    isAdmin:             Boolean = false,
+    modifier:            Modifier = Modifier
 ) {
-    val listState     = rememberLazyListState()
-    val scope         = rememberCoroutineScope()
-    val snackbarHost  = remember { SnackbarHostState() }
-    val context       = LocalContext.current
+    val listState    = rememberLazyListState()
+    val scope        = rememberCoroutineScope()
+    val snackbarHost = remember { SnackbarHostState() }
+    val context      = LocalContext.current
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         onSetPendingImage(uri)
@@ -85,7 +86,7 @@ fun ChatScreen(
         uri?.let { onImportFineTune(it) }
     }
     val micPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-        if (ok) onStartVoice() else { /* snackbar handled in VM */ }
+        if (ok) onStartVoice()
     }
 
     LaunchedEffect(uiState.messages.size) {
@@ -97,9 +98,30 @@ fun ChatScreen(
         uiState.snackbar?.let { snackbarHost.showSnackbar(it); onClearSnackbar() }
     }
 
+    // FIX: Feedback log dialog (was a snackbar hidden behind Settings panel)
+    uiState.feedbackLogDialog?.let { msg ->
+        AlertDialog(
+            onDismissRequest = { onDismissFeedbackDialog?.invoke() },
+            title = { Text("📄 Feedback Log", color = ThunderWhite) },
+            text = { Text(msg, color = ThunderGray, style = MaterialTheme.typography.bodySmall) },
+            confirmButton = {
+                val clipboard = LocalClipboardManager.current
+                TextButton(onClick = {
+                    clipboard.setText(androidx.compose.ui.text.AnnotatedString(msg))
+                    onDismissFeedbackDialog?.invoke()
+                }) { Text("Copy Path", color = ThunderElectric) }
+            },
+            dismissButton = {
+                TextButton(onClick = { onDismissFeedbackDialog?.invoke() }) {
+                    Text("Close", color = ThunderGray)
+                }
+            },
+            containerColor = ThunderDeepBlue
+        )
+    }
+
     // Export result dialog
     uiState.exportResult?.let { result ->
-        val ctx = LocalContext.current
         AlertDialog(
             onDismissRequest = onClearExport,
             title = { Text("✅ Exported", color = ThunderWhite) },
@@ -118,7 +140,7 @@ fun ChatScreen(
                         putExtra(Intent.EXTRA_STREAM, result.uri)
                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                     }
-                    ctx.startActivity(Intent.createChooser(intent, "Share file"))
+                    context.startActivity(Intent.createChooser(intent, "Share file"))
                     onClearExport()
                 }) { Text("Share / Save", color = ThunderElectric) }
             },
@@ -135,53 +157,53 @@ fun ChatScreen(
             title = { Text("⚠️ Error Report") },
             text = {
                 Column {
-                    Text("An error occurred. You can copy this and send it to the developer:", style = MaterialTheme.typography.bodySmall)
+                    Text("An error occurred. Copy and send to developer:",
+                        style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(8.dp))
                     Text(crash, style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                         color = ThunderRed)
                 }
             },
             confirmButton = {
-                TextButton(onClick = { clipboard.setText(androidx.compose.ui.text.AnnotatedString(crash)); onClearCrash() }) {
-                    Text("Copy & Close")
-                }
+                TextButton(onClick = {
+                    clipboard.setText(androidx.compose.ui.text.AnnotatedString(crash))
+                    onClearCrash()
+                }) { Text("Copy & Close") }
             },
             dismissButton = { TextButton(onClick = onClearCrash) { Text("Dismiss") } }
         )
     }
 
-    // Settings sheet
     if (uiState.showSettings) {
         SettingsSheet(
-            userName = uiState.userName,
-            systemPrompt = currentSystemPrompt(),
-            onSaveUserName = onSaveUserName,
-            onSaveSystemPrompt = onSaveSystemPrompt,
-            onExportFeedback = onExportFeedback,
-            onImportFineTune = { ftPicker.launch("*/*") },
-            onShowAbout = onShowAbout,
-            onGetPeerSync = onGetPeerSync,
-            onDismiss = onToggleSettings
+            userName            = uiState.userName,
+            systemPrompt        = currentSystemPrompt(),
+            onSaveUserName      = onSaveUserName,
+            onSaveSystemPrompt  = onSaveSystemPrompt,
+            onExportFeedback    = onExportFeedback,
+            onImportFineTune    = { ftPicker.launch("*/*") },
+            onShowAbout         = onShowAbout,
+            onGetPeerSync       = onGetPeerSync,
+            onDismiss           = onToggleSettings
         )
         return
     }
 
-    // Session drawer
     if (uiState.showSessionDrawer) {
         SessionDrawer(
-            sessions = uiState.sessions,
+            sessions  = uiState.sessions,
             currentId = uiState.currentSessionId,
-            onNew = onNewSession,
-            onSwitch = onSwitchSession,
-            onDelete = onDeleteSession,
-            onRename = onRenameSession,
+            onNew     = onNewSession,
+            onSwitch  = onSwitchSession,
+            onDelete  = onDeleteSession,
+            onRename  = onRenameSession,
             onDismiss = onToggleDrawer
         )
         return
     }
 
     Scaffold(
-        snackbarHost = { SnackbarHost(snackbarHost) },
+        snackbarHost  = { SnackbarHost(snackbarHost) },
         containerColor = ThunderBlack,
         topBar = {
             val title = uiState.sessions.find { it.id == uiState.currentSessionId }?.title ?: "Thunder AGI"
@@ -193,24 +215,20 @@ fun ChatScreen(
                 },
                 title = {
                     Column {
-                        Text("Thunder AGI", style = MaterialTheme.typography.labelSmall,
-                            color = ThunderElectric)
+                        Text("Thunder AGI", style = MaterialTheme.typography.labelSmall, color = ThunderElectric)
                         Text(title, style = MaterialTheme.typography.titleSmall,
                             color = ThunderWhite, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 },
                 actions = {
-                    // Image generation toggle
                     IconButton(onClick = onToggleImageGen) {
                         Icon(Icons.Default.Image, "Image generation",
                             tint = if (uiState.imageGenEnabled) ThunderPurple else ThunderGray)
                     }
-                    // Web search toggle
                     IconButton(onClick = onToggleWebSearch) {
                         Icon(Icons.Default.Search, "Web search",
                             tint = if (uiState.webSearchEnabled) ThunderElectric else ThunderGray)
                     }
-                    // Export last response
                     if (uiState.messages.any { !it.isUser && !it.isLoading }) {
                         IconButton(onClick = onExportResponse) {
                             Icon(Icons.Default.SaveAlt, "Export response", tint = ThunderGray)
@@ -224,7 +242,7 @@ fun ChatScreen(
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = ThunderDeepBlue,
+                    containerColor   = ThunderDeepBlue,
                     titleContentColor = ThunderWhite
                 )
             )
@@ -232,17 +250,17 @@ fun ChatScreen(
         bottomBar = {
             if (uiState.modelLoaded) {
                 InputSection(
-                    text = uiState.inputText,
-                    generating = uiState.isGenerating,
-                    recording = uiState.isRecording,
+                    text        = uiState.inputText,
+                    generating  = uiState.isGenerating,
+                    recording   = uiState.isRecording,
                     webSearchOn = uiState.webSearchEnabled,
                     pendingImage = uiState.pendingImageUri,
                     onTextChange = onInputChanged,
-                    onSend = onSendMessage,
-                    onAttach = { imagePicker.launch("image/*") },
+                    onSend      = onSendMessage,
+                    onAttach    = { imagePicker.launch("image/*") },
                     onRemoveImage = { onSetPendingImage(null) },
-                    onMicPress = { micPerm.launch(Manifest.permission.RECORD_AUDIO) },
-                    modifier = Modifier.imePadding()
+                    onMicPress  = { micPerm.launch(Manifest.permission.RECORD_AUDIO) },
+                    modifier    = Modifier.imePadding()
                 )
             }
         }
@@ -252,14 +270,15 @@ fun ChatScreen(
                 uiState.isModelLoading -> LoadingView()
                 !uiState.modelLoaded   -> ErrorView(uiState.error ?: "Unknown error", onRetryLoadModel)
                 else -> MessageList(
-                    messages  = uiState.messages,
-                    listState = listState,
-                    userName  = uiState.userName,
-                    onUp      = onThumbsUp,
-                    onDown    = onThumbsDown,
+                    messages        = uiState.messages,
+                    listState       = listState,
+                    userName        = uiState.userName,
+                    onUp            = onThumbsUp,
+                    onDown          = onThumbsDown,
                     onDeleteMessage = onDeleteMessage,
-                    onClear   = if (uiState.messages.isNotEmpty()) onClearChat else null,
-                    modifier  = Modifier.fillMaxSize()
+                    onEditMessage   = onEditMessage,
+                    onClear         = if (uiState.messages.isNotEmpty()) onClearChat else null,
+                    modifier        = Modifier.fillMaxSize()
                 )
             }
         }
@@ -270,23 +289,20 @@ fun ChatScreen(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsSheet(
-    userName: String,
-    systemPrompt: String,
-    onSaveUserName: (String) -> Unit,
+    userName:           String,
+    systemPrompt:       String,
+    onSaveUserName:     (String) -> Unit,
     onSaveSystemPrompt: (String) -> Unit,
-    onExportFeedback: () -> Unit,
-    onImportFineTune: () -> Unit,
-    onShowAbout: () -> Unit,
-    onGetPeerSync: () -> com.thunder.agi.p2p.PeerSync,
-    onDismiss: () -> Unit
+    onExportFeedback:   () -> Unit,
+    onImportFineTune:   () -> Unit,
+    onShowAbout:        () -> Unit,
+    onGetPeerSync:      () -> com.thunder.agi.p2p.PeerSync,
+    onDismiss:          () -> Unit
 ) {
     var nameEdit by remember { mutableStateOf(userName) }
 
     Column(
-        Modifier
-            .fillMaxSize()
-            .background(ThunderDeepBlue)
-            .verticalScroll(rememberScrollState())
+        Modifier.fillMaxSize().background(ThunderDeepBlue).verticalScroll(rememberScrollState())
     ) {
         TopAppBar(
             title = { Text("Settings", color = ThunderWhite) },
@@ -302,36 +318,27 @@ private fun SettingsSheet(
 
             Text("Your Name", style = MaterialTheme.typography.labelMedium, color = ThunderGray)
             OutlinedTextField(
-                value = nameEdit,
+                value       = nameEdit,
                 onValueChange = { nameEdit = it },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                colors = outlinedTextFieldColors(),
+                modifier    = Modifier.fillMaxWidth(),
+                singleLine  = true,
+                colors      = outlinedTextFieldColors(),
                 placeholder = { Text("e.g. Yassin") }
             )
 
-            // System prompt is managed internally by the model's learning system —
-            // no need to expose it to the user.
-
             HorizontalDivider(color = ThunderMidBlue)
-
             Text("Fine-tuning", style = MaterialTheme.typography.labelMedium, color = ThunderGray)
 
-            OutlinedButton(
-                onClick = onImportFineTune,
-                modifier = Modifier.fillMaxWidth(),
-                border = BorderStroke(1.dp, ThunderElectric)
-            ) {
+            OutlinedButton(onClick = onImportFineTune, modifier = Modifier.fillMaxWidth(),
+                border = BorderStroke(1.dp, ThunderElectric)) {
                 Icon(Icons.Default.Upload, null, tint = ThunderElectric)
                 Spacer(Modifier.width(8.dp))
                 Text("Import Fine-tune (.gguf)", color = ThunderElectric)
             }
 
-            OutlinedButton(
-                onClick = onExportFeedback,
-                modifier = Modifier.fillMaxWidth(),
-                border = BorderStroke(1.dp, ThunderGray)
-            ) {
+            // FIX: clicking this now shows a dialog with the path (was hidden snackbar)
+            OutlinedButton(onClick = onExportFeedback, modifier = Modifier.fillMaxWidth(),
+                border = BorderStroke(1.dp, ThunderGray)) {
                 Icon(Icons.Default.Download, null, tint = ThunderGray)
                 Spacer(Modifier.width(8.dp))
                 Text("View Feedback Log Path", color = ThunderGray)
@@ -339,32 +346,29 @@ private fun SettingsSheet(
 
             HorizontalDivider(color = ThunderMidBlue)
 
-            Text("WhatsApp Sync", style = MaterialTheme.typography.labelMedium, color = ThunderGray)
+            // FIX: WhatsApp Sync note in Arabic + English
+            Text("WhatsApp Sync  /  مزامنة واتساب",
+                style = MaterialTheme.typography.labelMedium, color = ThunderGray)
             Text(
-                "Create a WhatsApp chat named \"Thunder AGI\". The app reads update " +
-                "notifications from it automatically. Messages starting with [UPDATE] " +
-                "are treated as model instructions; others are saved as training data.",
+                "Create a WhatsApp chat named \"Thunder AGI\". Messages starting with [UPDATE] " +
+                "are treated as model instructions; others are saved as training data.\n\n" +
+                "أنشئ محادثة واتساب باسم \"Thunder AGI\". الرسائل التي تبدأ بـ [UPDATE] " +
+                "تُعامَل كتعليمات للنموذج؛ وغيرها يُحفظ كبيانات تدريب.",
                 style = MaterialTheme.typography.bodySmall, color = ThunderGray
             )
 
             HorizontalDivider(color = ThunderMidBlue)
-
-            // WiFi Direct peer sync panel
             PeerSyncPanel(peerSync = onGetPeerSync())
 
-            // About — always visible at the bottom of Settings
             OutlinedButton(
-                onClick = {
-                    onSaveUserName(nameEdit)
-                    onDismiss()
-                    onShowAbout()
-                },
+                onClick = { onSaveUserName(nameEdit); onDismiss(); onShowAbout() },
                 modifier = Modifier.fillMaxWidth(),
                 border = BorderStroke(1.dp, ThunderElectric)
             ) {
                 Icon(Icons.Default.Info, null, tint = ThunderElectric)
                 Spacer(Modifier.width(8.dp))
-                Text("About Thunder AGI", color = ThunderElectric)
+                // FIX: bilingual About button
+                Text("About • عن التطبيق", color = ThunderElectric)
             }
         }
     }
@@ -374,16 +378,16 @@ private fun SettingsSheet(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SessionDrawer(
-    sessions: List<ChatSession>,
+    sessions:  List<ChatSession>,
     currentId: String?,
-    onNew: () -> Unit,
-    onSwitch: (String) -> Unit,
-    onDelete: (String) -> Unit,
-    onRename: (String, String) -> Unit,
+    onNew:     () -> Unit,
+    onSwitch:  (String) -> Unit,
+    onDelete:  (String) -> Unit,
+    onRename:  (String, String) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var renamingId by remember { mutableStateOf<String?>(null) }
-    var renameText by remember { mutableStateOf("") }
+    var renamingId  by remember { mutableStateOf<String?>(null) }
+    var renameText  by remember { mutableStateOf("") }
 
     Column(Modifier.fillMaxSize().background(ThunderDeepBlue)) {
         TopAppBar(
@@ -392,34 +396,29 @@ private fun SessionDrawer(
                 IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, null, tint = ThunderGray) }
             },
             actions = {
-                IconButton(onClick = onNew) {
-                    Icon(Icons.Default.Add, "New chat", tint = ThunderElectric)
-                }
+                IconButton(onClick = onNew) { Icon(Icons.Default.Add, "New chat", tint = ThunderElectric) }
             },
             colors = TopAppBarDefaults.topAppBarColors(containerColor = ThunderDeepBlue)
         )
         LazyColumn(Modifier.fillMaxSize()) {
             items(sessions, key = { it.id }) { s ->
-                val isActive = s.id == currentId
+                val isActive   = s.id == currentId
                 val isRenaming = renamingId == s.id
-
                 Column(
-                    Modifier
-                        .fillMaxWidth()
+                    Modifier.fillMaxWidth()
                         .background(if (isActive) ThunderMidBlue else Color.Transparent)
                         .clickable { onSwitch(s.id) }
                         .padding(horizontal = 16.dp, vertical = 8.dp)
                 ) {
                     if (isRenaming) {
                         OutlinedTextField(
-                            value = renameText,
+                            value         = renameText,
                             onValueChange = { renameText = it },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true,
-                            colors = outlinedTextFieldColors(),
+                            modifier      = Modifier.fillMaxWidth(),
+                            singleLine    = true,
+                            colors        = outlinedTextFieldColors(),
                             keyboardActions = KeyboardActions(onDone = {
-                                onRename(s.id, renameText)
-                                renamingId = null
+                                onRename(s.id, renameText); renamingId = null
                             }),
                             trailingIcon = {
                                 IconButton(onClick = { onRename(s.id, renameText); renamingId = null }) {
@@ -439,13 +438,10 @@ private fun SessionDrawer(
                                 style = MaterialTheme.typography.bodyMedium)
                             IconButton(onClick = { renameText = s.title; renamingId = s.id },
                                 modifier = Modifier.size(32.dp)) {
-                                Icon(Icons.Default.Edit, null, tint = ThunderGray,
-                                    modifier = Modifier.size(16.dp))
+                                Icon(Icons.Default.Edit, null, tint = ThunderGray, modifier = Modifier.size(16.dp))
                             }
-                            IconButton(onClick = { onDelete(s.id) },
-                                modifier = Modifier.size(32.dp)) {
-                                Icon(Icons.Default.Delete, null, tint = ThunderRed,
-                                    modifier = Modifier.size(16.dp))
+                            IconButton(onClick = { onDelete(s.id) }, modifier = Modifier.size(32.dp)) {
+                                Icon(Icons.Default.Delete, null, tint = ThunderRed, modifier = Modifier.size(16.dp))
                             }
                         }
                     }
@@ -459,43 +455,41 @@ private fun SessionDrawer(
 // ── Message List ──────────────────────────────────────────────────────────────
 @Composable
 private fun MessageList(
-    messages: List<ChatMessage>,
-    listState: LazyListState,
-    userName: String,
-    onUp: (String) -> Unit,
-    onDown: (String) -> Unit,
-    onDeleteMessage: (String) -> Unit,
-    onClear: (() -> Unit)?,
-    modifier: Modifier
+    messages:       List<ChatMessage>,
+    listState:      LazyListState,
+    userName:       String,
+    onUp:           (String) -> Unit,
+    onDown:         (String) -> Unit,
+    onDeleteMessage:(String) -> Unit,
+    onEditMessage:  ((String, String) -> Unit)?,
+    onClear:        (() -> Unit)?,
+    modifier:       Modifier
 ) {
     if (messages.isEmpty()) {
         Box(modifier, contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("⚡", fontSize = 48.sp)
                 Spacer(Modifier.height(16.dp))
-                Text("Thunder AGI", style = MaterialTheme.typography.headlineSmall,
-                    color = ThunderElectric)
+                Text("Thunder AGI", style = MaterialTheme.typography.headlineSmall, color = ThunderElectric)
                 Text("الرَّعد للذكاء العام المصطنع",
                     style = MaterialTheme.typography.bodyMedium, color = ThunderGray)
             }
         }
     } else {
         LazyColumn(
-            state = listState,
-            modifier = modifier,
-            contentPadding = PaddingValues(12.dp),
+            state             = listState,
+            modifier          = modifier,
+            contentPadding    = PaddingValues(12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             items(messages, key = { it.id }) { msg ->
-                MessageBubble(msg, userName, onUp, onDown, onDeleteMessage)
+                MessageBubble(msg, userName, onUp, onDown, onDeleteMessage, onEditMessage)
             }
-            // Clear button at bottom
             if (onClear != null) {
                 item {
                     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                         TextButton(onClick = onClear) {
-                            Icon(Icons.Default.Delete, null, tint = ThunderRed,
-                                modifier = Modifier.size(14.dp))
+                            Icon(Icons.Default.Delete, null, tint = ThunderRed, modifier = Modifier.size(14.dp))
                             Spacer(Modifier.width(4.dp))
                             Text("Clear conversation", color = ThunderRed,
                                 style = MaterialTheme.typography.labelSmall)
@@ -511,19 +505,22 @@ private fun MessageList(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MessageBubble(
-    msg: ChatMessage,
-    userName: String,
-    onUp: (String) -> Unit,
-    onDown: (String) -> Unit,
-    onDeleteMessage: (String) -> Unit
+    msg:            ChatMessage,
+    userName:       String,
+    onUp:           (String) -> Unit,
+    onDown:         (String) -> Unit,
+    onDeleteMessage:(String) -> Unit,
+    onEditMessage:  ((String, String) -> Unit)?
 ) {
-    val isUser = msg.isUser
+    val isUser    = msg.isUser
     val clipboard = LocalClipboardManager.current
     var showMenu      by remember { mutableStateOf(false) }
-    var showThinking  by remember { mutableStateOf(false) }
     var showTimestamp by remember { mutableStateOf(false) }
 
-    // Format timestamp as HH:mm  dd/MM/yyyy
+    // FIX: edit state for user messages
+    var editMode   by remember { mutableStateOf(false) }
+    var editText   by remember { mutableStateOf(msg.content) }
+
     val formattedTime = remember(msg.timestamp) {
         java.text.SimpleDateFormat("HH:mm  dd/MM/yyyy", java.util.Locale.getDefault())
             .format(java.util.Date(msg.timestamp))
@@ -537,318 +534,291 @@ private fun MessageBubble(
             horizontalAlignment = if (isUser) Alignment.End else Alignment.Start,
             modifier = Modifier.widthIn(max = 300.dp)
         ) {
-        // Sender label
-        Text(
-            if (isUser) userName else "Thunder AGI",
-            style = MaterialTheme.typography.labelSmall,
-            color = if (isUser) ThunderGlow else ThunderElectric,
-            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
-        )
+            Text(
+                if (isUser) userName else "Thunder AGI",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (isUser) ThunderGlow else ThunderElectric,
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+            )
 
-        // Thinking indicator (collapsible)
-        if (!isUser && (msg.isLoading || msg.thinkingStep != null) && !msg.isLoading.not()) {
-            if (msg.isLoading) {
-                ThinkingBox(msg.thinkingStep ?: "Processing…", showThinking, { showThinking = !showThinking })
-            }
-        }
-
-        // Bubble
-        Box(
-            Modifier
-                .widthIn(max = 320.dp)
-                .clip(RoundedCornerShape(
-                    topStart = 16.dp, topEnd = 16.dp,
-                    bottomStart = if (isUser) 16.dp else 4.dp,
-                    bottomEnd   = if (isUser) 4.dp else 16.dp
-                ))
-                .background(if (isUser) UserBubble else AIBubble)
-                .border(
-                    width = 0.5.dp,
-                    color = if (isUser) ThunderElectric.copy(.3f) else ThunderMidBlue,
-                    shape = RoundedCornerShape(
-                        topStart = 16.dp, topEnd = 16.dp,
+            // FIX: single ThinkingBox — only inside the bubble (removed duplicate above bubble)
+            Box(
+                Modifier
+                    .widthIn(max = 320.dp)
+                    .clip(RoundedCornerShape(
+                        topStart    = 16.dp, topEnd   = 16.dp,
                         bottomStart = if (isUser) 16.dp else 4.dp,
                         bottomEnd   = if (isUser) 4.dp else 16.dp
+                    ))
+                    .background(if (isUser) UserBubble else AIBubble)
+                    .border(0.5.dp,
+                        if (isUser) ThunderElectric.copy(.3f) else ThunderMidBlue,
+                        RoundedCornerShape(
+                            topStart    = 16.dp, topEnd   = 16.dp,
+                            bottomStart = if (isUser) 16.dp else 4.dp,
+                            bottomEnd   = if (isUser) 4.dp else 16.dp
+                        ))
+                    // FIX: tap to show/hide timestamp; long-press for menu
+                    .combinedClickable(
+                        onClick    = { if (!editMode) showTimestamp = !showTimestamp },
+                        onLongClick = { showMenu = true }
                     )
-                )
-                .combinedClickable(onClick = {}, onLongClick = { showMenu = true })
-                .padding(12.dp)
-        ) {
-            Column {
-                msg.mediaPath?.let { path ->
-                    val model: Any = if (path.startsWith("http")) path else File(path)
-                    AsyncImage(
-                        model = model,
-                        contentDescription = null,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 220.dp)
-                            .clip(RoundedCornerShape(8.dp)),
-                        contentScale = ContentScale.Fit
-                    )
-                    Spacer(Modifier.height(6.dp))
-                }
+                    .padding(12.dp)
+            ) {
+                Column {
+                    msg.mediaPath?.let { path ->
+                        val model: Any = if (path.startsWith("http")) path else File(path)
+                        AsyncImage(model = model, contentDescription = null,
+                            modifier = Modifier.fillMaxWidth().heightIn(max = 220.dp)
+                                .clip(RoundedCornerShape(8.dp)),
+                            contentScale = ContentScale.Fit)
+                        Spacer(Modifier.height(6.dp))
+                    }
 
-                if (msg.isLoading) {
-                    ThinkingBox(msg.thinkingStep ?: "Thinking…", showThinking, { showThinking = !showThinking })
-                } else {
-                    // Detect code blocks and render with monospace
-                    val hasCode = msg.content.contains("```")
-                    if (hasCode) {
-                        CodeAwareText(msg.content)
+                    if (msg.isLoading) {
+                        // FIX: single ThinkingBox with rotating bilingual labels
+                        ThinkingBox(msg.thinkingStep ?: "معالجة…  Processing…")
+                    } else if (editMode && isUser) {
+                        // FIX: inline edit mode
+                        OutlinedTextField(
+                            value         = editText,
+                            onValueChange = { editText = it },
+                            modifier      = Modifier.fillMaxWidth(),
+                            colors        = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor      = ThunderElectric,
+                                unfocusedBorderColor    = ThunderMidBlue,
+                                focusedTextColor        = ThunderWhite,
+                                unfocusedTextColor      = ThunderWhite,
+                                cursorColor             = ThunderElectric,
+                                focusedContainerColor   = ThunderDeepBlue,
+                                unfocusedContainerColor = ThunderDeepBlue
+                            ),
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Default)
+                        )
+                        Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                            TextButton(onClick = { editMode = false; editText = msg.content }) {
+                                Text("Cancel", color = ThunderGray, style = MaterialTheme.typography.labelSmall)
+                            }
+                            TextButton(onClick = {
+                                editMode = false
+                                onEditMessage?.invoke(msg.id, editText.trim())
+                            }) {
+                                Text("Resend ↺", color = ThunderElectric,
+                                    style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
                     } else {
-                        Text(msg.content, style = MaterialTheme.typography.bodyMedium,
-                            color = ThunderWhite, lineHeight = 22.sp)
+                        // FIX: use MarkdownText so **bold** etc. render properly
+                        val hasCode = msg.content.contains("```")
+                        if (hasCode) CodeAwareText(msg.content)
+                        else MarkdownText(msg.content)
                     }
+                }
+
+                DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                    DropdownMenuItem(
+                        text = { Text("Copy", color = ThunderWhite) },
+                        leadingIcon = { Icon(Icons.Default.ContentCopy, null, tint = ThunderElectric) },
+                        onClick = {
+                            clipboard.setText(androidx.compose.ui.text.AnnotatedString(msg.content))
+                            showMenu = false
+                        }
+                    )
+                    // FIX: Edit & Resend for user messages — creates conversation branch
+                    if (isUser && !msg.isLoading && onEditMessage != null) {
+                        DropdownMenuItem(
+                            text = { Text("✏️ Edit & Resend", color = ThunderElectric) },
+                            onClick = { editText = msg.content; editMode = true; showMenu = false }
+                        )
+                    }
+                    if (!isUser && !msg.isLoading) {
+                        DropdownMenuItem(
+                            text = { Text("👍 Good response", color = ThunderGreen) },
+                            onClick = { onUp(msg.id); showMenu = false }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("👎 Bad response", color = ThunderRed) },
+                            onClick = { onDown(msg.id); showMenu = false }
+                        )
+                    }
+                    DropdownMenuItem(
+                        text = { Text("Delete", color = ThunderRed) },
+                        leadingIcon = { Icon(Icons.Default.Delete, null, tint = ThunderRed) },
+                        onClick = { onDeleteMessage(msg.id); showMenu = false }
+                    )
                 }
             }
 
-            // Context menu
-            DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
-                DropdownMenuItem(
-                    text = { Text("Copy", color = ThunderWhite) },
-                    leadingIcon = { Icon(Icons.Default.ContentCopy, null, tint = ThunderElectric) },
-                    onClick = {
-                        clipboard.setText(androidx.compose.ui.text.AnnotatedString(msg.content))
-                        showMenu = false
-                    }
-                )
-                if (!isUser && !msg.isLoading) {
-                    DropdownMenuItem(
-                        text = { Text("👍 Good response", color = ThunderGreen) },
-                        onClick = { onUp(msg.id); showMenu = false }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("👎 Bad response", color = ThunderRed) },
-                        onClick = { onDown(msg.id); showMenu = false }
-                    )
-                }
+            // FIX: timestamp shown below bubble on tap
+            AnimatedVisibility(showTimestamp) {
+                Text(formattedTime,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ThunderGray,
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
             }
         }
     }
-    }
 }
 
+// ── ThinkingBox — compact rotating bilingual labels ───────────────────────────
+// FIX: replaced the long static architecture description + removed the duplicate
+// outer ThinkingBox. Now shows short rotating bilingual labels like Claude does.
 @Composable
-private fun ThinkingBox(step: String, expanded: Boolean, onToggle: () -> Unit) {
-    Column(Modifier.padding(bottom = 4.dp)) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier
-                .clip(RoundedCornerShape(8.dp))
-                .background(ThunderMidBlue.copy(.6f))
-                .clickable { onToggle() }
-                .padding(horizontal = 10.dp, vertical = 6.dp)
-        ) {
-            CircularProgressIndicator(
-                modifier = Modifier.size(12.dp),
-                strokeWidth = 1.5.dp,
-                color = ThunderElectric
-            )
-            Spacer(Modifier.width(6.dp))
-            Text(step, style = MaterialTheme.typography.labelSmall, color = ThunderElectric,
-                modifier = Modifier.weight(1f))
-            Icon(
-                if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                null, tint = ThunderGray, modifier = Modifier.size(14.dp)
-            )
+private fun ThinkingBox(step: String) {
+    val labels = listOf(
+        "معالجة…  Processing…",
+        "تفكير…  Thinking…",
+        "ربط…  Entangling…",
+        "استرجاع…  Recalling…",
+        "صياغة…  Composing…",
+        "تحليل…  Analyzing…",
+        "بحث…  Searching…",
+        "قريباً…  Almost there…"
+    )
+    var idx by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(1800)
+            idx = (idx + 1) % labels.size
         }
-        AnimatedVisibility(expanded) {
-            Text("Model is processing your request using the LFM2.5-VL architecture with " +
-                    "hybrid recurrent + attention layers.",
-                style = MaterialTheme.typography.bodySmall, color = ThunderGray,
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
-        }
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(ThunderMidBlue.copy(.6f))
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+    ) {
+        CircularProgressIndicator(modifier = Modifier.size(12.dp),
+            strokeWidth = 1.5.dp, color = ThunderElectric)
+        Spacer(Modifier.width(6.dp))
+        Text(labels[idx], style = MaterialTheme.typography.labelSmall, color = ThunderElectric)
     }
 }
 
-
+// ── Markdown renderer ─────────────────────────────────────────────────────────
 @Composable
 private fun MarkdownText(text: String) {
-    // Detect if text is primarily Arabic (RTL)
     val arabicChars = text.count { it in '\u0600'..'\u06FF' }
-    val isRTL = arabicChars > text.length / 3
-    val textAlign = if (isRTL) TextAlign.Right else TextAlign.Start
+    val isRTL       = arabicChars > text.length / 3
+    val textAlign   = if (isRTL) TextAlign.Right else TextAlign.Start
 
     val lines = text.lines()
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         lines.forEach { line ->
             when {
-                // Headers
-                line.startsWith("### ") -> Text(
-                    line.removePrefix("### "),
-                    style = MaterialTheme.typography.titleSmall,
-                    color = ThunderElectric,
-                    textAlign = textAlign,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                line.startsWith("## ") -> Text(
-                    line.removePrefix("## "),
-                    style = MaterialTheme.typography.titleMedium,
-                    color = ThunderElectric,
-                    textAlign = textAlign,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                line.startsWith("# ") -> Text(
-                    line.removePrefix("# "),
-                    style = MaterialTheme.typography.titleLarge,
-                    color = ThunderElectric,
-                    textAlign = textAlign,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                // Bullet points
+                line.startsWith("### ") -> Text(line.removePrefix("### "),
+                    style = MaterialTheme.typography.titleSmall, color = ThunderElectric,
+                    textAlign = textAlign, modifier = Modifier.fillMaxWidth())
+                line.startsWith("## ")  -> Text(line.removePrefix("## "),
+                    style = MaterialTheme.typography.titleMedium, color = ThunderElectric,
+                    textAlign = textAlign, modifier = Modifier.fillMaxWidth())
+                line.startsWith("# ")   -> Text(line.removePrefix("# "),
+                    style = MaterialTheme.typography.titleLarge, color = ThunderElectric,
+                    textAlign = textAlign, modifier = Modifier.fillMaxWidth())
                 line.trimStart().startsWith("- ") || line.trimStart().startsWith("* ") -> {
                     Row(horizontalArrangement = Arrangement.Start) {
-                        Text("• ", color = ThunderElectric,
-                            style = MaterialTheme.typography.bodyMedium)
-                        Text(
-                            buildInlineMarkdown(line.trimStart().removePrefix("- ").removePrefix("* ")),
+                        Text("• ", color = ThunderElectric, style = MaterialTheme.typography.bodyMedium)
+                        Text(buildInlineMarkdown(line.trimStart().removePrefix("- ").removePrefix("* ")),
                             style = MaterialTheme.typography.bodyMedium,
-                            color = ThunderWhite,
-                            lineHeight = 22.sp
-                        )
+                            color = ThunderWhite, lineHeight = 22.sp)
                     }
                 }
-                // Numbered list
                 line.trimStart().matches(Regex("\\d+\\..*")) -> {
                     Row(horizontalArrangement = Arrangement.Start) {
                         Text(line.trimStart().substringBefore(".") + ". ",
-                            color = ThunderElectric,
-                            style = MaterialTheme.typography.bodyMedium)
-                        Text(
-                            buildInlineMarkdown(line.trimStart().substringAfter(". ")),
+                            color = ThunderElectric, style = MaterialTheme.typography.bodyMedium)
+                        Text(buildInlineMarkdown(line.trimStart().substringAfter(". ")),
                             style = MaterialTheme.typography.bodyMedium,
-                            color = ThunderWhite,
-                            lineHeight = 22.sp
-                        )
+                            color = ThunderWhite, lineHeight = 22.sp)
                     }
                 }
-                // Horizontal rule
                 line.trim() == "---" || line.trim() == "***" ->
                     HorizontalDivider(color = ThunderMidBlue, modifier = Modifier.padding(vertical = 4.dp))
-                // Empty line = spacer
                 line.isBlank() -> Spacer(Modifier.height(4.dp))
-                // Normal text with inline markdown
-                else -> Text(
-                    buildInlineMarkdown(line),
+                else -> Text(buildInlineMarkdown(line),
                     style = MaterialTheme.typography.bodyMedium,
-                    color = ThunderWhite,
-                    lineHeight = 22.sp,
-                    textAlign = textAlign,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                    color = ThunderWhite, lineHeight = 22.sp,
+                    textAlign = textAlign, modifier = Modifier.fillMaxWidth())
             }
         }
     }
 }
 
 fun buildInlineMarkdown(text: String): androidx.compose.ui.text.AnnotatedString {
-    val builder = androidx.compose.ui.text.AnnotatedString.Builder()
+    val b = androidx.compose.ui.text.AnnotatedString.Builder()
     var i = 0
     while (i < text.length) {
         when {
-            // Bold **text**
             text.startsWith("**", i) -> {
                 val end = text.indexOf("**", i + 2)
                 if (end != -1) {
-                    builder.pushStyle(androidx.compose.ui.text.SpanStyle(
+                    b.pushStyle(androidx.compose.ui.text.SpanStyle(
                         fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
-                        color = androidx.compose.ui.graphics.Color(0xFFEAF6FF)
-                    ))
-                    builder.append(text.substring(i + 2, end))
-                    builder.pop()
-                    i = end + 2
-                } else { builder.append(text[i]); i++ }
+                        color = androidx.compose.ui.graphics.Color(0xFFEAF6FF)))
+                    b.append(text.substring(i + 2, end))
+                    b.pop(); i = end + 2
+                } else { b.append(text[i]); i++ }
             }
-            // Italic *text* or _text_
             (text.startsWith("*", i) && !text.startsWith("**", i)) ||
             (text.startsWith("_", i) && !text.startsWith("__", i)) -> {
                 val delim = text[i].toString()
-                val end = text.indexOf(delim, i + 1)
+                val end   = text.indexOf(delim, i + 1)
                 if (end != -1 && end > i + 1) {
-                    builder.pushStyle(androidx.compose.ui.text.SpanStyle(
-                        fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
-                    ))
-                    builder.append(text.substring(i + 1, end))
-                    builder.pop()
-                    i = end + 1
-                } else { builder.append(text[i]); i++ }
+                    b.pushStyle(androidx.compose.ui.text.SpanStyle(
+                        fontStyle = androidx.compose.ui.text.font.FontStyle.Italic))
+                    b.append(text.substring(i + 1, end))
+                    b.pop(); i = end + 1
+                } else { b.append(text[i]); i++ }
             }
-            // Inline code `code`
             text.startsWith("`", i) -> {
                 val end = text.indexOf("`", i + 1)
                 if (end != -1) {
-                    builder.pushStyle(androidx.compose.ui.text.SpanStyle(
+                    b.pushStyle(androidx.compose.ui.text.SpanStyle(
                         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                         background = androidx.compose.ui.graphics.Color(0xFF0D1117),
-                        color = androidx.compose.ui.graphics.Color(0xFF4FC3F7)
-                    ))
-                    builder.append(text.substring(i + 1, end))
-                    builder.pop()
-                    i = end + 1
-                } else { builder.append(text[i]); i++ }
+                        color      = androidx.compose.ui.graphics.Color(0xFF4FC3F7)))
+                    b.append(text.substring(i + 1, end))
+                    b.pop(); i = end + 1
+                } else { b.append(text[i]); i++ }
             }
-            else -> { builder.append(text[i]); i++ }
+            else -> { b.append(text[i]); i++ }
         }
     }
-    return builder.toAnnotatedString()
+    return b.toAnnotatedString()
 }
 
 @Composable
-private fun CodeAwareText(content: String, onRunCode: ((String, String) -> Unit)? = null) {
+private fun CodeAwareText(content: String) {
     val parts = content.split("```")
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         parts.forEachIndexed { i, part ->
             if (i % 2 == 0) {
-                if (part.isNotBlank())
-                    Text(part.trim(), style = MaterialTheme.typography.bodyMedium,
-                        color = ThunderWhite, lineHeight = 22.sp)
+                if (part.isNotBlank()) MarkdownText(part.trim())
             } else {
-                // First line is language hint
-                val lines = part.trimStart('\n')
+                val lines     = part.trimStart('\n')
                 val firstLine = lines.lines().firstOrNull()?.trim() ?: ""
                 val isLangHint = firstLine.matches(Regex("[a-zA-Z]+"))
                 val lang = if (isLangHint) firstLine else "code"
                 val code = if (isLangHint) lines.lines().drop(1).joinToString("\n") else lines
 
                 Column {
-                    // Header bar
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(topStart = 8.dp, topEnd = 8.dp))
-                            .background(Color(0xFF161B22))
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                    Row(Modifier.fillMaxWidth()
+                        .clip(RoundedCornerShape(topStart = 8.dp, topEnd = 8.dp))
+                        .background(Color(0xFF161B22))
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
+                        verticalAlignment     = Alignment.CenterVertically) {
                         Text(lang, style = MaterialTheme.typography.labelSmall, color = ThunderGray)
-                        if (onRunCode != null && lang.lowercase() in listOf("python","javascript","js","java","kotlin")) {
-                            TextButton(
-                                onClick = { onRunCode(code, lang) },
-                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
-                            ) {
-                                Icon(Icons.Default.PlayArrow, null, tint = ThunderGreen,
-                                    modifier = Modifier.size(14.dp))
-                                Spacer(Modifier.width(4.dp))
-                                Text("Run", color = ThunderGreen,
-                                    style = MaterialTheme.typography.labelSmall)
-                            }
-                        }
                     }
-                    // Code body
-                    Box(
-                        Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(bottomStart = 8.dp, bottomEnd = 8.dp))
-                            .background(Color(0xFF0D1117))
-                            .border(0.5.dp, ThunderMidBlue,
-                                RoundedCornerShape(bottomStart = 8.dp, bottomEnd = 8.dp))
-                            .horizontalScroll(rememberScrollState())
-                            .padding(12.dp)
-                    ) {
-                        Text(code.trim(), style = MaterialTheme.typography.bodySmall
-                            .copy(fontFamily = FontFamily.Monospace),
+                    Box(Modifier.fillMaxWidth()
+                        .clip(RoundedCornerShape(bottomStart = 8.dp, bottomEnd = 8.dp))
+                        .background(Color(0xFF0D1117))
+                        .border(0.5.dp, ThunderMidBlue, RoundedCornerShape(bottomStart = 8.dp, bottomEnd = 8.dp))
+                        .horizontalScroll(rememberScrollState())
+                        .padding(12.dp)) {
+                        Text(code.trim(),
+                            style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                             color = ThunderGlow, softWrap = false)
                     }
                 }
@@ -860,31 +830,25 @@ private fun CodeAwareText(content: String, onRunCode: ((String, String) -> Unit)
 // ── Input Section ─────────────────────────────────────────────────────────────
 @Composable
 private fun InputSection(
-    text: String,
-    generating: Boolean,
-    recording: Boolean,
-    webSearchOn: Boolean,
+    text:         String,
+    generating:   Boolean,
+    recording:    Boolean,
+    webSearchOn:  Boolean,
     pendingImage: Uri?,
     onTextChange: (String) -> Unit,
-    onSend: () -> Unit,
-    onAttach: () -> Unit,
-    onRemoveImage: () -> Unit,
-    onMicPress: () -> Unit,
-    modifier: Modifier = Modifier
+    onSend:       () -> Unit,
+    onAttach:     () -> Unit,
+    onRemoveImage:() -> Unit,
+    onMicPress:   () -> Unit,
+    modifier:     Modifier = Modifier
 ) {
     val keyboard = LocalSoftwareKeyboardController.current
 
     Surface(modifier, color = InputBg, shadowElevation = 8.dp) {
         Column {
-            // Image preview strip
             pendingImage?.let { uri ->
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .background(ThunderMidBlue)
-                        .padding(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(Modifier.fillMaxWidth().background(ThunderMidBlue).padding(8.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
                     AsyncImage(model = uri, contentDescription = null,
                         modifier = Modifier.size(52.dp).clip(RoundedCornerShape(6.dp)),
                         contentScale = ContentScale.Crop)
@@ -897,100 +861,77 @@ private fun InputSection(
                 }
             }
 
-            // Web search indicator
             if (webSearchOn) {
                 Row(Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Search, null, tint = ThunderElectric,
-                        modifier = Modifier.size(12.dp))
+                    Icon(Icons.Default.Search, null, tint = ThunderElectric, modifier = Modifier.size(12.dp))
                     Spacer(Modifier.width(4.dp))
-                    Text("Web search enabled", style = MaterialTheme.typography.labelSmall,
-                        color = ThunderElectric)
+                    Text("Web search enabled", style = MaterialTheme.typography.labelSmall, color = ThunderElectric)
                 }
             }
 
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.Bottom,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
+                horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+
                 IconButton(onClick = onAttach, enabled = !generating) {
                     Icon(Icons.Default.AttachFile, "Attach",
                         tint = if (!generating) ThunderElectric else ThunderGray)
                 }
 
                 OutlinedTextField(
-                    value = text,
+                    value       = text,
                     onValueChange = onTextChange,
-                    modifier = Modifier.weight(1f),
+                    modifier    = Modifier.weight(1f),
                     placeholder = { Text(
                         when {
-                            recording -> "🎤 Listening…"
-                            generating -> "Generating…"
-                            else -> "Message Thunder AGI…"
-                        },
-                        color = ThunderGray
-                    )},
+                            recording  -> "🎤 Listening…"
+                            generating -> "…Generating"
+                            else       -> "…Message Thunder AGI"
+                        }, color = ThunderGray)
+                    },
+                    // FIX: ImeAction.Default → Enter adds new line, not sends message
                     keyboardOptions = KeyboardOptions(
                         capitalization = KeyboardCapitalization.Sentences,
-                        imeAction = ImeAction.Send
+                        imeAction      = ImeAction.Default
                     ),
-                    keyboardActions = KeyboardActions(onSend = {
-                        if (!generating) { onSend(); keyboard?.hide() }
-                    }),
-                    singleLine = false, maxLines = 5,
-                    enabled = !recording,  // Allow typing while model generates
-                    shape = RoundedCornerShape(20.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor    = ThunderElectric,
-                        unfocusedBorderColor  = ThunderMidBlue,
-                        focusedTextColor      = ThunderWhite,
-                        unfocusedTextColor    = ThunderWhite,
-                        cursorColor           = ThunderElectric,
-                        focusedContainerColor = ThunderDeepBlue,
+                    keyboardActions = KeyboardActions.Default,
+                    singleLine  = false,
+                    maxLines    = 5,
+                    enabled     = !recording,
+                    shape       = RoundedCornerShape(20.dp),
+                    colors      = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor      = ThunderElectric,
+                        unfocusedBorderColor    = ThunderMidBlue,
+                        focusedTextColor        = ThunderWhite,
+                        unfocusedTextColor      = ThunderWhite,
+                        cursorColor             = ThunderElectric,
+                        focusedContainerColor   = ThunderDeepBlue,
                         unfocusedContainerColor = ThunderDeepBlue
                     )
                 )
 
-                // Mic button
-                Box(
-                    Modifier
-                        .size(48.dp)
-                        .clip(CircleShape)
-                        .background(if (recording) ThunderRed else ThunderMidBlue)
-                        .clickable { onMicPress() },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        if (recording) Icons.Default.Stop else Icons.Default.Mic,
-                        "Voice",
-                        tint = if (recording) Color.White else ThunderElectric
-                    )
+                Box(Modifier.size(48.dp).clip(CircleShape)
+                    .background(if (recording) ThunderRed else ThunderMidBlue)
+                    .clickable { onMicPress() },
+                    contentAlignment = Alignment.Center) {
+                    Icon(if (recording) Icons.Default.Stop else Icons.Default.Mic,
+                        "Voice", tint = if (recording) Color.White else ThunderElectric)
                 }
 
-                // Send button — active when text OR image is ready
                 AnimatedVisibility((text.isNotBlank() || pendingImage != null) && !generating) {
-                    Box(
-                        Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(
-                                Brush.linearGradient(listOf(ThunderElectric, ThunderPurple))
-                            )
-                            .clickable(enabled = !generating) { onSend(); keyboard?.hide() },
-                        contentAlignment = Alignment.Center
-                    ) {
+                    Box(Modifier.size(48.dp).clip(CircleShape)
+                        .background(Brush.linearGradient(listOf(ThunderElectric, ThunderPurple)))
+                        .clickable(enabled = !generating) { onSend(); keyboard?.hide() },
+                        contentAlignment = Alignment.Center) {
                         Icon(Icons.AutoMirrored.Filled.Send, "Send",
                             tint = ThunderBlack, modifier = Modifier.size(20.dp))
                     }
                 }
 
                 if (generating) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(24.dp).padding(2.dp),
-                        strokeWidth = 2.dp,
-                        color = ThunderElectric
-                    )
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp).padding(2.dp),
+                        strokeWidth = 2.dp, color = ThunderElectric)
                 }
             }
         }
@@ -1000,15 +941,12 @@ private fun InputSection(
 // ── Loading / Error ───────────────────────────────────────────────────────────
 @Composable
 private fun LoadingView() {
-    Column(
-        modifier = Modifier.fillMaxSize().background(ThunderBlack),
+    Column(Modifier.fillMaxSize().background(ThunderBlack),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
+        verticalArrangement = Arrangement.Center) {
         CircularProgressIndicator(color = ThunderElectric, modifier = Modifier.size(56.dp))
         Spacer(Modifier.height(24.dp))
-        Text("Loading Thunder AGI…", color = ThunderWhite,
-            style = MaterialTheme.typography.titleMedium)
+        Text("Loading Thunder AGI…", color = ThunderWhite, style = MaterialTheme.typography.titleMedium)
         Spacer(Modifier.height(8.dp))
         Text("الرَّعد للذكاء العام المصطنع", color = ThunderElectric,
             style = MaterialTheme.typography.bodySmall)
@@ -1017,11 +955,9 @@ private fun LoadingView() {
 
 @Composable
 private fun ErrorView(error: String, onRetry: () -> Unit) {
-    Column(
-        modifier = Modifier.fillMaxSize().background(ThunderBlack).padding(32.dp),
+    Column(Modifier.fillMaxSize().background(ThunderBlack).padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
+        verticalArrangement = Arrangement.Center) {
         Text("⚡", fontSize = 48.sp)
         Spacer(Modifier.height(16.dp))
         Text("Failed to Load Model", style = MaterialTheme.typography.titleLarge,
@@ -1039,76 +975,72 @@ private fun ErrorView(error: String, onRetry: () -> Unit) {
 
 @Composable
 private fun outlinedTextFieldColors() = OutlinedTextFieldDefaults.colors(
-    focusedBorderColor    = ThunderElectric,
-    unfocusedBorderColor  = ThunderMidBlue,
-    focusedTextColor      = ThunderWhite,
-    unfocusedTextColor    = ThunderWhite,
-    cursorColor           = ThunderElectric,
-    focusedContainerColor = ThunderDeepBlue,
+    focusedBorderColor      = ThunderElectric,
+    unfocusedBorderColor    = ThunderMidBlue,
+    focusedTextColor        = ThunderWhite,
+    unfocusedTextColor      = ThunderWhite,
+    cursorColor             = ThunderElectric,
+    focusedContainerColor   = ThunderDeepBlue,
     unfocusedContainerColor = ThunderDeepBlue
 )
 
-// ── WiFi Direct Peer Sync Panel ───────────────────────────────────────────────
-
+// ── WiFi Sync Panel ───────────────────────────────────────────────────────────
 @Composable
 fun PeerSyncPanel(peerSync: com.thunder.agi.p2p.PeerSync) {
     val state by peerSync.state.collectAsState()
 
     Column(Modifier.fillMaxWidth()) {
-        Text("WiFi Sync مزامنة لاسلكية",
+        Text("WiFi Sync  مزامنة لاسلكية",
             style = MaterialTheme.typography.labelMedium, color = ThunderGray)
-
         Spacer(Modifier.height(6.dp))
 
-        // Status
+        // FIX: better WiFi Direct error message — mentions Location requirement
         Text(
             text = when {
-                state.error != null             -> "⚠ ${state.error}"
-                state.transferProgress != null  -> "⟳ ${state.transferProgress}"
-                state.lastSyncResult != null    -> "✓ ${state.lastSyncResult}"
-                state.isConnected               -> "متصل بـ ${state.connectedDevice}"
-                state.isDiscovering             -> "جارٍ البحث عن الأجهزة القريبة…"
-                else                            -> "غير نشط"
+                state.error != null -> {
+                    val err = state.error!!
+                    if (err.contains("Internal error", ignoreCase = true) ||
+                        err.contains("BUSY", ignoreCase = true))
+                        "⚠ WiFi Direct يحتاج تفعيل الموقع (GPS) — Android 10+\n" +
+                        "WiFi Direct requires Location Services to be ON (Android 10+)"
+                    else "⚠ $err"
+                }
+                state.transferProgress != null -> "⟳ ${state.transferProgress}"
+                state.lastSyncResult  != null  -> "✓ ${state.lastSyncResult}"
+                state.isConnected              -> "متصل بـ ${state.connectedDevice}"
+                state.isDiscovering            -> "جارٍ البحث عن الأجهزة القريبة…"
+                else                           -> "غير نشط"
             },
             style = MaterialTheme.typography.bodySmall,
             color = when {
-                state.error != null            -> ThunderRed
-                state.lastSyncResult != null   -> ThunderGreen
-                else                           -> ThunderGray
+                state.error != null          -> ThunderRed
+                state.lastSyncResult != null -> ThunderGreen
+                else                         -> ThunderGray
             }
         )
-
         Spacer(Modifier.height(8.dp))
-
-        // Discover / Stop button
         OutlinedButton(
             onClick = {
                 if (state.isDiscovering || state.isConnected) peerSync.disconnect()
                 else peerSync.discoverPeers()
             },
             modifier = Modifier.fillMaxWidth(),
-            border = BorderStroke(1.dp, ThunderMidBlue)
+            border   = BorderStroke(1.dp, ThunderMidBlue)
         ) {
-            Text(
-                if (state.isDiscovering || state.isConnected) "إيقاف المزامنة" else "بحث عن الأجهزة القريبة",
-                color = ThunderElectric
-            )
+            Text(if (state.isDiscovering || state.isConnected) "إيقاف المزامنة"
+                 else "بحث عن الأجهزة القريبة",
+                color = ThunderElectric)
         }
 
-        // Peer list
         if (state.peers.isNotEmpty()) {
             Spacer(Modifier.height(6.dp))
             Text("الأجهزة المكتشفة:", style = MaterialTheme.typography.labelSmall, color = ThunderGray)
             state.peers.forEach { device ->
-                Row(
-                    Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                Row(Modifier.fillMaxWidth().padding(vertical = 2.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        device.deviceName.ifBlank { device.deviceAddress },
-                        style = MaterialTheme.typography.bodySmall, color = ThunderWhite
-                    )
+                    verticalAlignment     = Alignment.CenterVertically) {
+                    Text(device.deviceName.ifBlank { device.deviceAddress },
+                        style = MaterialTheme.typography.bodySmall, color = ThunderWhite)
                     TextButton(onClick = { peerSync.connectToPeer(device) }) {
                         Text("مزامنة", color = ThunderElectric)
                     }
