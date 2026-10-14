@@ -8,7 +8,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Large runner needed for DreamLite conversion (~8GB RAM required)
 
     steps:
       - name: Free Disk Space (Ubuntu)
@@ -18,15 +17,12 @@ jobs:
           sudo rm -rf /opt/ghc
           sudo rm -rf /usr/local/share/boost
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Remove adaptive icon overrides (use density-specific webp icons instead)
         run: |
-          # The mipmap-anydpi XMLs define an adaptive icon using the lightning bolt
-          # vector drawable, which overrides ALL density-specific webp files on
-          # Android 8+. Deleting them forces Android to use the correctly-sized
-          # webp files generated in the icon step below.
           rm -f lfm25/app/src/main/res/mipmap-anydpi/ic_launcher.xml
           rm -f lfm25/app/src/main/res/mipmap-anydpi/ic_launcher_round.xml
           echo "Adaptive icon XMLs removed"
@@ -48,7 +44,7 @@ jobs:
         run: |
           python3 << 'PYEOF'
           from PIL import Image
-          import os, sys
+          import os
           src = "lfm25/app/src/main/assets/app_icon_source.jpg"
           if not os.path.exists(src):
               print("WARNING: app_icon_source.jpg not found, skipping icons")
@@ -77,14 +73,14 @@ jobs:
           python3 << 'PYEOF'
           import os, sys, torch, json
           print("=== DreamLite ONNX Export Pipeline ===")
-          
+
           from huggingface_hub import snapshot_download
           from diffusers import AutoencoderKL, UNet2DConditionModel, AutoPipelineForText2Image
           from transformers import CLIPTextModel, CLIPTokenizer
           import numpy as np
-          
+
           os.makedirs("dreamlite_onnx", exist_ok=True)
-          
+
           # ── 1. VAE decoder ─────────────────────────────────────────────────
           print("Downloading HD VAE (madebyollin/sdxl-vae-fp16-fix)...")
           try:
@@ -100,7 +96,7 @@ jobs:
               del vae
           except Exception as e:
               print(f"VAE export failed: {e}")
-          
+
           # ── 2. CLIP text encoder ──────────────────────────────────────────
           print("Downloading CLIP text encoder...")
           try:
@@ -118,22 +114,17 @@ jobs:
               del text_encoder, tokenizer
           except Exception as e:
               print(f"Text encoder export failed: {e}")
-          
+
           # ── 3. UNet — try DreamLite first, fall back to TinySD ────────────
-          # The UNet is the core denoising network — without it the pipeline
-          # produces noise, not real images. DreamLite-base may have one;
-          # TinySD (~200 MB) is a reliable mobile-optimised fallback.
           unet_exported = False
-          num_steps = 20  # default for full UNet
-          
-          print("Trying DreamLite UNet (full weights, no ignore_patterns)...")
+          num_steps = 20
+
+          print("Trying DreamLite UNet...")
           try:
               dl_path = snapshot_download(
                   "carlofkl/DreamLite-base",
                   revision="diffusers",
-                  local_dir="dreamlite_base"
-                  # No ignore_patterns — we need the .safetensors weights
-              )
+                  local_dir="dreamlite_base")
               unet = UNet2DConditionModel.from_pretrained(
                   f"{dl_path}/unet", torch_dtype=torch.float32)
               unet.eval()
@@ -150,9 +141,8 @@ jobs:
               del unet
           except Exception as e:
               print(f"DreamLite UNet not available ({e}), using TinySD fallback...")
-          
+
           if not unet_exported:
-              # TinySD: distilled from SD1.5, ~40% smaller, works in 20 steps
               print("Downloading TinySD UNet (segmind/tiny-sd)...")
               try:
                   pipe = AutoPipelineForText2Image.from_pretrained(
@@ -167,13 +157,12 @@ jobs:
                       input_names=["sample", "timestep", "encoder_hidden_states"],
                       output_names=["out_sample"], opset_version=17)
                   unet_exported = True
-                  num_steps = 20  # TinySD works well with 20 steps
                   print(f"✓ TinySD UNet: {os.path.getsize('dreamlite_onnx/unet.onnx')//1024//1024} MB")
                   del pipe
               except Exception as e:
                   print(f"TinySD export also failed: {e}")
-                  print("WARNING: No UNet available — offline image generation disabled")
-          
+                  print("WARNING: No UNet — offline image generation disabled")
+
           # ── 4. Manifest ────────────────────────────────────────────────────
           manifest = {
               "version": "2.0",
@@ -193,21 +182,27 @@ jobs:
           print("Available ONNX files:", os.listdir("dreamlite_onnx"))
           PYEOF
 
-      - name: Pack DreamLite ONNX into assets
+      # FIX: Copy ONNX files DIRECTLY into assets — no zip container.
+      # Zipping caused double-compression: the zip was re-compressed by aapt
+      # inside the APK, so Android had to decompress twice, corrupting streams.
+      # With direct asset files + noCompress in build.gradle.kts the files are
+      # stored uncompressed and ImageGenerator.kt copies them to filesDir as-is.
+      - name: Copy DreamLite ONNX files directly into assets (no zip)
         run: |
           mkdir -p lfm25/app/src/main/assets
           if [ -d "dreamlite_onnx" ] && [ "$(ls dreamlite_onnx/*.onnx 2>/dev/null | wc -l)" -gt "0" ]; then
-            cd dreamlite_onnx
-            zip -r ../lfm25/app/src/main/assets/dreamlite.zip .
-            cd ..
-            echo "DreamLite bundled: $(du -sh lfm25/app/src/main/assets/dreamlite.zip)"
-            # IMPORTANT: noCompress in build.gradle.kts stores this zip uncompressed
-            # inside the APK so Android can read it directly without double-decompression.
+            # Copy each ONNX file directly — NOT zipped
+            for f in dreamlite_onnx/*.onnx dreamlite_onnx/manifest.json; do
+              [ -f "$f" ] && cp "$f" lfm25/app/src/main/assets/
+            done
+            echo "DreamLite ONNX files copied directly to assets:"
+            ls -lh lfm25/app/src/main/assets/*.onnx lfm25/app/src/main/assets/manifest.json 2>/dev/null || true
           else
-            echo "ERROR: No ONNX files in dreamlite_onnx/ — conversion step above failed"
+            echo "WARNING: No ONNX files in dreamlite_onnx/ — offline image generation will be skipped"
             ls -la dreamlite_onnx/ 2>/dev/null || echo "dreamlite_onnx/ missing"
-            exit 1
+            # Do NOT exit 1 — app still works without image generation (online fallback)
           fi
+          echo "Full assets:"
           ls -lh lfm25/app/src/main/assets/
 
       - name: Install NDK and CMake
@@ -221,19 +216,29 @@ jobs:
 
       - name: Generate consistent signing keystore
         run: |
-          # Use a fixed keystore so APK updates install over previous version
-          # without requiring uninstall. Same key = same signature = update works.
           KEYSTORE_PATH="$HOME/thunder_agi.keystore"
           if [ ! -f "$KEYSTORE_PATH" ]; then
-            keytool -genkey -v               -keystore "$KEYSTORE_PATH"               -alias thunder_agi               -keyalg RSA -keysize 2048               -validity 10000               -storepass ThunderAGI2026!               -keypass ThunderAGI2026!               -dname "CN=Thunder AGI, OU=Thunder, O=Yassin Khashelmoos, L=Khartoum, ST=Khartoum, C=SD"
+            keytool -genkey -v \
+              -keystore "$KEYSTORE_PATH" \
+              -alias thunder_agi \
+              -keyalg RSA -keysize 2048 \
+              -validity 10000 \
+              -storepass ThunderAGI2026! \
+              -keypass ThunderAGI2026! \
+              -dname "CN=Thunder AGI, OU=Thunder, O=Yassin Khashelmoos, L=Khartoum, ST=Khartoum, C=SD"
             echo "Keystore generated"
           fi
           echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> $GITHUB_ENV
 
-      - name: Build Release APK (minified + obfuscated)
+      - name: Build Release APK
         working-directory: lfm25
         run: |
-          ./gradlew assembleRelease             -Pandroid.injected.signing.store.file=${{ env.KEYSTORE_PATH }}             -Pandroid.injected.signing.store.password=ThunderAGI2026!             -Pandroid.injected.signing.key.alias=thunder_agi             -Pandroid.injected.signing.key.password=ThunderAGI2026!             --stacktrace
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file=${{ env.KEYSTORE_PATH }} \
+            -Pandroid.injected.signing.store.password=ThunderAGI2026! \
+            -Pandroid.injected.signing.key.alias=thunder_agi \
+            -Pandroid.injected.signing.key.password=ThunderAGI2026! \
+            --stacktrace
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
           ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/25.2.9519653
@@ -241,8 +246,6 @@ jobs:
       - name: Copy APK to output
         run: |
           mkdir -p output
-          # Use Gradle output directly - it already does zipalign + signing
-          # DO NOT run zipalign manually after signing - it breaks the signature
           APK="lfm25/app/build/outputs/apk/release/app-release.apk"
           if [ ! -f "$APK" ]; then
             APK="lfm25/app/build/outputs/apk/debug/app-debug.apk"
@@ -254,7 +257,6 @@ jobs:
       - name: Verify APK is valid
         run: |
           APK="output/ThunderAGI-الرعد-v3.apk"
-          # Verify it's a valid ZIP/APK
           python3 -c "
           import zipfile, sys
           try:
@@ -263,8 +265,10 @@ jobs:
                   has_manifest = 'AndroidManifest.xml' in files
                   has_dex = any(f.endswith('.dex') for f in files)
                   has_lib = any(f.startswith('lib/') for f in files)
+                  onnx_files = [f for f in files if f.endswith('.onnx')]
                   print(f'APK valid: manifest={has_manifest} dex={has_dex} lib={has_lib}')
-                  print(f'Files: {len(files)}')
+                  print(f'ONNX files in APK: {onnx_files}')
+                  print(f'Total files: {len(files)}')
                   if not has_manifest or not has_dex:
                       print('ERROR: APK missing required components!')
                       sys.exit(1)
@@ -286,8 +290,8 @@ jobs:
           echo ""
           echo "=== HOW TO INSTALL ==="
           echo "1. Download the artifact ZIP from GitHub"
-          echo "2. EXTRACT the ZIP - you will find ThunderAGI-الرعد-v3.apk inside"
+          echo "2. EXTRACT the ZIP — you will find ThunderAGI-الرعد-v3.apk inside"
           echo "3. Copy ONLY the .apk file to your phone"
           echo "4. Tap the .apk file to install"
-          echo "DO NOT try to install the .zip - extract it first!"
+          echo "DO NOT try to install the .zip — extract it first!"
           echo "APK size: $(du -sh output/ThunderAGI-الرعد-v3.apk)"
