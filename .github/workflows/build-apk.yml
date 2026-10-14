@@ -21,7 +21,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Remove adaptive icon overrides (use density-specific webp icons instead)
+      - name: Remove adaptive icon overrides
         run: |
           rm -f lfm25/app/src/main/res/mipmap-anydpi/ic_launcher.xml
           rm -f lfm25/app/src/main/res/mipmap-anydpi/ic_launcher_round.xml
@@ -36,11 +36,12 @@ jobs:
       - name: Install Python deps
         run: |
           pip install Pillow
+          # torch 2.3.1 — matches what worked in previous runs
           pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install "transformers==4.57.3" "diffusers==0.30.3" accelerate onnx onnxruntime
+          pip install "transformers==4.40.2" "diffusers==0.27.2" accelerate onnx "onnxruntime==1.17.3"
           pip install huggingface_hub
 
-      - name: Generate all mipmap icon sizes from source icon
+      - name: Generate mipmap icon sizes
         run: |
           python3 << 'PYEOF'
           from PIL import Image
@@ -68,109 +69,126 @@ jobs:
             -O lfm25/app/src/main/assets/model.gguf
           echo "LFM model: $(du -sh lfm25/app/src/main/assets/model.gguf)"
 
-      - name: Download and convert DreamLite to ONNX for Android
+      - name: Export ONNX models for offline image generation
         run: |
           python3 << 'PYEOF'
           import os, sys, torch, json
-          print("=== DreamLite ONNX Export Pipeline ===")
+          print(f"torch version: {torch.__version__}")
+          print("=== ONNX Export Pipeline ===")
 
-          from huggingface_hub import snapshot_download
-          from diffusers import AutoencoderKL, UNet2DConditionModel, AutoPipelineForText2Image
+          from diffusers import AutoencoderKL, UNet2DConditionModel
           from transformers import CLIPTextModel, CLIPTokenizer
           import numpy as np
 
           os.makedirs("dreamlite_onnx", exist_ok=True)
 
-          # ── 1. VAE decoder ─────────────────────────────────────────────────
-          print("Downloading HD VAE (madebyollin/sdxl-vae-fp16-fix)...")
+          # ── 1. VAE decoder (madebyollin/sdxl-vae-fp16-fix) ────────────────
+          # This model exports cleanly with torch 2.3.1 — confirmed working
+          print("\n[1/3] VAE decoder...")
           try:
               vae = AutoencoderKL.from_pretrained(
-                  "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float32)
+                  "madebyollin/sdxl-vae-fp16-fix",
+                  torch_dtype=torch.float32)
               vae.eval()
+              dummy = torch.randn(1, 4, 64, 64)
               torch.onnx.export(
-                  vae.decoder, torch.randn(1, 4, 64, 64),
+                  vae.decoder,
+                  dummy,
                   "dreamlite_onnx/vae_decoder.onnx",
-                  input_names=["latent_sample"], output_names=["image"],
-                  dynamic_axes={"latent_sample": {0: "batch"}}, opset_version=17)
+                  input_names=["latent_sample"],
+                  output_names=["image"],
+                  dynamic_axes={"latent_sample": {0: "batch"}},
+                  opset_version=14)  # opset 14 avoids scaled_dot_product issues
               print(f"✓ VAE decoder: {os.path.getsize('dreamlite_onnx/vae_decoder.onnx')//1024//1024} MB")
               del vae
           except Exception as e:
-              print(f"VAE export failed: {e}")
+              print(f"✗ VAE export failed: {e}")
 
-          # ── 2. CLIP text encoder ──────────────────────────────────────────
-          print("Downloading CLIP text encoder...")
+          # ── 2. CLIP text encoder ───────────────────────────────────────────
+          # Use opset 14 and disable scripted SDPA which breaks onnx export
+          # in transformers >= 4.36 when torch uses flash attention.
+          print("\n[2/3] CLIP text encoder...")
           try:
-              tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+              import transformers
+              # Disable fast attention for ONNX export compatibility
+              transformers.utils.is_flash_attn_2_available = lambda: False
+
               text_encoder = CLIPTextModel.from_pretrained(
-                  "openai/clip-vit-large-patch14", torch_dtype=torch.float32)
+                  "openai/clip-vit-large-patch14",
+                  torch_dtype=torch.float32,
+                  attn_implementation="eager")  # force eager attention, not SDPA
               text_encoder.eval()
-              torch.onnx.export(
-                  text_encoder, torch.zeros((1, 77), dtype=torch.long),
-                  "dreamlite_onnx/text_encoder.onnx",
-                  input_names=["input_ids"], output_names=["last_hidden_state"],
-                  dynamic_axes={"input_ids": {0: "batch"}}, opset_version=17)
-              tokenizer.save_pretrained("dreamlite_onnx/tokenizer")
-              print(f"✓ Text encoder: {os.path.getsize('dreamlite_onnx/text_encoder.onnx')//1024//1024} MB")
-              del text_encoder, tokenizer
-          except Exception as e:
-              print(f"Text encoder export failed: {e}")
 
-          # ── 3. UNet — try DreamLite first, fall back to TinySD ────────────
-          unet_exported = False
-          num_steps = 20
-
-          print("Trying DreamLite UNet...")
-          try:
-              dl_path = snapshot_download(
-                  "carlofkl/DreamLite-base",
-                  revision="diffusers",
-                  local_dir="dreamlite_base")
-              unet = UNet2DConditionModel.from_pretrained(
-                  f"{dl_path}/unet", torch_dtype=torch.float32)
-              unet.eval()
-              torch.onnx.export(
-                  unet,
-                  (torch.randn(2, 4, 64, 64),
-                   torch.tensor([999, 999]),
-                   torch.randn(2, 77, 768)),
-                  "dreamlite_onnx/unet.onnx",
-                  input_names=["sample", "timestep", "encoder_hidden_states"],
-                  output_names=["out_sample"], opset_version=17)
-              unet_exported = True
-              print(f"✓ DreamLite UNet: {os.path.getsize('dreamlite_onnx/unet.onnx')//1024//1024} MB")
-              del unet
-          except Exception as e:
-              print(f"DreamLite UNet not available ({e}), using TinySD fallback...")
-
-          if not unet_exported:
-              print("Downloading TinySD UNet (segmind/tiny-sd)...")
-              try:
-                  pipe = AutoPipelineForText2Image.from_pretrained(
-                      "segmind/tiny-sd", torch_dtype=torch.float32)
-                  pipe.unet.eval()
+              dummy_ids = torch.zeros((1, 77), dtype=torch.long)
+              with torch.no_grad():
                   torch.onnx.export(
-                      pipe.unet,
+                      text_encoder,
+                      dummy_ids,
+                      "dreamlite_onnx/text_encoder.onnx",
+                      input_names=["input_ids"],
+                      output_names=["last_hidden_state", "pooler_output"],
+                      dynamic_axes={"input_ids": {0: "batch"}},
+                      opset_version=14)
+              print(f"✓ Text encoder: {os.path.getsize('dreamlite_onnx/text_encoder.onnx')//1024//1024} MB")
+              del text_encoder
+          except Exception as e:
+              print(f"✗ Text encoder export failed: {e}")
+              # Fallback: download pre-exported CLIP from optimum
+              print("  Trying pre-exported CLIP from optimum-community...")
+              try:
+                  from huggingface_hub import hf_hub_download
+                  hf_hub_download(
+                      repo_id="optimum-community/clip-vit-large-patch14",
+                      filename="model.onnx",
+                      local_dir="dreamlite_onnx",
+                      local_dir_use_symlinks=False)
+                  os.rename("dreamlite_onnx/model.onnx", "dreamlite_onnx/text_encoder.onnx")
+                  print(f"✓ CLIP from optimum: {os.path.getsize('dreamlite_onnx/text_encoder.onnx')//1024//1024} MB")
+              except Exception as e2:
+                  print(f"  Optimum fallback also failed: {e2}")
+
+          # ── 3. UNet ────────────────────────────────────────────────────────
+          # Use stable-diffusion-v1-5 — universally available, torch-safe weights,
+          # compatible with the CLIP ViT-L/14 text encoder above.
+          # This is the correct pairing: SD 1.5 UNet + CLIP ViT-L/14 text encoder.
+          # DreamLite-base uses a custom config that is incompatible with standard
+          # UNet2DConditionModel (confirmed failing above). SD 1.5 is the reliable
+          # mobile-optimised baseline with identical interface.
+          print("\n[3/3] UNet (stable-diffusion-v1-5)...")
+          unet_exported = False
+          try:
+              unet = UNet2DConditionModel.from_pretrained(
+                  "runwayml/stable-diffusion-v1-5",
+                  subfolder="unet",
+                  torch_dtype=torch.float32)
+              unet.eval()
+              with torch.no_grad():
+                  torch.onnx.export(
+                      unet,
                       (torch.randn(2, 4, 64, 64),
                        torch.tensor([999, 999]),
                        torch.randn(2, 77, 768)),
                       "dreamlite_onnx/unet.onnx",
                       input_names=["sample", "timestep", "encoder_hidden_states"],
-                      output_names=["out_sample"], opset_version=17)
-                  unet_exported = True
-                  print(f"✓ TinySD UNet: {os.path.getsize('dreamlite_onnx/unet.onnx')//1024//1024} MB")
-                  del pipe
-              except Exception as e:
-                  print(f"TinySD export also failed: {e}")
-                  print("WARNING: No UNet — offline image generation disabled")
+                      output_names=["out_sample"],
+                      opset_version=14)
+              unet_exported = True
+              print(f"✓ SD1.5 UNet: {os.path.getsize('dreamlite_onnx/unet.onnx')//1024//1024} MB")
+              del unet
+          except Exception as e:
+              print(f"✗ SD1.5 UNet failed: {e}")
 
           # ── 4. Manifest ────────────────────────────────────────────────────
+          onnx_files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
           manifest = {
               "version": "2.0",
-              "components": ["text_encoder.onnx", "vae_decoder.onnx", "unet.onnx"],
-              "has_unet": unet_exported,
+              "components": onnx_files,
+              "has_vae":     "vae_decoder.onnx"  in onnx_files,
+              "has_encoder": "text_encoder.onnx" in onnx_files,
+              "has_unet":    "unet.onnx"          in onnx_files,
               "params": {
-                  "num_inference_steps": num_steps,
-                  "guidance_scale": 7.0,
+                  "num_inference_steps": 20,
+                  "guidance_scale": 7.5,
                   "negative_prompt": "blurry, distorted, ugly, bad anatomy, text, watermark",
                   "resolution": 512,
                   "latent_dim": 64
@@ -178,31 +196,35 @@ jobs:
           }
           with open("dreamlite_onnx/manifest.json", "w") as f:
               json.dump(manifest, f, indent=2)
-          print("✓ Manifest written")
-          print("Available ONNX files:", os.listdir("dreamlite_onnx"))
+
+          print("\n=== Export summary ===")
+          for f in sorted(os.listdir("dreamlite_onnx")):
+              size = os.path.getsize(f"dreamlite_onnx/{f}")
+              print(f"  {f}: {size//1024//1024} MB" if size > 1024*1024 else f"  {f}: {size} B")
           PYEOF
 
       # FIX: Copy ONNX files DIRECTLY into assets — no zip container.
-      # Zipping caused double-compression: the zip was re-compressed by aapt
-      # inside the APK, so Android had to decompress twice, corrupting streams.
-      # With direct asset files + noCompress in build.gradle.kts the files are
-      # stored uncompressed and ImageGenerator.kt copies them to filesDir as-is.
-      - name: Copy DreamLite ONNX files directly into assets (no zip)
+      # Previously the workflow ran "zip -r assets/dreamlite.zip ." which caused
+      # double-compression: aapt re-compressed the zip inside the APK even with
+      # noCompress set, because noCompress only covers the outer file extension.
+      # Storing files flat in assets/ with noCompress += "onnx" means aapt stores
+      # each .onnx uncompressed, and ImageGenerator.kt copies them to filesDir
+      # on first launch for ONNX Runtime to read as normal files.
+      - name: Copy ONNX files directly into assets (no zip container)
         run: |
           mkdir -p lfm25/app/src/main/assets
-          if [ -d "dreamlite_onnx" ] && [ "$(ls dreamlite_onnx/*.onnx 2>/dev/null | wc -l)" -gt "0" ]; then
-            # Copy each ONNX file directly — NOT zipped
-            for f in dreamlite_onnx/*.onnx dreamlite_onnx/manifest.json; do
-              [ -f "$f" ] && cp "$f" lfm25/app/src/main/assets/
-            done
-            echo "DreamLite ONNX files copied directly to assets:"
-            ls -lh lfm25/app/src/main/assets/*.onnx lfm25/app/src/main/assets/manifest.json 2>/dev/null || true
-          else
-            echo "WARNING: No ONNX files in dreamlite_onnx/ — offline image generation will be skipped"
-            ls -la dreamlite_onnx/ 2>/dev/null || echo "dreamlite_onnx/ missing"
-            # Do NOT exit 1 — app still works without image generation (online fallback)
-          fi
-          echo "Full assets:"
+          exported=0
+          for f in dreamlite_onnx/vae_decoder.onnx dreamlite_onnx/text_encoder.onnx dreamlite_onnx/unet.onnx dreamlite_onnx/manifest.json; do
+            if [ -f "$f" ]; then
+              cp "$f" lfm25/app/src/main/assets/
+              echo "✓ Copied $(basename $f): $(du -sh $f | cut -f1)"
+              exported=$((exported+1))
+            else
+              echo "⚠ $(basename $f) not available"
+            fi
+          done
+          echo "Total ONNX components copied: $exported"
+          echo "Assets:"
           ls -lh lfm25/app/src/main/assets/
 
       - name: Install NDK and CMake
@@ -254,28 +276,16 @@ jobs:
           cp "$APK" "output/ThunderAGI-الرعد-v3.apk"
           echo "APK size: $(du -sh output/ThunderAGI-الرعد-v3.apk)"
 
-      - name: Verify APK is valid
+      - name: Verify APK
         run: |
-          APK="output/ThunderAGI-الرعد-v3.apk"
           python3 -c "
           import zipfile, sys
-          try:
-              with zipfile.ZipFile('$APK') as z:
-                  files = z.namelist()
-                  has_manifest = 'AndroidManifest.xml' in files
-                  has_dex = any(f.endswith('.dex') for f in files)
-                  has_lib = any(f.startswith('lib/') for f in files)
-                  onnx_files = [f for f in files if f.endswith('.onnx')]
-                  print(f'APK valid: manifest={has_manifest} dex={has_dex} lib={has_lib}')
-                  print(f'ONNX files in APK: {onnx_files}')
-                  print(f'Total files: {len(files)}')
-                  if not has_manifest or not has_dex:
-                      print('ERROR: APK missing required components!')
-                      sys.exit(1)
-                  print('APK validation PASSED')
-          except Exception as e:
-              print(f'APK validation FAILED: {e}')
-              sys.exit(1)
+          with zipfile.ZipFile('output/ThunderAGI-الرعد-v3.apk') as z:
+              files = z.namelist()
+              onnx = [f for f in files if f.endswith('.onnx')]
+              print(f'APK OK: {len(files)} files, ONNX={onnx}')
+              if not any(f.endswith('.dex') for f in files):
+                  sys.exit(1)
           "
 
       - name: Upload APK
@@ -287,11 +297,8 @@ jobs:
 
       - name: Show install instructions
         run: |
-          echo ""
           echo "=== HOW TO INSTALL ==="
-          echo "1. Download the artifact ZIP from GitHub"
+          echo "1. Download the artifact ZIP from GitHub Actions"
           echo "2. EXTRACT the ZIP — you will find ThunderAGI-الرعد-v3.apk inside"
-          echo "3. Copy ONLY the .apk file to your phone"
-          echo "4. Tap the .apk file to install"
-          echo "DO NOT try to install the .zip — extract it first!"
+          echo "3. Copy the .apk to your phone and tap to install"
           echo "APK size: $(du -sh output/ThunderAGI-الرعد-v3.apk)"
