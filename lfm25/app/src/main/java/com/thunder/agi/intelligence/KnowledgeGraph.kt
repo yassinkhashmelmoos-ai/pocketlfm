@@ -108,7 +108,7 @@ class KnowledgeGraph(context: Context) {
     }
 
     /** Extract and store facts from a conversation turn using simple heuristics */
-    suspend fun learnFromConversation(userText: String, aiResponse: String) =
+    suspend fun learnFromConversation(userText: String, @Suppress("UNUSED_PARAMETER") aiResponse: String) =
         withContext(Dispatchers.IO) {
             val lower = userText.lowercase()
 
