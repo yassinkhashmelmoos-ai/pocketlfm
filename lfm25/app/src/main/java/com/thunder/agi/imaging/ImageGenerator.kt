@@ -97,13 +97,34 @@ class ImageGenerator(private val context: Context) {
 
     private fun extractAndLoadModels() {
         try {
-            val zipFile = File(context.filesDir, DREAMLITE_ZIP)
-            val assetsZip = context.assets.list("")?.contains(DREAMLITE_ZIP) == true
+            // Load ONNX files directly from assets (not from a zip).
+            // The GitHub Actions workflow now copies vae_decoder.onnx, text_encoder.onnx,
+            // and unet.onnx directly into assets/ — no zip container needed.
+            // This avoids the double-compression issue where Android re-packages
+            // the zip and the ONNX files end up compressed inside a compressed archive.
+            val onnxFiles = listOf("vae_decoder.onnx", "text_encoder.onnx", "unet.onnx")
+            val assetList = context.assets.list("") ?: emptyArray()
+            for (name in onnxFiles) {
+                val dest = File(context.filesDir, name)
+                if (!dest.exists() && assetList.contains(name)) {
+                    Log.i(TAG, "Copying $name from assets...")
+                    context.assets.open(name).use { input ->
+                        FileOutputStream(dest).use { out -> input.copyTo(out) }
+                    }
+                    Log.i(TAG, "$name copied (${dest.length()/1024/1024}MB)")
+                }
+            }
 
-            if (!zipFile.exists() && assetsZip) {
-                Log.i(TAG, "Extracting ThunderImagen from assets...")
-                context.assets.open(DREAMLITE_ZIP).use { input ->
-                    ZipInputStream(input).use { zis ->
+            // Legacy zip support: if old zip exists and ONNX not yet extracted
+            val zipFile = File(context.filesDir, DREAMLITE_ZIP)
+            val assetsZip = assetList.contains(DREAMLITE_ZIP)
+            val vaeExtracted = File(context.filesDir, "vae_decoder.onnx").exists()
+            if (!vaeExtracted && (zipFile.exists() || assetsZip)) {
+                val input = if (zipFile.exists()) java.io.FileInputStream(zipFile)
+                            else context.assets.open(DREAMLITE_ZIP)
+                Log.i(TAG, "Extracting from legacy zip...")
+                input.use {
+                    ZipInputStream(it).use { zis ->
                         var entry = zis.nextEntry
                         while (entry != null) {
                             val dest = File(context.filesDir, entry.name)
@@ -113,7 +134,7 @@ class ImageGenerator(private val context: Context) {
                         }
                     }
                 }
-                Log.i(TAG, "ThunderImagen extracted")
+                Log.i(TAG, "Legacy zip extracted")
             }
 
             val teFile = File(context.filesDir, "text_encoder.onnx")
@@ -512,7 +533,7 @@ class ImageGenerator(private val context: Context) {
             "golden" to 4404L,"dog" to 1929L,"playing" to 2712L,"park" to 2523L
         )
         var pos = 1
-        for (word in text.lowercase().trim().split(Regex("\s+"))) {
+        for (word in text.lowercase().trim().split(Regex("\\s+"))) {
             if (pos >= maxLen - 1) break
             val tok = known[word] ?: run {
                 var h = 5381L
