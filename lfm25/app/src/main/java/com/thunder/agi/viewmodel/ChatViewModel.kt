@@ -239,7 +239,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     _ui.update { s -> s.copy(messages = rows.map { r ->
                         ChatMessage(id = r.id, content = r.content, isUser = r.isUser,
                             mediaPath = r.mediaPath, mediaType = r.mediaType,
-                            timestamp = r.timestamp ?: System.currentTimeMillis())
+                            timestamp = r.timestamp)
                     })}
                 }
             }
