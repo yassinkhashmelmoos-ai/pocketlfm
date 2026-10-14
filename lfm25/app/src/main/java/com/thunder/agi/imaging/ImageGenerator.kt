@@ -327,7 +327,7 @@ class ImageGenerator(private val context: Context) {
 
     // ── Online generation (Pollinations.ai) ──────────────────────────────────
 
-    private suspend fun generateOnline(prompt: String, sourceImage: Bitmap?): GenerationResult {
+    private suspend fun generateOnline(prompt: String, @Suppress("UNUSED_PARAMETER") sourceImage: Bitmap?): GenerationResult {
         return try {
             val encoded = URLEncoder.encode(prompt, "UTF-8")
             val seed    = Random.nextInt(99999)
@@ -460,6 +460,7 @@ class ImageGenerator(private val context: Context) {
         return when (val first = raw[0]) {
             // 4D NCHW: Array<Array<Array<FloatArray>>> shape [batch, C, H, W]
             is Array<*> -> when {
+                @Suppress("USELESS_CAST")
                 (first as Array<*>).firstOrNull() is Array<*> -> {
                     @Suppress("UNCHECKED_CAST")
                     val nchw = raw as Array<Array<Array<FloatArray>>>
@@ -567,8 +568,6 @@ class ImageGenerator(private val context: Context) {
             // Classifier-Free Guidance: combine text and negative conditioning
             // noise_pred = neg + cfgScale * (text - neg)
             val result = FloatArray(latent.size)
-            val embedScale = minOf(textEmbed.size, latent.size)
-
             for (i in latent.indices) {
                 val textCond = textEmbed.getOrElse(i % textEmbed.size) { 0f }
                 val negCond  = negEmbed.getOrElse(i % negEmbed.size) { 0f }
