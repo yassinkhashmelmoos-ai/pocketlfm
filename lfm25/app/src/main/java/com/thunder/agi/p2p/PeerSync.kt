@@ -67,12 +67,13 @@ class PeerSync(private val context: Context) {
                     }
                 }
                 WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
+                    @Suppress("DEPRECATION")
                     val networkInfo = if (Build.VERSION.SDK_INT >= 29)
                         intent.getParcelableExtra<android.net.NetworkInfo>(WifiP2pManager.EXTRA_NETWORK_INFO)
                     else
-                        @Suppress("DEPRECATION")
                         intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO)
 
+                    @Suppress("DEPRECATION")
                     if (networkInfo?.isConnected == true) {
                         manager?.requestConnectionInfo(channel) { info ->
                             if (info.groupFormed) {
@@ -191,7 +192,7 @@ class PeerSync(private val context: Context) {
 
     // ── Data exchange ─────────────────────────────────────────────────────────
 
-    private suspend fun handleConnection(socket: Socket, isServer: Boolean) = withContext(Dispatchers.IO) {
+    private suspend fun handleConnection(socket: Socket, @Suppress("UNUSED_PARAMETER") isServer: Boolean) = withContext(Dispatchers.IO) {
         try {
             val out = DataOutputStream(socket.getOutputStream())
             val inp = DataInputStream(socket.getInputStream())
