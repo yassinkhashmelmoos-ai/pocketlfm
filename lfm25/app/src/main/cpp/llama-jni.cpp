@@ -89,11 +89,14 @@ static jstring generate_dream_diffusion(JNIEnv* env,
                                          float temperature) {
     const llama_vocab* vocab = llama_model_get_vocab(g_model);
 
-    // Get the mask token id — DREAM uses [MASK] during training
+    // Get the mask token id — DREAM uses [MASK] during training.
+    // llama_vocab_mask() is the canonical API; fall back to tokenising the
+    // string literal since llama_vocab_token_to_id() is not in this llama.h.
     llama_token mask_id = llama_vocab_mask(vocab);
     if (mask_id < 0) {
-        // Fallback: find by string
-        mask_id = llama_vocab_token_to_id(vocab, "[MASK]");
+        llama_token tmp[4];
+        int n = llama_tokenize(vocab, "[MASK]", 6, tmp, 4, false, true);
+        if (n > 0) mask_id = tmp[0];
     }
     if (mask_id < 0) {
         LOGW("DREAM: no [MASK] token found, falling back to greedy AR");
@@ -308,7 +311,7 @@ Java_com_thunder_agi_llama_ThunderModel_nativeGenerate(
     // DO NOT clear recurrent/conv state — that destroys multi-turn coherence.
     // llama_kv_cache_seq_rm removes only the attention KV entries for seq 0,
     // leaving the shortconv rolling state intact across turns.
-    llama_kv_cache_seq_rm(g_ctx, 0, -1, -1);
+    llama_memory_seq_rm(llama_get_memory(g_ctx), 0, -1, -1);
     int n_past = 0;
 
     const llama_vocab* vocab = llama_model_get_vocab(g_model);
@@ -333,7 +336,13 @@ Java_com_thunder_agi_llama_ThunderModel_nativeGenerate(
     if (n_tokens > g_ctx_size - max_tokens - 64) {
         int keep = g_ctx_size - max_tokens - 64;
         // Find the <|user|> token id to truncate at turn boundaries
-        llama_token user_tok = llama_vocab_token_to_id(vocab, "<|user|>");
+        // tokenize "<|user|>" to find its token id for boundary-aware truncation
+        llama_token user_tok = -1;
+        {
+            llama_token tmp2[8];
+            int n2 = llama_tokenize(vocab, "<|user|>", 8, tmp2, 8, false, true);
+            if (n2 > 0) user_tok = tmp2[0];
+        }
         std::vector<llama_token> trimmed;
         // Always keep first 256 tokens (system prompt)
         int sys_end = std::min(256, keep / 3);
