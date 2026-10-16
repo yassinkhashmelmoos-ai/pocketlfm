@@ -1,6 +1,7 @@
 #include <jni.h>
 #include <string>
 #include <vector>
+#include <utility>
 #include <android/log.h>
 #include <mutex>
 #include <thread>
@@ -331,45 +332,62 @@ Java_com_thunder_agi_llama_ThunderModel_nativeGenerate(
     if (n_tokens <= 0) return env->NewStringUTF("...");
     tokens.resize(n_tokens);
 
-    // Truncate: keep system prefix + tail, but ONLY at <|user|> boundaries
+    // Truncate: keep system prefix + tail, but ONLY at <|im_start|> boundaries
     // to avoid splicing mid-sequence (which corrupts conv state init for LFM2)
     if (n_tokens > g_ctx_size - max_tokens - 64) {
         int keep = g_ctx_size - max_tokens - 64;
-        // Find the <|user|> token id to truncate at turn boundaries
-        // tokenize "<|user|>" to find its token id for boundary-aware truncation
-        llama_token user_tok = -1;
+        // FIX: the prompt builder now emits ChatML ("<|im_start|>role ... <|im_end|>")
+        // instead of Zephyr-style "<|user|>" tags, so the boundary marker to search
+        // for has to match. "<|im_start|>" also starts EVERY turn (user or
+        // assistant), not just user turns, which makes this boundary search more
+        // reliable than before, not less.
+        llama_token turn_tok = -1;
         {
             llama_token tmp2[8];
-            int n2 = llama_tokenize(vocab, "<|user|>", 8, tmp2, 8, false, true);
-            if (n2 > 0) user_tok = tmp2[0];
+            int n2 = llama_tokenize(vocab, "<|im_start|>", 12, tmp2, 8, false, true);
+            if (n2 > 0) turn_tok = tmp2[0];
         }
-        std::vector<llama_token> trimmed;
         // Always keep first 256 tokens (system prompt)
         int sys_end = std::min(256, keep / 3);
-        trimmed.insert(trimmed.end(), tokens.begin(), tokens.begin() + sys_end);
-        // Walk backward from end, collecting complete turns
+
+        // FIX: the old code appended each kept turn directly into `trimmed` while
+        // walking backward from the end, so the result was
+        // [system, newest turn, 2nd-newest turn, ..., oldest kept turn] — newest
+        // (and the trailing "<|im_start|>assistant" generation prompt inside it)
+        // right after the system block, with older turns piled on AFTER it. That
+        // is backwards: the model needs the conversation in chronological order,
+        // with the generation prompt last, not buried in the middle. This instead
+        // only *collects* the ranges while walking backward (still deciding what
+        // fits newest-first, same as before), then replays them oldest-first.
+        std::vector<std::pair<int,int>> turn_ranges;  // [start, end) in original order, newest collected first
         int tail_start = (int)tokens.size() - 1;
-        int collected  = (int)trimmed.size();
+        int collected  = sys_end;
         while (tail_start > sys_end && collected < keep) {
-            // Find previous <|user|> boundary
+            // Find previous <|im_start|> boundary
             int boundary = tail_start;
-            if (user_tok >= 0) {
-                while (boundary > sys_end && tokens[boundary] != user_tok) boundary--;
+            if (turn_tok >= 0) {
+                while (boundary > sys_end && tokens[boundary] != turn_tok) boundary--;
             } else {
                 boundary = std::max(sys_end, tail_start - 128);
             }
             int turn_len = tail_start - boundary + 1;
             if (collected + turn_len > keep) break;
-            trimmed.insert(trimmed.end(), tokens.begin() + boundary, tokens.begin() + tail_start + 1);
+            turn_ranges.emplace_back(boundary, tail_start + 1);
+            collected += turn_len;
             tail_start = boundary - 1;
-            collected  = (int)trimmed.size();
         }
-        // Sort back into order (we prepended sys and appended turns in reverse)
-        // Actually just fall back to simple head+tail if the boundary logic gives nothing useful
-        if ((int)trimmed.size() < keep / 2) {
-            trimmed.clear();
-            trimmed.insert(trimmed.end(), tokens.begin(), tokens.begin() + sys_end);
+
+        std::vector<llama_token> trimmed;
+        trimmed.insert(trimmed.end(), tokens.begin(), tokens.begin() + sys_end);
+        if (collected < keep / 2) {
+            // Fall back to simple head+tail if the boundary logic found too little
             trimmed.insert(trimmed.end(), tokens.end() - (keep - sys_end), tokens.end());
+        } else {
+            // Replay oldest-first (reverse of collection order) to restore
+            // chronological order, ending with the newest turn last.
+            for (auto it = turn_ranges.rbegin(); it != turn_ranges.rend(); ++it) {
+                trimmed.insert(trimmed.end(), tokens.begin() + it->first, tokens.begin() + it->second);
+            }
         }
         tokens = trimmed;
         n_tokens = (int)tokens.size();
