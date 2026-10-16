@@ -68,7 +68,15 @@ class ThunderModel private constructor() {
         }
     }
 
-    fun resetContext() { if (isModelLoaded) nativeResetContext() }
+    // FIX: this crosses into native code and blocks on the same mutex nativeGenerate()
+    // holds for the whole duration of a reply. It used to be a plain function, so it
+    // ran on whatever thread called it — which, at both call sites in ChatViewModel,
+    // was the main/UI thread, freezing the app if a generation was still in flight.
+    // Dispatching here (matching generate()'s own Dispatchers.Default above) fixes it
+    // for every current and future caller in one place.
+    suspend fun resetContext() = withContext(Dispatchers.Default) {
+        if (isModelLoaded) nativeResetContext()
+    }
 
     // Only called when truly shutting down the app process
     fun unload() {
