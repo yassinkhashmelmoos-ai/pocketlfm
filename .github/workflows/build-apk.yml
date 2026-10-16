@@ -236,31 +236,24 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x lfm25/gradlew
 
-      - name: Generate consistent signing keystore
-        run: |
-          KEYSTORE_PATH="$HOME/thunder_agi.keystore"
-          if [ ! -f "$KEYSTORE_PATH" ]; then
-            keytool -genkey -v \
-              -keystore "$KEYSTORE_PATH" \
-              -alias thunder_agi \
-              -keyalg RSA -keysize 2048 \
-              -validity 10000 \
-              -storepass ThunderAGI2026! \
-              -keypass ThunderAGI2026! \
-              -dname "CN=Thunder AGI, OU=Thunder, O=Yassin Khashelmoos, L=Khartoum, ST=Khartoum, C=SD"
-            echo "Keystore generated"
-          fi
-          echo "KEYSTORE_PATH=$KEYSTORE_PATH" >> $GITHUB_ENV
+      # FIX: every GitHub Actions run starts on a brand new, empty VM, so
+      # `[ ! -f "$KEYSTORE_PATH" ]` was true on EVERY build — this step actually
+      # generated a brand new signing key (new RSA pair, new app signature) each
+      # time, despite being named "consistent". That's why installing an "update"
+      # over an existing install failed with "App not installed": every APK had a
+      # different signature. By request, the fix here is a signing key committed
+      # straight into the repo at lfm25/thunder_agi.jks (allow-listed in
+      # .gitignore) — no GitHub secrets, no extra CI step, nothing to set up.
+      # app/build.gradle.kts already points at that file and signs with it
+      # automatically whenever it's present, so checkout alone is enough; this
+      # step is gone. The one real tradeoff: anyone who can see this repo can see
+      # that key, so anyone could sign their own APK that Android would accept as
+      # an "update" to yours. Switch to a GitHub-secrets-based key instead if that
+      # ever stops being an acceptable tradeoff.
 
       - name: Build Release APK
         working-directory: lfm25
-        run: |
-          ./gradlew assembleRelease \
-            -Pandroid.injected.signing.store.file=${{ env.KEYSTORE_PATH }} \
-            -Pandroid.injected.signing.store.password=ThunderAGI2026! \
-            -Pandroid.injected.signing.key.alias=thunder_agi \
-            -Pandroid.injected.signing.key.password=ThunderAGI2026! \
-            --stacktrace
+        run: ./gradlew assembleRelease --stacktrace
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
           ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/25.2.9519653
