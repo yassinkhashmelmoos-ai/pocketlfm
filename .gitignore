@@ -24,6 +24,10 @@ captures/
 # Keystore files
 *.jks
 *.keystore
+# Exception: this one is the app's real signing key, committed on purpose so CI
+# always signs with the same identity with no extra setup — see the comment in
+# .github/workflows/build-apk.yml above the "Build Release APK" step.
+!/lfm25/thunder_agi.jks
 
 # NDK / Native build
 obj/
