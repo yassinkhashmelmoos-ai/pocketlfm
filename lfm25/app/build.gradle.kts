@@ -48,9 +48,13 @@ android {
             val ksFile = rootProject.file("thunder_agi.jks")
             if (ksFile.exists()) {
                 storeFile     = ksFile
-                storePassword = System.getenv("KS_PASS") ?: "thunder2026"
+                // FIX: matches the keystore now committed at lfm25/thunder_agi.jks
+                // (see .github/workflows/build-apk.yml), so CI signs with the same
+                // key on every run with zero manual setup. System.getenv still wins
+                // if you ever set KS_PASS/KS_ALIAS/KS_KEY_PASS yourself.
+                storePassword = System.getenv("KS_PASS") ?: "1234567890"
                 keyAlias      = System.getenv("KS_ALIAS") ?: "thunder"
-                keyPassword   = System.getenv("KS_KEY_PASS") ?: "thunder2026"
+                keyPassword   = System.getenv("KS_KEY_PASS") ?: "1234567890"
             }
         }
     }
