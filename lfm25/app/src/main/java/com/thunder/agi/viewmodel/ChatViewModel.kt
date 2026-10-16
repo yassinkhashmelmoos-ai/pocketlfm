@@ -36,11 +36,17 @@ private const val TAG       = "ThunderAGI"
 private const val PREFS_NAME = "thunder_agi_prefs"
 
 // ── Prompt builder ────────────────────────────────────────────────────────────
-// FIX: soft prompt cache goes INSIDE the system block as plain text, never as
-// raw template tokens between the system block and the conversation history.
-// Injecting "<|user|>" tokens outside the system block creates two consecutive
-// user turns, corrupting LFM2 conv state and causing the model to echo tokens.
-private fun buildZephyrPrompt(
+// FIX: LFM2.5-VL uses a ChatML-style template (<|im_start|>role ... <|im_end|>),
+// confirmed against Liquid AI's own model card and GGUF conversion docs — NOT the
+// Zephyr-style <|user|>/<|assistant|>/<|system|>/<|endoftext|> tags this used to
+// emit. The model was never trained on those tags, which is why so many odd stop
+// sequences were needed downstream just to contain the confusion they caused.
+// BOS ("<|startoftext|>") is intentionally NOT written here: nativeGenerate()
+// already tokenizes with add_special=true, which auto-prepends the model's real
+// BOS token — writing it again as literal text would double it up.
+// Turn-boundary tokens also changed from "<|user|>" to "<|im_start|>"; the native
+// truncation logic in llama-jni.cpp was updated to match (see FIX there too).
+private fun buildChatPrompt(
     sessionHistory:  List<ChatMessage>,
     userText:        String,
     imagePath:       String?,
@@ -48,31 +54,32 @@ private fun buildZephyrPrompt(
     softPromptCache: String
 ): String {
     val sb = StringBuilder()
-    sb.append("<|system|>\n")
-    sb.append(systemPrompt)
+
+    var systemBlock = systemPrompt
     if (softPromptCache.isNotBlank()) {
         val clean = softPromptCache.take(400)
+            .replace("<|im_start|>", "")
+            .replace("<|im_end|>",   "")
             .replace("<|user|>",      "Q:")
             .replace("<|assistant|>", "A:")
             .replace("<|endoftext|>", "")
             .replace("<|system|>",    "")
             .trim()
         if (clean.isNotBlank()) {
-            sb.append("\n\nExamples of good responses:\n")
-            sb.append(clean)
+            systemBlock += "\n\nExamples of good responses:\n$clean"
         }
     }
-    sb.append("<|endoftext|>\n")
+    sb.append("<|im_start|>system\n").append(systemBlock).append("<|im_end|>\n")
 
     val recent = sessionHistory.takeLast(6)
     recent.forEach { msg ->
-        if (msg.isUser) sb.append("<|user|>\n${msg.content}<|endoftext|>\n")
-        else            sb.append("<|assistant|>\n${msg.content}<|endoftext|>\n")
+        val role = if (msg.isUser) "user" else "assistant"
+        sb.append("<|im_start|>$role\n${msg.content}<|im_end|>\n")
     }
 
     val imgNote = if (imagePath != null) "\n[Image: $imagePath]" else ""
-    sb.append("<|user|>\n$userText$imgNote<|endoftext|>\n")
-    sb.append("<|assistant|>\n")
+    sb.append("<|im_start|>user\n$userText$imgNote<|im_end|>\n")
+    sb.append("<|im_start|>assistant\n")
     return sb.toString()
 }
 
@@ -182,7 +189,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         ensureModelLoaded()
         nightlyTrainer.schedule()
         checkNotifPermission()
-        checkImageGenAvailable()  // FIX: called on init so button shows correct state
+        checkImageGenAvailable()  // quick flag read — true once preload below finishes
+
+        // FIX: ImageGenerator used to copy ~700MB of ONNX models and load them into
+        // ONNX Runtime from its *constructor*, which runs here, synchronously, on
+        // whatever thread creates this ViewModel — the main/UI thread. That froze
+        // (or ANR'd) first launch for every user, even ones who never generate an
+        // image. The constructor is cheap now; kick the real loading off here, in
+        // the background, and refresh the UI flag once it's actually ready.
+        viewModelScope.launch(Dispatchers.IO) {
+            imageGenerator.preload()
+            withContext(Dispatchers.Main) { checkImageGenAvailable() }
+        }
     }
 
     // ── Model ──────────────────────────────────────────────────────────────────
@@ -230,7 +248,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun switchSession(id: String) {
         sessionJob?.cancel()
-        model.resetContext()
+        // FIX: nativeResetContext() blocks on the same native mutex nativeGenerate()
+        // holds for the whole duration of a reply. Calling it directly here used to
+        // run it on whichever thread called switchSession() — the main/UI thread —
+        // so switching chats while a previous reply was still generating froze the
+        // app until that generation finished. Run it in the background instead; the
+        // UI below updates immediately regardless.
+        viewModelScope.launch(Dispatchers.Default) { model.resetContext() }
         _ui.update { it.copy(currentSessionId = id, messages = emptyList(),
             showSessionDrawer = false, isGenerating = false) }
         sessionJob = viewModelScope.launch {
@@ -419,10 +443,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     db.messageDao().getMessagesForSessionOnce(sessionId).map { r ->
                         ChatMessage(id = r.id, content = r.content, isUser = r.isUser)
                     }
+                }.let { history ->
+                    // FIX: by the time generateResponse() runs, the current turn has
+                    // already been written to the DB (persistAndShow() in sendMessage()/
+                    // editAndResend() runs first, so the UI can show it immediately).
+                    // That means it's also the last row this query returns — and it gets
+                    // appended again below via `userText`, so without this it appeared
+                    // TWICE in every prompt. Only drop it when it really is that same
+                    // trailing turn, so nothing is lost if the call path ever changes.
+                    val last = history.lastOrNull()
+                    if (last != null && last.isUser && last.content == userText)
+                        history.dropLast(1) else history
                 }
 
                 val softCache = if (softPromptFile.exists()) softPromptFile.readText() else ""
-                val prompt    = buildZephyrPrompt(
+                val prompt    = buildChatPrompt(
                     sessionHistory  = sessionHistory,
                     userText        = if (toolContext.isNotBlank()) "$toolContext$augmentedText" else augmentedText,
                     imagePath       = imagePath,
@@ -505,8 +540,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun clearChat() {
         val id = _ui.value.currentSessionId ?: return
         viewModelScope.launch {
-            db.messageDao().deleteForSession(id)
-            model.resetContext()
+            // FIX: both calls used to run on viewModelScope's default (Main) dispatcher.
+            // resetContext() blocks on the same native mutex a generation holds for the
+            // whole reply, so clearing the chat mid-generation froze the app; the DB
+            // delete is also blocking I/O that doesn't belong on the UI thread.
+            withContext(Dispatchers.IO)      { db.messageDao().deleteForSession(id) }
+            withContext(Dispatchers.Default) { model.resetContext() }
             _ui.update { it.copy(messages = emptyList()) }
         }
     }
