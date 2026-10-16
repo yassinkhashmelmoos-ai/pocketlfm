@@ -8,6 +8,8 @@ import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -84,16 +86,69 @@ class ImageGenerator(private val context: Context) {
     private var textEncoderSession: OrtSession? = null
     private var vaeDecoderSession: OrtSession?  = null
     private var unetSession: OrtSession?         = null   // core denoising network
-    private var onnxReady = false
+    @Volatile private var onnxReady = false
+    @Volatile private var modelsChecked = false  // FIX: guards the one-time lazy load below
+    private val modelsLoadMutex = Mutex()
     private var currentGuidanceScale = CFG_SCALE
     private var registry = mutableMapOf<Int, String>()  // imageId → path
 
     init {
         loadRegistry()
-        extractAndLoadModels()
+        // FIX: extractAndLoadModels() used to run here, synchronously, on whatever
+        // thread constructs this object. ChatViewModel creates ImageGenerator as a
+        // property initializer, which runs on the main/UI thread — so copying
+        // ~700MB of ONNX models and loading them into ONNX Runtime froze (or ANR'd)
+        // every app launch, even for users who never generate an image. Loading now
+        // happens lazily and off the main thread — see preload() / ensureModelsReady().
     }
 
     // ── Model loading ─────────────────────────────────────────────────────────
+
+    /** Call this as early as convenient, from a background coroutine, so models are
+     *  likely already warm by the time the user actually asks to generate an image.
+     *  Safe to call repeatedly / from multiple coroutines — the real work runs once. */
+    suspend fun preload() = ensureModelsReady()
+
+    private suspend fun ensureModelsReady() {
+        if (modelsChecked) return
+        modelsLoadMutex.withLock {
+            if (modelsChecked) return@withLock
+            withContext(Dispatchers.IO) { extractAndLoadModels() }
+            modelsChecked = true
+        }
+    }
+
+    // FIX: copying used to only check dest.exists() — a half-copied file left behind
+    // by the app being force-closed mid-copy still "exists", so it was never retried
+    // and a corrupt model would silently fail (or hang) forever after. This copies to
+    // a temp file first, verifies its size against the asset's real size (these
+    // extensions are in androidResources.noCompress, so assets.openFd().length gives
+    // the true uncompressed size), and only then renames it into place.
+    private fun copyAssetIfNeeded(name: String) {
+        val dest = File(context.filesDir, name)
+        val expectedSize = try {
+            context.assets.openFd(name).use { it.length }
+        } catch (e: Exception) { -1L }  // couldn't determine it — fall back to exists() below
+
+        val looksIntact = dest.exists() && (expectedSize < 0 || dest.length() == expectedSize)
+        if (looksIntact) return
+
+        Log.i(TAG, "Copying $name from assets...")
+        val tmp = File(context.filesDir, "$name.tmp")
+        context.assets.open(name).use { input ->
+            FileOutputStream(tmp).use { out -> input.copyTo(out) }
+        }
+        if (expectedSize >= 0 && tmp.length() != expectedSize) {
+            tmp.delete()
+            throw java.io.IOException("$name copied as ${tmp.length()}B, expected ${expectedSize}B")
+        }
+        dest.delete()
+        if (!tmp.renameTo(dest)) {
+            tmp.delete()
+            throw java.io.IOException("Could not finalize copy of $name")
+        }
+        Log.i(TAG, "$name copied (${dest.length()/1024/1024}MB)")
+    }
 
     private fun extractAndLoadModels() {
         try {
@@ -105,13 +160,12 @@ class ImageGenerator(private val context: Context) {
             val onnxFiles = listOf("vae_decoder.onnx", "text_encoder.onnx", "unet.onnx")
             val assetList = context.assets.list("") ?: emptyArray()
             for (name in onnxFiles) {
-                val dest = File(context.filesDir, name)
-                if (!dest.exists() && assetList.contains(name)) {
-                    Log.i(TAG, "Copying $name from assets...")
-                    context.assets.open(name).use { input ->
-                        FileOutputStream(dest).use { out -> input.copyTo(out) }
+                if (assetList.contains(name)) {
+                    try {
+                        copyAssetIfNeeded(name)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Copy of $name failed, will retry next launch: ${e.message}")
                     }
-                    Log.i(TAG, "$name copied (${dest.length()/1024/1024}MB)")
                 }
             }
 
@@ -178,6 +232,7 @@ class ImageGenerator(private val context: Context) {
         forceOffline: Boolean = false,
         progressCallback: ((Int, Int) -> Unit)? = null
     ): GenerationResult = withContext(Dispatchers.IO) {
+        ensureModelsReady()  // FIX: no-op if preload() already finished; otherwise loads now
         Log.i(TAG, "Generate: '$prompt' offline=$onnxReady web=$webEnabled")
 
         val result = when {
