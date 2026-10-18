@@ -106,16 +106,15 @@ jobs:
           pip install torchvision --index-url https://download.pytorch.org/whl/cpu
       - name: Patch diffusers to remove resolve_revision import
         run: |
-          python -c "
-          import diffusers, os, re
-          path = os.path.join(os.path.dirname(diffusers.__file__), 'utils', 'hub_utils.py')
-          with open(path) as f:
-              text = f.read()
-          text = re.sub(r'resolve_revision,\s*', '', text)
-          with open(path, 'w') as f:
-              f.write(text)
-          print('Patched resolve_revision import')
-          "
+          DIFFUSERS_HUB=$(python -c "import importlib.util, os; spec=importlib.util.find_spec('diffusers'); print(os.path.join(os.path.dirname(spec.origin),'utils','hub_utils.py'))")
+          echo "Patching: $DIFFUSERS_HUB"
+          sed -i '/^[[:space:]]*resolve_revision,[[:space:]]*$/d' "$DIFFUSERS_HUB"
+          if grep -q resolve_revision "$DIFFUSERS_HUB"; then
+            echo "✗ resolve_revision still present"
+            exit 1
+          else
+            echo "✓ resolve_revision removed from hub_utils.py"
+          fi
       
       - name: Export ONNX models for offline image generation
         run: |
