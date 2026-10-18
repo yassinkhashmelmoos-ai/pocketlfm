@@ -94,7 +94,7 @@ jobs:
       # get bundled, and ImageGenerator.kt's existing per-session loading guard
       # (see FIX comments there) degrades to the online fallback rather than
       # crashing if text_encoder.onnx ends up missing.
-      - name: Install dependencies
+     - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install "torch==2.14.1" --index-url https://download.pytorch.org/whl/cpu
@@ -104,7 +104,8 @@ jobs:
             accelerate \
             "onnxruntime>=1.18.0"
           pip install torchvision --index-url https://download.pytorch.org/whl/cpu
-            - name: Patch diffusers to remove resolve_revision import
+
+      - name: Patch diffusers to remove resolve_revision import
         run: |
           python3 << 'PYEOF'
           import importlib.util, os, re
@@ -122,15 +123,12 @@ jobs:
               print(text[idx:idx+600])
               print("----------------------------")
 
-          # Remove `resolve_revision,` on its own line inside a multiline import
           new_text = re.sub(r'^[ \t]*resolve_revision,?[ \t]*\n', '', text, flags=re.MULTILINE)
 
-          # Remove inline occurrences (e.g. `, resolve_revision` or `resolve_revision, `)
           if 'resolve_revision' in new_text:
               new_text = re.sub(r',\s*resolve_revision\b(?!\s*\()', '', new_text)
               new_text = re.sub(r'\bresolve_revision\s*,\s*', '', new_text)
 
-          # If the symbol is referenced later in the file, add a fallback stub
           if re.search(r'\bresolve_revision\s*\(', new_text):
               start = new_text.find('from huggingface_hub import (')
               if start >= 0:
@@ -164,7 +162,8 @@ jobs:
 
           print("✓ resolve_revision removed from hub_utils.py imports")
           PYEOF
-      
+
+     
       - name: Export ONNX models for offline image generation
         run: |
           python3 << 'PYEOF'
