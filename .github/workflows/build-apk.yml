@@ -104,17 +104,66 @@ jobs:
             accelerate \
             "onnxruntime>=1.18.0"
           pip install torchvision --index-url https://download.pytorch.org/whl/cpu
-      - name: Patch diffusers to remove resolve_revision import
+            - name: Patch diffusers to remove resolve_revision import
         run: |
-          DIFFUSERS_HUB=$(python -c "import importlib.util, os; spec=importlib.util.find_spec('diffusers'); print(os.path.join(os.path.dirname(spec.origin),'utils','hub_utils.py'))")
-          echo "Patching: $DIFFUSERS_HUB"
-          sed -i '/^[[:space:]]*resolve_revision,[[:space:]]*$/d' "$DIFFUSERS_HUB"
-          if grep -q resolve_revision "$DIFFUSERS_HUB"; then
-            echo "✗ resolve_revision still present"
-            exit 1
-          else
-            echo "✓ resolve_revision removed from hub_utils.py"
-          fi
+          python3 << 'PYEOF'
+          import importlib.util, os, re
+
+          spec = importlib.util.find_spec('diffusers')
+          path = os.path.join(os.path.dirname(spec.origin), 'utils', 'hub_utils.py')
+          print(f"Patching: {path}")
+
+          with open(path) as f:
+              text = f.read()
+
+          idx = text.find('from huggingface_hub import')
+          if idx >= 0:
+              print("--- current import block ---")
+              print(text[idx:idx+600])
+              print("----------------------------")
+
+          # Remove `resolve_revision,` on its own line inside a multiline import
+          new_text = re.sub(r'^[ \t]*resolve_revision,?[ \t]*\n', '', text, flags=re.MULTILINE)
+
+          # Remove inline occurrences (e.g. `, resolve_revision` or `resolve_revision, `)
+          if 'resolve_revision' in new_text:
+              new_text = re.sub(r',\s*resolve_revision\b(?!\s*\()', '', new_text)
+              new_text = re.sub(r'\bresolve_revision\s*,\s*', '', new_text)
+
+          # If the symbol is referenced later in the file, add a fallback stub
+          if re.search(r'\bresolve_revision\s*\(', new_text):
+              start = new_text.find('from huggingface_hub import (')
+              if start >= 0:
+                  end = new_text.find(')', start)
+                  if end >= 0:
+                      fallback = (
+                          '\n\ntry:\n'
+                          '    resolve_revision\nexcept NameError:\n'
+                          '    def resolve_revision(*args, **kwargs):\n'
+                          '        raise NotImplementedError('
+                          '"resolve_revision requires newer huggingface_hub")\n'
+                      )
+                      new_text = new_text[:end + 1] + fallback + new_text[end + 1:]
+
+          with open(path, 'w') as f:
+              f.write(new_text)
+
+          try:
+              compile(new_text, path, 'exec')
+          except SyntaxError as e:
+              print(f"✗ Patch introduced a syntax error: {e}")
+              raise SystemExit(1)
+
+          remaining = [ln for ln in new_text.splitlines()
+                       if 'resolve_revision' in ln and 'import' in ln]
+          if remaining:
+              print("✗ resolve_revision still in an import:")
+              for ln in remaining:
+                  print("   ", ln)
+              raise SystemExit(1)
+
+          print("✓ resolve_revision removed from hub_utils.py imports")
+          PYEOF
       
       - name: Export ONNX models for offline image generation
         run: |
