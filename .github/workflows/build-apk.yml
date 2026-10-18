@@ -97,10 +97,15 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install torch==2.14.1 --extra-index-url https://pytorch.org
-          pip install --no-cache-dir --upgrade "huggingface-hub>=0.34.0,<1.0" "transformers>=4.45.0" "diffusers>=0.30.0" accelerate "onnxruntime>=1.18.0"
-          pip install torchvision --index-url https://pytorch.org --preserve-hashes=false
-
+          pip install "torch==2.14.1" --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-cache-dir --upgrade \
+            "huggingface-hub>=0.34.0,<1.0" \
+            "transformers==4.57.3" \
+            accelerate \
+            "onnxruntime>=1.18.0"
+          pip install --no-deps "git+https://github.com/huggingface/diffusers.git"
+          pip install torchvision --index-url https://download.pytorch.org/whl/cpu
+      
       - name: Export ONNX models for offline image generation
         run: |
           python3 << 'PYEOF'
