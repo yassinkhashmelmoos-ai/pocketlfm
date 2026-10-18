@@ -36,10 +36,18 @@ jobs:
       - name: Install Python deps
         run: |
           pip install Pillow
-          # torch 2.3.1 — matches what worked in previous runs
-          pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cpu
-          pip install "transformers==4.40.2" "diffusers==0.27.2" accelerate onnx "onnxruntime==1.17.3"
-          pip install "huggingface_hub==0.22.2"
+          # FIX: torch 2.3.1 / transformers 4.40.2 / diffusers 0.27.2 predate DreamLite
+          # and Qwen3-VL entirely (both are 2026 architectures) — those pins could
+          # never have loaded DreamLitePipeline or Qwen3VLForConditionalGeneration,
+          # which is the real reason the old export silently fell back to SD1.5.
+          # transformers==4.57.3 is DreamLite's own pinned requirement (its model
+          # card warns that >=5.0 produces visible artifacts with its Qwen3-VL
+          # encoder). DreamLitePipeline/DreamLiteUNetModel aren't in a tagged
+          # diffusers release yet, so diffusers must come from the main branch.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install "transformers==4.57.3" accelerate onnx "onnxruntime==1.18.0"
+          pip install "git+https://github.com/huggingface/diffusers.git"
+          pip install "huggingface_hub>=0.25.0"
 
       - name: Generate mipmap icon sizes
         run: |
@@ -69,27 +77,82 @@ jobs:
             -O lfm25/app/src/main/assets/model.gguf
           echo "LFM model: $(du -sh lfm25/app/src/main/assets/model.gguf)"
 
+      # FIX: this entire step used to silently abandon DreamLite and export a
+      # plain full-size SD1.5 UNet + mismatched SDXL VAE instead (see the old
+      # comments this replaces). This version actually loads DreamLite-base's
+      # real UNet and Qwen3-VL-2B-Instruct's real text encoder (per the user's
+      # explicit instruction to follow Gemini's component choices), grounded in
+      # the actual DreamLitePipeline/scheduler source read directly from the
+      # installed diffusers package rather than guessed — exact prompt template,
+      # exact drop-index, exact flow-matching math, exact CFG formula. See the
+      # per-section comments below for what's confirmed vs. best-effort.
+      #
+      # Known real risk, stated plainly rather than hidden: exporting a 2B-
+      # parameter model on a standard GitHub-hosted runner (~7GB RAM) is tight.
+      # The text-encoder export is wrapped so if it fails (OOM, timeout), the
+      # UNet + VAE (the part closest to validated by community precedent) still
+      # get bundled, and ImageGenerator.kt's existing per-session loading guard
+      # (see FIX comments there) degrades to the online fallback rather than
+      # crashing if text_encoder.onnx ends up missing.
       - name: Export ONNX models for offline image generation
         run: |
           python3 << 'PYEOF'
-          import os, sys, torch, json
+          import os, sys, gc, torch, json
           print(f"torch version: {torch.__version__}")
-          print("=== ONNX Export Pipeline ===")
+          print("=== ONNX Export Pipeline (DreamLite-base + Qwen3-VL-2B + SDXL-VAE) ===")
 
-          from diffusers import AutoencoderKL, UNet2DConditionModel
-          from transformers import CLIPTextModel, CLIPTokenizer
+          from diffusers import AutoencoderKL, DreamLitePipeline
           import numpy as np
 
           os.makedirs("dreamlite_onnx", exist_ok=True)
+          manifest = {"version": "3.0", "components": [], "params": {}}
 
-          # ── 1. VAE decoder (madebyollin/sdxl-vae-fp16-fix) ────────────────
-          # This model exports cleanly with torch 2.3.1 — confirmed working
-          print("\n[1/3] VAE decoder...")
+          # ── 0. Load DreamLite-base's real pipeline (UNet + Qwen3-VL text encoder) ──
+          # FIX: the old code never did this — it only ever downloaded DreamLite's
+          # *configs* (explicitly excluding weights) and exported a substitute SD1.5
+          # UNet instead. DreamLitePipeline / DreamLiteUNetModel are real classes
+          # confirmed present in diffusers' main branch; the earlier "incompatible
+          # with standard UNet2DConditionModel" failure was from trying to load this
+          # checkpoint with the generic class instead of its own subclass.
+          print("\n[0/4] Loading carlofkl/DreamLite-base (this is the big one)...")
+          pipe = DreamLitePipeline.from_pretrained(
+              "carlofkl/DreamLite-base", revision="diffusers", torch_dtype=torch.float32)
+          unet = pipe.unet
+          unet.eval()
+          text_encoder = pipe.text_encoder
+          tokenizer = pipe.tokenizer
+          cross_attention_dim = unet.config.cross_attention_dim
+          if isinstance(cross_attention_dim, (list, tuple)):
+              cross_attention_dim = cross_attention_dim[-1]
+          print(f"  UNet cross_attention_dim (expected text hidden size): {cross_attention_dim}")
+          print(f"  UNet in_channels: {unet.config.in_channels}")
+
+          # Prompt-encoding constants copied verbatim from DreamLitePipeline's own
+          # __init__ (self.prompt_template_encode_generate / _start_idx) — these are
+          # empirically pinned by the authors, not derivable from the model alone.
+          manifest["params"]["prompt_template"] = (
+              "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, "
+              "quantity, text, spatial relationships of the objects and background:<|im_end|>\n"
+              "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+          )
+          manifest["params"]["prompt_template_drop_idx"] = 34
+
+          # ── 1. VAE decoder + encoder (madebyollin/sdxl-vae-fp16-fix) ──────────
+          # FIX: per the user's explicit direction, swap DreamLite's default
+          # AutoencoderTiny (small/blurry, "deep-fried" per Gemini) for this full
+          # SDXL VAE. IMPORTANT: SDXL's scaling_factor (0.13025) and shift_factor
+          # differ from SD1.5's 0.18215 — the manifest carries the REAL values read
+          # from this VAE's own config, not a hardcoded assumption, and
+          # ImageGenerator.kt must read them from there (see its FIX comment).
+          print("\n[1/4] VAE encoder + decoder (madebyollin/sdxl-vae-fp16-fix)...")
+          vae = AutoencoderKL.from_pretrained(
+              "madebyollin/sdxl-vae-fp16-fix",
+              torch_dtype=torch.float32)
+          vae.eval()
+          manifest["params"]["vae_scaling_factor"] = float(vae.config.scaling_factor)
+          manifest["params"]["vae_shift_factor"] = float(getattr(vae.config, "shift_factor", 0.0) or 0.0)
+          manifest["params"]["latent_channels"] = int(vae.config.latent_channels)
           try:
-              vae = AutoencoderKL.from_pretrained(
-                  "madebyollin/sdxl-vae-fp16-fix",
-                  torch_dtype=torch.float32)
-              vae.eval()
               dummy = torch.randn(1, 4, 64, 64)
               torch.onnx.export(
                   vae.decoder,
@@ -100,100 +163,225 @@ jobs:
                   dynamic_axes={"latent_sample": {0: "batch"}},
                   opset_version=14)  # opset 14 avoids scaled_dot_product issues
               print(f"✓ VAE decoder: {os.path.getsize('dreamlite_onnx/vae_decoder.onnx')//1024//1024} MB")
-              del vae
           except Exception as e:
-              print(f"✗ VAE export failed: {e}")
+              print(f"✗ VAE decoder export failed: {e}")
 
-          # ── 2. CLIP text encoder ───────────────────────────────────────────
-          # Use opset 14 and disable scripted SDPA which breaks onnx export
-          # in transformers >= 4.36 when torch uses flash attention.
-          print("\n[2/3] CLIP text encoder...")
+          # FIX: the old workflow never exported a VAE *encoder* at all — only the
+          # decoder. That made image editing impossible (no way to turn the source
+          # image into latents). AutoencoderKL.encode() returns a
+          # DiagonalGaussianDistribution, not a plain tensor, so it needs a thin
+          # wrapper to be ONNX-exportable; .mode() (not .sample()) is used so
+          # encoding is deterministic.
+          class VaeEncoderWrapper(torch.nn.Module):
+              def __init__(self, vae):
+                  super().__init__()
+                  self.vae = vae
+              def forward(self, pixel_values):
+                  return self.vae.encode(pixel_values).latent_dist.mode()
           try:
-              import transformers
-              # Disable fast attention for ONNX export compatibility
-              transformers.utils.is_flash_attn_2_available = lambda: False
-
-              text_encoder = CLIPTextModel.from_pretrained(
-                  "openai/clip-vit-large-patch14",
-                  torch_dtype=torch.float32,
-                  attn_implementation="eager")  # force eager attention, not SDPA
-              text_encoder.eval()
-
-              dummy_ids = torch.zeros((1, 77), dtype=torch.long)
+              dummy_img = torch.randn(1, 3, 512, 512)
               with torch.no_grad():
                   torch.onnx.export(
-                      text_encoder,
-                      dummy_ids,
-                      "dreamlite_onnx/text_encoder.onnx",
-                      input_names=["input_ids"],
-                      output_names=["last_hidden_state", "pooler_output"],
-                      dynamic_axes={"input_ids": {0: "batch"}},
+                      VaeEncoderWrapper(vae),
+                      dummy_img,
+                      "dreamlite_onnx/vae_encoder.onnx",
+                      input_names=["pixel_values"],
+                      output_names=["latent_sample"],
+                      dynamic_axes={"pixel_values": {0: "batch", 2: "height", 3: "width"}},
                       opset_version=14)
-              print(f"✓ Text encoder: {os.path.getsize('dreamlite_onnx/text_encoder.onnx')//1024//1024} MB")
-              del text_encoder
+              print(f"✓ VAE encoder: {os.path.getsize('dreamlite_onnx/vae_encoder.onnx')//1024//1024} MB")
+          except Exception as e:
+              print(f"✗ VAE encoder export failed: {e}")
+          del vae
+          gc.collect()
+
+          # ── 2. Text encoder: Qwen3-VL-2B-Instruct (DreamLite's real encoder) ──
+          # FIX: this used to export plain CLIP ViT-L/14, which DreamLite's UNet
+          # was never trained to read (wrong dimensionality, wrong semantics
+          # entirely) — that pairing could only ever produce noise. DreamLite
+          # genuinely requires Qwen3VLForConditionalGeneration (confirmed in its
+          # own model card and in the pipeline's __init__ type hints, read
+          # directly above). Per the user's explicit instruction, this exports the
+          # real thing rather than a smaller substitute.
+          #
+          # HONEST FLAG: two independent community Android/WebGPU ports of
+          # DreamLite both export the UNet+VAE successfully but explicitly do NOT
+          # run this 2B encoder on-device at all (one hardcodes a single prompt,
+          # the other requires a server) — this is genuinely unproven territory,
+          # not a routine export. Two concrete, specific risks: (1) a 2B model may
+          # simply exceed this runner's RAM during export, so this is wrapped to
+          # let the rest of the pipeline still ship if it fails; (2) a dynamically
+          # INT8-quantized 2B-parameter vision-language model used as a diffusion
+          # conditioning signal has no known precedent to validate against — it
+          # may export cleanly and still not produce coherent conditioning.
+          #
+          # output_hidden_states=True + hidden_states[-1], dropping the first
+          # prompt_template_drop_idx (34) tokens — exactly mirrors
+          # DreamLitePipeline.encode_prompt() read above. Only the text-only
+          # ("generate" mode) path is exported; image-conditioned "edit" mode
+          # uses a different template/processor path not covered by this export.
+          print("\n[2/4] Text encoder (Qwen/Qwen3-VL-2B-Instruct)...")
+          try:
+              from transformers import Qwen3VLForConditionalGeneration
+
+              del pipe  # free the DreamLite pipeline's copy before loading a 2nd big model
+              gc.collect()
+              qwen = Qwen3VLForConditionalGeneration.from_pretrained(
+                  "Qwen/Qwen3-VL-2B-Instruct", torch_dtype=torch.float32)
+              qwen.eval()
+              real_hidden_size = qwen.config.text_config.hidden_size
+              print(f"  Qwen3-VL-2B text hidden_size: {real_hidden_size} "
+                    f"(UNet expects {cross_attention_dim} — {'MATCH' if real_hidden_size == cross_attention_dim else 'MISMATCH, will likely fail at UNet runtime'})")
+              manifest["params"]["text_hidden_size"] = int(real_hidden_size)
+
+              class TextEncoderWrapper(torch.nn.Module):
+                  def __init__(self, model):
+                      super().__init__()
+                      self.model = model
+                  def forward(self, input_ids, attention_mask):
+                      out = self.model(input_ids=input_ids, attention_mask=attention_mask,
+                                        output_hidden_states=True, use_cache=False)
+                      return out.hidden_states[-1]
+
+              dummy_ids = torch.randint(0, 1000, (2, 48), dtype=torch.long)
+              dummy_mask = torch.ones((2, 48), dtype=torch.long)
+              with torch.no_grad():
+                  torch.onnx.export(
+                      TextEncoderWrapper(qwen),
+                      (dummy_ids, dummy_mask),
+                      "dreamlite_onnx/text_encoder_fp32.onnx",
+                      input_names=["input_ids", "attention_mask"],
+                      output_names=["last_hidden_state"],
+                      dynamic_axes={
+                          "input_ids":        {0: "batch", 1: "sequence"},
+                          "attention_mask":   {0: "batch", 1: "sequence"},
+                          "last_hidden_state":{0: "batch", 1: "sequence"},
+                      },
+                      opset_version=17)
+              print(f"  Raw export: {os.path.getsize('dreamlite_onnx/text_encoder_fp32.onnx')//1024//1024} MB")
+              del qwen
+              gc.collect()
+
+              # FIX: there is no Android/ONNX equivalent of the official 4-bit MLX
+              # deployment — ONNX Runtime's own dynamic INT8 quantization is the
+              # most defensible available substitute (not a faithful port of the
+              # official config, which this honestly can't be). Still far smaller
+              # than shipping fp32/fp16.
+              from onnxruntime.quantization import quantize_dynamic, QuantType
+              quantize_dynamic(
+                  "dreamlite_onnx/text_encoder_fp32.onnx",
+                  "dreamlite_onnx/text_encoder.onnx",
+                  weight_type=QuantType.QInt8)
+              os.remove("dreamlite_onnx/text_encoder_fp32.onnx")
+              print(f"✓ Text encoder (INT8): {os.path.getsize('dreamlite_onnx/text_encoder.onnx')//1024//1024} MB")
           except Exception as e:
               print(f"✗ Text encoder export failed: {e}")
-              # Fallback: download pre-exported CLIP from optimum
-              print("  Trying pre-exported CLIP from optimum-community...")
-              try:
-                  from huggingface_hub import hf_hub_download
-                  hf_hub_download(
-                      repo_id="optimum-community/clip-vit-large-patch14",
-                      filename="model.onnx",
-                      local_dir="dreamlite_onnx",
-                      local_dir_use_symlinks=False)
-                  os.rename("dreamlite_onnx/model.onnx", "dreamlite_onnx/text_encoder.onnx")
-                  print(f"✓ CLIP from optimum: {os.path.getsize('dreamlite_onnx/text_encoder.onnx')//1024//1024} MB")
-              except Exception as e2:
-                  print(f"  Optimum fallback also failed: {e2}")
+              print("  Offline generation will be unavailable this build — the app")
+              print("  degrades to online generation rather than crashing (see")
+              print("  ImageGenerator.kt's FIX comments on per-session loading).")
 
-          # ── 3. UNet ────────────────────────────────────────────────────────
-          # Use stable-diffusion-v1-5 — universally available, torch-safe weights,
-          # compatible with the CLIP ViT-L/14 text encoder above.
-          # This is the correct pairing: SD 1.5 UNet + CLIP ViT-L/14 text encoder.
-          # DreamLite-base uses a custom config that is incompatible with standard
-          # UNet2DConditionModel (confirmed failing above). SD 1.5 is the reliable
-          # mobile-optimised baseline with identical interface.
-          print("\n[3/3] UNet (stable-diffusion-v1-5)...")
+          # ── 3. UNet (DreamLite-base's real DreamLiteUNetModel) ────────────────
+          # FIX: this used to silently substitute a full SD1.5 UNet (~3.4GB,
+          # external-data weights the old copy step never bundled — the root cause
+          # of the crash this whole investigation started from) paired with a
+          # text encoder it was never trained with. This exports DreamLite's own
+          # 0.39B UNet, loaded via DreamLiteUNetModel (a real UNet2DConditionModel
+          # subclass, confirmed present in diffusers main) rather than the generic
+          # parent class that failed before.
+          #
+          # Inputs mirror DreamLitePipeline.__call__ exactly, read directly above:
+          # double-width `sample` (latents concatenated with a same-shape zero
+          # tensor along the width axis — DreamLite always expects this "diptych"
+          # layout, even for plain text-to-image with no real second image), plus
+          # `encoder_attention_mask` and `added_cond_kwargs={"time_ids": ...}`
+          # flattened into a plain `time_ids` input for ONNX (dict kwargs aren't
+          # ONNX-exportable). 1024x1024 output → 128x128 latents each side, 256
+          # wide combined, matching DreamLite's native resolution.
+          print("\n[3/4] UNet (carlofkl/DreamLite-base)...")
           unet_exported = False
           try:
-              unet = UNet2DConditionModel.from_pretrained(
-                  "runwayml/stable-diffusion-v1-5",
-                  subfolder="unet",
-                  torch_dtype=torch.float32)
-              unet.eval()
+              class UNetWrapper(torch.nn.Module):
+                  def __init__(self, unet):
+                      super().__init__()
+                      self.unet = unet
+                  def forward(self, sample, timestep, encoder_hidden_states, encoder_attention_mask, time_ids):
+                      return self.unet(
+                          sample, timestep=timestep,
+                          encoder_hidden_states=encoder_hidden_states,
+                          encoder_attention_mask=encoder_attention_mask,
+                          added_cond_kwargs={"time_ids": time_ids},
+                          return_dict=False)[0]
+
+              latent_ch = manifest["params"]["latent_channels"]
+              dummy_sample = torch.randn(2, latent_ch, 128, 256)  # width doubled (diptych)
+              dummy_t = torch.tensor([500.0, 500.0])
+              dummy_hidden = torch.randn(2, 48, cross_attention_dim)
+              dummy_enc_mask = torch.ones(2, 48, dtype=torch.long)
+              dummy_time_ids = torch.tensor([[1024.0, 1024.0], [1024.0, 1024.0]])
               with torch.no_grad():
                   torch.onnx.export(
-                      unet,
-                      (torch.randn(2, 4, 64, 64),
-                       torch.tensor([999, 999]),
-                       torch.randn(2, 77, 768)),
+                      UNetWrapper(unet),
+                      (dummy_sample, dummy_t, dummy_hidden, dummy_enc_mask, dummy_time_ids),
                       "dreamlite_onnx/unet.onnx",
-                      input_names=["sample", "timestep", "encoder_hidden_states"],
+                      input_names=["sample", "timestep", "encoder_hidden_states",
+                                   "encoder_attention_mask", "time_ids"],
                       output_names=["out_sample"],
-                      opset_version=14)
+                      dynamic_axes={
+                          "sample":               {0: "batch"},
+                          "encoder_hidden_states":{0: "batch", 1: "sequence"},
+                          "encoder_attention_mask":{0: "batch", 1: "sequence"},
+                          "time_ids":             {0: "batch"},
+                      },
+                      opset_version=17)
               unet_exported = True
-              print(f"✓ SD1.5 UNet: {os.path.getsize('dreamlite_onnx/unet.onnx')//1024//1024} MB")
+              print(f"✓ DreamLite UNet: {os.path.getsize('dreamlite_onnx/unet.onnx')//1024//1024} MB")
               del unet
           except Exception as e:
-              print(f"✗ SD1.5 UNet failed: {e}")
+              print(f"✗ DreamLite UNet export failed: {e}")
 
-          # ── 4. Manifest ────────────────────────────────────────────────────
+          # ── 4. Tokenizer + manifest ───────────────────────────────────────────
+          # FIX: the Android app had no real tokenizer at all — ImageGenerator.kt's
+          # tokenize() was a ~35-word hardcoded dictionary plus a hash fallback for
+          # everything else (confirmed still true on inspection; semantically
+          # meaningless for the vast majority of real prompts). Qwen3-VL ships a
+          # real HF "fast tokenizer" as a single tokenizer.json (byte-level BPE);
+          # bundling that file lets the Kotlin side do real tokenization instead of
+          # another placeholder. See the matching FIX in ImageGenerator.kt.
+          print("\n[4/4] Tokenizer...")
+          try:
+              tokenizer.save_pretrained("dreamlite_onnx/tokenizer_dir")
+              import shutil
+              shutil.copy("dreamlite_onnx/tokenizer_dir/tokenizer.json", "dreamlite_onnx/tokenizer.json")
+              print(f"✓ tokenizer.json: {os.path.getsize('dreamlite_onnx/tokenizer.json')//1024} KB")
+          except Exception as e:
+              print(f"✗ Tokenizer export failed: {e}")
+
+          # FIX: merges into the manifest built up during each component's export
+          # above (real vae_scaling_factor/shift_factor/latent_channels/
+          # text_hidden_size/prompt_template/drop_idx) instead of overwriting it
+          # with a fresh dict — the old code discarded all of that. num_inference_
+          # steps / guidance_scale / negative_prompt / attention_slicing are the
+          # exact parameters requested, from Gemini's analysis, rather than this
+          # pipeline's own defaults (30 steps / CFG 3.5) — noted here since it's a
+          # real, deliberate departure from the authors' tuned values, not an
+          # oversight.
           onnx_files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
-          manifest = {
-              "version": "2.0",
-              "components": onnx_files,
-              "has_vae":     "vae_decoder.onnx"  in onnx_files,
-              "has_encoder": "text_encoder.onnx" in onnx_files,
-              "has_unet":    "unet.onnx"          in onnx_files,
-              "params": {
-                  "num_inference_steps": 20,
-                  "guidance_scale": 7.5,
-                  "negative_prompt": "blurry, distorted, ugly, bad anatomy, text, watermark",
-                  "resolution": 512,
-                  "latent_dim": 64
-              }
-          }
+          manifest["components"] = onnx_files
+          manifest["has_vae_decoder"] = "vae_decoder.onnx"  in onnx_files
+          manifest["has_vae_encoder"] = "vae_encoder.onnx"  in onnx_files
+          manifest["has_encoder"]     = "text_encoder.onnx" in onnx_files
+          manifest["has_unet"]        = "unet.onnx"          in onnx_files
+          manifest["has_tokenizer"]   = os.path.exists("dreamlite_onnx/tokenizer.json")
+          manifest["params"].update({
+              "num_inference_steps": 50,
+              "guidance_scale": 7.0,
+              "negative_prompt": "blurry, distorted, ugly, bad anatomy, text, watermark, pixelated, low resolution",
+              "attention_slicing": True,
+              "resolution": 1024,
+              "scheduler": "flow_match_euler_discrete",
+              "scheduler_shift": {"base_image_seq_len": 256, "max_image_seq_len": 4096,
+                                   "base_shift": 0.5, "max_shift": 1.16},
+          })
           with open("dreamlite_onnx/manifest.json", "w") as f:
               json.dump(manifest, f, indent=2)
 
@@ -214,7 +402,7 @@ jobs:
         run: |
           mkdir -p lfm25/app/src/main/assets
           exported=0
-          for f in dreamlite_onnx/vae_decoder.onnx dreamlite_onnx/text_encoder.onnx dreamlite_onnx/unet.onnx dreamlite_onnx/manifest.json; do
+          for f in dreamlite_onnx/vae_decoder.onnx dreamlite_onnx/vae_encoder.onnx dreamlite_onnx/text_encoder.onnx dreamlite_onnx/unet.onnx dreamlite_onnx/tokenizer.json dreamlite_onnx/manifest.json; do
             if [ -f "$f" ]; then
               cp "$f" lfm25/app/src/main/assets/
               echo "✓ Copied $(basename $f): $(du -sh $f | cut -f1)"
