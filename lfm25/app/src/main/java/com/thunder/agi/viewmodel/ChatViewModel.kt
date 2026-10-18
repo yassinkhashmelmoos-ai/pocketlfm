@@ -189,18 +189,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         ensureModelLoaded()
         nightlyTrainer.schedule()
         checkNotifPermission()
-        checkImageGenAvailable()  // quick flag read — true once preload below finishes
+        checkImageGenAvailable()  // quick flag read
 
-        // FIX: ImageGenerator used to copy ~700MB of ONNX models and load them into
-        // ONNX Runtime from its *constructor*, which runs here, synchronously, on
-        // whatever thread creates this ViewModel — the main/UI thread. That froze
-        // (or ANR'd) first launch for every user, even ones who never generate an
-        // image. The constructor is cheap now; kick the real loading off here, in
-        // the background, and refresh the UI flag once it's actually ready.
-        viewModelScope.launch(Dispatchers.IO) {
-            imageGenerator.preload()
-            withContext(Dispatchers.Main) { checkImageGenAvailable() }
-        }
+        // FIX: this used to also call imageGenerator.preload() here, in the
+        // background, right after launch. That's no longer safe to do eagerly:
+        // loading ~660MB of ONNX models at the exact moment the LLM is also
+        // loading its own ~218MB GGUF is what was driving the 700MB+ user-data /
+        // 1.2GB+ RAM crash on launch — not just a main-thread freeze (that part
+        // was already fixed by moving the work off the constructor; this is a
+        // separate problem: competing for memory at the worst possible time).
+        // ImageGenerator.generate() already calls ensureModelsReady() itself the
+        // first time it's actually invoked (see ensureModelsReady() there), so
+        // nothing further is needed here — the one-time load cost just moves to
+        // someone's first "generate an image" tap instead of to every launch.
     }
 
     // ── Model ──────────────────────────────────────────────────────────────────
