@@ -112,53 +112,49 @@ jobs:
             pip
       - name: Patch diffusers for huggingface_hub compatibility
         run: |
-          python3 << 'PYEOF'
-          import importlib.util, os
+          SHIM=/tmp/hub_compat_shim.py
+          printf '%s\n' \
+            '# diffusers-hub-compat-shim' \
+            'import huggingface_hub as _hfh_shim' \
+            'import huggingface_hub.errors as _hfh_err_shim' \
+            'import huggingface_hub.utils as _hfh_util_shim' \
+            '' \
+            'if not hasattr(_hfh_shim, "resolve_revision"):' \
+            '    def _resolve_revision_stub(*args, **kwargs):' \
+            '        return args[0] if args else kwargs.get("revision", "main")' \
+            '    _hfh_shim.resolve_revision = _resolve_revision_stub' \
+            '' \
+            'if not hasattr(_hfh_err_shim, "RevisionResolutionError"):' \
+            '    class RevisionResolutionError(Exception):' \
+            '        pass' \
+            '    _hfh_err_shim.RevisionResolutionError = RevisionResolutionError' \
+            '' \
+            'if not hasattr(_hfh_util_shim, "httpx"):' \
+            '    try:' \
+            '        import httpx as _httpx' \
+            '        _hfh_util_shim.httpx = _httpx' \
+            '    except ImportError:' \
+            '        import huggingface_hub.utils._http as _http_mod' \
+            '        _hfh_util_shim.httpx = _http_mod' \
+            > "$SHIM"
 
-          spec = importlib.util.find_spec('diffusers')
-          path = os.path.join(os.path.dirname(spec.origin), 'utils', 'hub_utils.py')
-          print(f"Patching: {path}")
-
+          python3 -c '
+          import importlib.util, os, sys
+          spec = importlib.util.find_spec("diffusers")
+          path = os.path.join(os.path.dirname(spec.origin), "utils", "hub_utils.py")
           with open(path) as f:
               text = f.read()
-
-          SHIM_MARKER = '# diffusers-hub-compat-shim'
-          if SHIM_MARKER in text:
-              print("Already patched, skipping")
-              raise SystemExit(0)
-
-          shim = """# diffusers-hub-compat-shim
-          import huggingface_hub as _hfh_shim
-          import huggingface_hub.errors as _hfh_err_shim
-          import huggingface_hub.utils as _hfh_util_shim
-
-          if not hasattr(_hfh_shim, 'resolve_revision'):
-              def _resolve_revision_stub(*args, **kwargs):
-                  if args:
-                      return args[0]
-                  return kwargs.get('revision', 'main')
-              _hfh_shim.resolve_revision = _resolve_revision_stub
-
-          if not hasattr(_hfh_err_shim, 'RevisionResolutionError'):
-              class RevisionResolutionError(Exception):
-                  pass
-              _hfh_err_shim.RevisionResolutionError = RevisionResolutionError
-
-          if not hasattr(_hfh_util_shim, 'httpx'):
-              try:
-                  import httpx as _httpx
-                  _hfh_util_shim.httpx = _httpx
-              except ImportError:
-                  import huggingface_hub.utils._http as _http_mod
-                  _hfh_util_shim.httpx = _http_mod
-
-          """
-
-          with open(path, 'w') as f:
+          if "# diffusers-hub-compat-shim" in text:
+              print("Already patched")
+              sys.exit(0)
+          with open("/tmp/hub_compat_shim.py") as f:
+              shim = f.read()
+          if not shim.endswith("\n"):
+              shim += "\n"
+          with open(path, "w") as f:
               f.write(shim + text)
-
-          print("✓ Compatibility shim prepended to hub_utils.py")
-          PYEOF     
+          print("Patched " + path)
+          '
           
      
       - name: Export ONNX models for offline image generation
