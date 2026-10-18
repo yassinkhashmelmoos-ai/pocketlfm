@@ -133,7 +133,11 @@ jobs:
             '' \
             'if not hasattr(_hfh, "resolve_revision"):' \
             '    def _resolve_revision_stub(*a, **k):' \
-            '        return a[0] if a else k.get("revision", "main")' \
+            '        if "revision" in k:' \
+            '            return k["revision"]' \
+            '        if len(a) >= 2:' \
+            '            return a[1]' \
+            '        return "main"' \
             '    _hfh.resolve_revision = _resolve_revision_stub' \
             '' \
             'if not hasattr(_hfh_err, "RevisionResolutionError"):' \
