@@ -96,7 +96,7 @@ jobs:
       # crashing if text_encoder.onnx ends up missing.
       - name: Export ONNX models for offline image generation
         run: |
-          pip install --no-cache-dir --upgrade 'huggingface-hub>=0.34.0,<1.0' diffusers transformers accelerate
+          pip install --no-cache-dir --upgrade 'huggingface-hub>=0.34.0,<1.0' diffusers transformers accelerate onnx onnxruntime
           python3 << 'PYEOF'
           import os, sys, gc, torch, json
           print(f"torch version: {torch.__version__}")
