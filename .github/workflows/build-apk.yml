@@ -76,7 +76,7 @@ jobs:
             "https://huggingface.co/LiquidAI/LFM2.5-VL-450M-GGUF/resolve/main/LFM2.5-VL-450M-Q4_K_M.gguf" \
             -O lfm25/app/src/main/assets/model.gguf
           echo "LFM model: $(du -sh lfm25/app/src/main/assets/model.gguf)"
-    pip install --upgrade "huggingface-hub>=0.34.0,<1.0"
+    pip install --upgrade 'huggingface-hub>=0.34.0,<1.0'
       # FIX: this entire step used to silently abandon DreamLite and export a
       # plain full-size SD1.5 UNet + mismatched SDXL VAE instead (see the old
       # comments this replaces). This version actually loads DreamLite-base's
