@@ -104,6 +104,12 @@ jobs:
             accelerate \
             "onnxruntime>=1.18.0"
           pip install torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-cache-dir --upgrade \
+            "huggingface-hub>=0.34.0,<1.0" \
+            "transformers==4.57.3" \
+            accelerate \
+            "onnxruntime>=1.18.0" \
+            pip
       - name: Patch diffusers for huggingface_hub compatibility
         run: |
           python3 << 'PYEOF'
@@ -121,28 +127,30 @@ jobs:
               print("Already patched, skipping")
               raise SystemExit(0)
 
-          shim = f"""# {SHIM_MARKER}
+          shim = """# diffusers-hub-compat-shim
           import huggingface_hub as _hfh_shim
           import huggingface_hub.errors as _hfh_err_shim
+          import huggingface_hub.utils as _hfh_util_shim
 
-          def _make_fn_stub(name):
-              def _stub(*args, **kwargs):
+          if not hasattr(_hfh_shim, 'resolve_revision'):
+              def _resolve_revision_stub(*args, **kwargs):
                   if args:
                       return args[0]
                   return kwargs.get('revision', 'main')
-              _stub.__name__ = name
-              return _stub
+              _hfh_shim.resolve_revision = _resolve_revision_stub
 
-          def _make_exc_stub(name):
-              return type(name, (Exception,), {{}})
+          if not hasattr(_hfh_err_shim, 'RevisionResolutionError'):
+              class RevisionResolutionError(Exception):
+                  pass
+              _hfh_err_shim.RevisionResolutionError = RevisionResolutionError
 
-          for _name in ('resolve_revision',):
-              if not hasattr(_hfh_shim, _name):
-                  setattr(_hfh_shim, _name, _make_fn_stub(_name))
-
-          for _name in ('RevisionResolutionError',):
-              if not hasattr(_hfh_err_shim, _name):
-                  setattr(_hfh_err_shim, _name, _make_exc_stub(_name))
+          if not hasattr(_hfh_util_shim, 'httpx'):
+              try:
+                  import httpx as _httpx
+                  _hfh_util_shim.httpx = _httpx
+              except ImportError:
+                  import huggingface_hub.utils._http as _http_mod
+                  _hfh_util_shim.httpx = _http_mod
 
           """
 
@@ -150,8 +158,7 @@ jobs:
               f.write(shim + text)
 
           print("✓ Compatibility shim prepended to hub_utils.py")
-          PYEOF
-      
+          PYEOF     
           
      
       - name: Export ONNX models for offline image generation
