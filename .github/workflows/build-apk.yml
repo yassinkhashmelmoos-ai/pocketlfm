@@ -96,8 +96,8 @@ jobs:
       # crashing if text_encoder.onnx ends up missing.
       - name: Install dependencies
         run: |
-          pip install --no-cache-dir --upgrade "huggingface-hub>=0.34.0,<1.0" "transformers>=4.45.0" "diffusers[onnxruntime]>=0.30.0" accelerate
-      
+          pip install --no-cache-dir --upgrade "huggingface-hub>=0.34.0,<1.0" "transformers>=4.45.0" "diffusers>=0.30.0" accelerate "onnxruntime>=1.18.0"
+
       - name: Export ONNX models for offline image generation
         run: |
           python3 << 'PYEOF'
