@@ -110,32 +110,64 @@ jobs:
             accelerate \
             "onnxruntime>=1.18.0" \
             pip
+                pip install --no-cache-dir --upgrade \
+            "huggingface-hub>=0.34.0,<1.0" \
+            "transformers==4.57.3" \
+            accelerate \
+            "onnxruntime>=1.18.0" \
+            httpx
       - name: Patch diffusers for huggingface_hub compatibility
         run: |
           SHIM=/tmp/hub_compat_shim.py
           printf '%s\n' \
-            '# diffusers-hub-compat-shim' \
-            'import huggingface_hub as _hfh_shim' \
-            'import huggingface_hub.errors as _hfh_err_shim' \
-            'import huggingface_hub.utils as _hfh_util_shim' \
+            '# diffusers-hub-compat-shim-v2' \
+            'import huggingface_hub as _hfh' \
+            'import huggingface_hub.errors as _hfh_err' \
+            'import huggingface_hub.utils as _hfh_util' \
             '' \
-            'if not hasattr(_hfh_shim, "resolve_revision"):' \
-            '    def _resolve_revision_stub(*args, **kwargs):' \
-            '        return args[0] if args else kwargs.get("revision", "main")' \
-            '    _hfh_shim.resolve_revision = _resolve_revision_stub' \
+            'def _make_stub(name):' \
+            '    def _stub(*a, **k):' \
+            '        return None' \
+            '    _stub.__name__ = name' \
+            '    return _stub' \
             '' \
-            'if not hasattr(_hfh_err_shim, "RevisionResolutionError"):' \
+            'if not hasattr(_hfh, "resolve_revision"):' \
+            '    def _resolve_revision_stub(*a, **k):' \
+            '        return a[0] if a else k.get("revision", "main")' \
+            '    _hfh.resolve_revision = _resolve_revision_stub' \
+            '' \
+            'if not hasattr(_hfh_err, "RevisionResolutionError"):' \
             '    class RevisionResolutionError(Exception):' \
             '        pass' \
-            '    _hfh_err_shim.RevisionResolutionError = RevisionResolutionError' \
+            '    _hfh_err.RevisionResolutionError = RevisionResolutionError' \
             '' \
-            'if not hasattr(_hfh_util_shim, "httpx"):' \
+            'if not hasattr(_hfh_util, "httpx"):' \
             '    try:' \
             '        import httpx as _httpx' \
-            '        _hfh_util_shim.httpx = _httpx' \
+            '        _hfh_util.httpx = _httpx' \
             '    except ImportError:' \
             '        import huggingface_hub.utils._http as _http_mod' \
-            '        _hfh_util_shim.httpx = _http_mod' \
+            '        _hfh_util.httpx = _http_mod' \
+            '' \
+            'if not hasattr(_hfh, "get_cached_repo_tree"):' \
+            '    def _get_cached_repo_tree_stub(*a, **k):' \
+            '        return []' \
+            '    _hfh.get_cached_repo_tree = _get_cached_repo_tree_stub' \
+            '' \
+            'if not hasattr(_hfh, "__getattr__"):' \
+            '    def _hfh_getattr(name):' \
+            '        return _make_stub(name)' \
+            '    _hfh.__getattr__ = _hfh_getattr' \
+            '' \
+            'if not hasattr(_hfh_err, "__getattr__"):' \
+            '    def _hfh_err_getattr(name):' \
+            '        return type(name, (Exception,), {})' \
+            '    _hfh_err.__getattr__ = _hfh_err_getattr' \
+            '' \
+            'if not hasattr(_hfh_util, "__getattr__"):' \
+            '    def _hfh_util_getattr(name):' \
+            '        return _make_stub(name)' \
+            '    _hfh_util.__getattr__ = _hfh_util_getattr' \
             > "$SHIM"
 
           python3 -c '
@@ -144,8 +176,8 @@ jobs:
           path = os.path.join(os.path.dirname(spec.origin), "utils", "hub_utils.py")
           with open(path) as f:
               text = f.read()
-          if "# diffusers-hub-compat-shim" in text:
-              print("Already patched")
+          if "# diffusers-hub-compat-shim-v2" in text:
+              print("Already patched with v2")
               sys.exit(0)
           with open("/tmp/hub_compat_shim.py") as f:
               shim = f.read()
