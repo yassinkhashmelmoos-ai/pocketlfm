@@ -25,20 +25,37 @@ private const val TAG = "ThunderImagen"
 /**
  * ImageGenerator — Thunder AGI's image generation engine.
  *
- * Pipeline (Gemini-config as advised by Gemini AI):
- * 1. Text Encoder (CLIP ViT-L/14 ONNX) — encodes the prompt
- * 2. UNet / Diffusion (simplified DDPM in Kotlin) — denoising
- * 3. VAE Decoder (sdxl-vae-fp16-fix ONNX) — latent → pixel
+ * FIX: this used to pair a plain CLIP ViT-L/14 text encoder with a full-size
+ * stable-diffusion-v1-5 UNet it silently substituted for DreamLite (see
+ * build-apk.yml's FIX comments) — a model DreamLite's UNet was never trained
+ * to read, run through a hand-rolled DDPM loop that doesn't match this
+ * model's architecture at all. Per the user's explicit instruction to follow
+ * Gemini's component choices, this is now DreamLite-base's *real* pipeline,
+ * ported from the actual DreamLitePipeline source (read directly from the
+ * diffusers package during this work, not guessed):
+ * 1. Text Encoder: Qwen3-VL-2B-Instruct (DreamLite's real, required encoder —
+ *    NOT swappable for CLIP; its UNet's cross-attention was trained against
+ *    this model's specific hidden states) — dynamic-INT8 ONNX, see the honest
+ *    risk flag in build-apk.yml: no on-device precedent exists for this exact
+ *    export, unlike the UNet/VAE below.
+ * 2. UNet: DreamLiteUNetModel (carlofkl/DreamLite-base's own 0.39B UNet, not a
+ *    substitute) — flow-matching velocity prediction, not DDPM noise
+ *    prediction. Expects a double-width "diptych" input (real latents +
+ *    zero-filled placeholder for generate mode); see generateOffline().
+ * 3. VAE: madebyollin/sdxl-vae-fp16-fix (replacing DreamLite's default tiny
+ *    VAE, per the user's explicit direction) — scaling_factor/shift_factor
+ *    read from the manifest (SDXL's ≈0.13025 differs from SD1.5's 0.18215),
+ *    not hardcoded.
+ * Scheduler: FlowMatchEulerDiscreteScheduler with dynamic resolution-dependent
+ * shift — the exact calculate_shift/time_shift formulas, read from diffusers'
+ * actual scheduler source, not approximated.
  *
- * Parameters (Gemini's educated guess for best quality):
- * - num_inference_steps: 50  (maximum detail convergence)
- * - guidance_scale: 7.0      (strict prompt adherence like Gemini)
- * - image_guidance_scale: 1.5 (for editing tasks)
- * - resolution: 512×512      (sweet spot for mobile RAM)
- * - vae: sdxl-vae-fp16-fix   (replaces tiny VAE for HD output)
- * - text_encoder: CLIP ViT-L/14 (replaces distilled encoder)
- * - attention_slicing: true  (prevents OOM on mobile)
- * - negative_prompt: hardcoded strong negative
+ * Parameters, per the user's explicit instruction to follow Gemini's analysis
+ * exactly (this pipeline's own tuned defaults are actually 30 steps / CFG 3.5 —
+ * noted here as a deliberate departure, not an oversight):
+ * - num_inference_steps: 50, guidance_scale: 7.0, negative_prompt, attention
+ *   slicing (ONNX Runtime's memory arena serves the same OOM-prevention role
+ *   here; there's no separate "slicing" toggle in ONNX Runtime).
  *
  * Self-improvement loop:
  * - Compares offline result vs Pollinations.ai result (SSIM metric)
@@ -55,18 +72,29 @@ class ImageGenerator(private val context: Context) {
         private const val DREAMLITE_ZIP = "thunder_imagen.zip"
         private const val MANIFEST_FILE = "thunder_imagen_manifest.json"
         private const val REGISTRY_FILE = "image_registry.json"
+        // A real UNet (even aggressively quantized) is never this small — see the
+        // FIX comment at the unetFile check in extractAndLoadModels().
+        private const val MIN_PLAUSIBLE_UNET_BYTES = 50L * 1024 * 1024
 
-        // Gemini-advised negative prompt
-        private const val NEGATIVE_PROMPT =
+        // Gemini-advised negative prompt (fallback if manifest.json is missing it)
+        private const val NEGATIVE_PROMPT_FALLBACK =
             "blurry, distorted, ugly, bad anatomy, text, watermark, pixelated, " +
             "low resolution, disfigured, mutated, duplicate, artifacts, noise"
 
-        // Gemini-advised inference parameters
+        // Gemini-advised inference parameters (fallbacks — the real values ship in
+        // manifest.json, written by the export step in build-apk.yml, and are read
+        // into the instance vars below; these consts are only used if that read fails)
         private const val NUM_STEPS = 50
         private const val CFG_SCALE = 7.0f
         private const val IMG_CFG   = 1.5f
-        private const val RESOLUTION = 512
-        private const val LATENT_DIM = 64  // RESOLUTION / 8
+        // FIX: DreamLite's native resolution is 1024x1024 (default_sample_size=128
+        // latent tokens * 8x VAE downscale), not 512 — 512 was SD1.5's resolution,
+        // carried over by mistake along with the old SD1.5 substitution.
+        private const val RESOLUTION = 1024
+        private const val LATENT_DIM = 128  // RESOLUTION / 8
+        // FIX: SDXL-VAE's scaling_factor (~0.13025) differs from SD1.5's 0.18215 —
+        // this is only a fallback for if manifest.json's real value can't be read.
+        private const val VAE_SCALING_FACTOR_FALLBACK = 0.13025f
     }
 
     sealed class GenerationResult {
@@ -85,12 +113,37 @@ class ImageGenerator(private val context: Context) {
     private val onnxEnv   = OrtEnvironment.getEnvironment()
     private var textEncoderSession: OrtSession? = null
     private var vaeDecoderSession: OrtSession?  = null
+    private var vaeEncoderSession: OrtSession?   = null   // FIX: new — needed for image editing; the old code never exported or loaded one
     private var unetSession: OrtSession?         = null   // core denoising network
+    private var bpeTokenizer: BpeTokenizer?      = null   // FIX: new — real Qwen3-VL tokenizer, replacing the old hardcoded-dictionary tokenize()
     @Volatile private var onnxReady = false
     @Volatile private var modelsChecked = false  // FIX: guards the one-time lazy load below
     private val modelsLoadMutex = Mutex()
     private var currentGuidanceScale = CFG_SCALE
     private var registry = mutableMapOf<Int, String>()  // imageId → path
+
+    // FIX: all of these are read from manifest.json (written by the export step in
+    // build-apk.yml) in extractAndLoadModels() — the consts above are only the
+    // fallback if that read fails. Real values differ meaningfully from the SD1.5-era
+    // defaults they replace (see each FIX comment at point of use).
+    private var negativePrompt = NEGATIVE_PROMPT_FALLBACK
+    private var vaeScalingFactor = VAE_SCALING_FACTOR_FALLBACK
+    private var vaeShiftFactor = 0f
+    private var latentChannels = 4
+    private var textHiddenSize = 2048  // DreamLiteUNetModel's cross_attention_dim default
+    // Exact prompt template + drop_idx from DreamLitePipeline.__init__, copied into
+    // the manifest by the export step — see BOTH FIX comments (Python + here) for why
+    // these exact values matter and can't be approximated.
+    private var promptTemplate = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, " +
+        "quantity, text, spatial relationships of the objects and background:<|im_end|>\n" +
+        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+    private var promptTemplateDropIdx = 34
+    // Dynamic-shift schedule constants from FlowMatchEulerDiscreteScheduler's config
+    // (base_image_seq_len, max_image_seq_len, base_shift, max_shift) — see calculateShift().
+    private var shiftBaseSeqLen = 256f
+    private var shiftMaxSeqLen = 4096f
+    private var shiftBaseShift = 0.5f
+    private var shiftMaxShift = 1.16f
 
     init {
         loadRegistry()
@@ -157,7 +210,10 @@ class ImageGenerator(private val context: Context) {
             // and unet.onnx directly into assets/ — no zip container needed.
             // This avoids the double-compression issue where Android re-packages
             // the zip and the ONNX files end up compressed inside a compressed archive.
-            val onnxFiles = listOf("vae_decoder.onnx", "text_encoder.onnx", "unet.onnx")
+            // FIX: added vae_encoder.onnx (image editing needs to encode a source
+            // image into latents — the old code never bundled or loaded one at all)
+            // and tokenizer.json (Qwen3-VL's real BPE tokenizer, see BpeTokenizer.kt).
+            val onnxFiles = listOf("vae_decoder.onnx", "vae_encoder.onnx", "text_encoder.onnx", "unet.onnx", "tokenizer.json")
             val assetList = context.assets.list("") ?: emptyArray()
             for (name in onnxFiles) {
                 if (assetList.contains(name)) {
@@ -191,33 +247,128 @@ class ImageGenerator(private val context: Context) {
                 Log.i(TAG, "Legacy zip extracted")
             }
 
+            // FIX: read manifest.json's real values instead of trusting the
+            // SD1.5-era hardcoded constants — these are the actual exported
+            // model's config values (scaling factors, cross-attention dim, prompt
+            // template), not generic assumptions. Falls back to the constants
+            // (already set as the instance vars' defaults) if anything's missing.
+            val manifestFile = File(context.filesDir, "manifest.json")
+            if (manifestFile.exists()) {
+                try {
+                    val m = JSONObject(manifestFile.readText())
+                    val p = m.optJSONObject("params")
+                    if (p != null) {
+                        negativePrompt      = p.optString("negative_prompt", negativePrompt)
+                        vaeScalingFactor    = p.optDouble("vae_scaling_factor", vaeScalingFactor.toDouble()).toFloat()
+                        vaeShiftFactor      = p.optDouble("vae_shift_factor", vaeShiftFactor.toDouble()).toFloat()
+                        latentChannels      = p.optInt("latent_channels", latentChannels)
+                        textHiddenSize      = p.optInt("text_hidden_size", textHiddenSize)
+                        promptTemplate      = p.optString("prompt_template", promptTemplate)
+                        promptTemplateDropIdx = p.optInt("prompt_template_drop_idx", promptTemplateDropIdx)
+                        p.optJSONObject("scheduler_shift")?.let { s ->
+                            shiftBaseSeqLen = s.optDouble("base_image_seq_len", shiftBaseSeqLen.toDouble()).toFloat()
+                            shiftMaxSeqLen  = s.optDouble("max_image_seq_len", shiftMaxSeqLen.toDouble()).toFloat()
+                            shiftBaseShift  = s.optDouble("base_shift", shiftBaseShift.toDouble()).toFloat()
+                            shiftMaxShift   = s.optDouble("max_shift", shiftMaxShift.toDouble()).toFloat()
+                        }
+                    }
+                    Log.i(TAG, "manifest.json loaded: vaeScale=$vaeScalingFactor textHidden=$textHiddenSize dropIdx=$promptTemplateDropIdx")
+                } catch (e: Exception) {
+                    Log.w(TAG, "manifest.json parse failed, using fallback defaults: ${e.message}")
+                }
+            }
+
             val teFile = File(context.filesDir, "text_encoder.onnx")
             val vaeFile = File(context.filesDir, "vae_decoder.onnx")
-
+            val vaeEncFile = File(context.filesDir, "vae_encoder.onnx")
+            val tokenizerFile = File(context.filesDir, "tokenizer.json")
             val unetFile = File(context.filesDir, "unet.onnx")
 
+            if (tokenizerFile.exists()) {
+                bpeTokenizer = BpeTokenizer.loadFromAssets(context, tokenizerFile)
+                if (bpeTokenizer != null) Log.i(TAG, "Real BPE tokenizer loaded")
+            }
+
             if (teFile.exists() && vaeFile.exists()) {
+                if (vaeEncFile.exists()) {
+                    vaeEncoderSession = loadSessionSafely("vae_encoder.onnx", vaeEncFile,
+                        OrtSession.SessionOptions().apply { setIntraOpNumThreads(2) })
+                }
                 val opts = OrtSession.SessionOptions().apply {
                     try { addNnapi(); Log.i(TAG, "NNAPI enabled") }
                     catch (e: Exception) { Log.w(TAG, "No NNAPI: ${e.message}") }
                     setIntraOpNumThreads(4)
                     setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
                 }
-                textEncoderSession = onnxEnv.createSession(teFile.absolutePath, opts)
-                vaeDecoderSession  = onnxEnv.createSession(vaeFile.absolutePath, opts)
-                if (unetFile.exists()) {
-                    unetSession = onnxEnv.createSession(unetFile.absolutePath, opts)
-                    Log.i(TAG, "UNet loaded — full diffusion pipeline ready")
+
+                // FIX: each createSession() call used to run unguarded — if ONE
+                // file was bad, ONNX Runtime's native layer could bring down the
+                // whole process (an OrtException is catchable, but a corrupt or
+                // incomplete model can also fail at a lower, non-Java-catchable
+                // level). Load each independently so a single bad file degrades
+                // gracefully instead of crashing the app or blocking the others.
+                textEncoderSession = loadSessionSafely("text_encoder.onnx", teFile, opts)
+                vaeDecoderSession  = loadSessionSafely("vae_decoder.onnx",  vaeFile, opts)
+
+                // FIX: the CI export step for unet.onnx (see build-apk.yml) only
+                // copies the file named "unet.onnx" — a full SD1.5 UNet is ~3.4GB,
+                // over the single-file ONNX size limit, so torch.onnx.export very
+                // likely wrote its actual weights to a separate external-data file
+                // that never got copied into assets. The result is a tiny ~1MB
+                // graph-only stub with no real weights behind it. Loading that is
+                // not just "the wrong result" — it's very likely what was crashing
+                // the app on launch. A real UNet (even int4-quantized) is never
+                // under tens of MB, so treat anything implausibly small the exact
+                // same way the code already treats a missing file: skip it and
+                // fall back to online generation, rather than attempting to load
+                // something already known to be broken.
+                if (unetFile.exists() && unetFile.length() >= MIN_PLAUSIBLE_UNET_BYTES) {
+                    unetSession = loadSessionSafely("unet.onnx", unetFile, opts)
+                    if (unetSession != null) Log.i(TAG, "UNet loaded — full diffusion pipeline ready")
+                } else if (unetFile.exists()) {
+                    Log.w(TAG, "unet.onnx is only ${unetFile.length()}B — too small to be real " +
+                        "(see FIX comment above); skipping it, offline generation will use online fallback")
                 } else {
                     Log.w(TAG, "UNet missing — offline generation will use online fallback")
                 }
-                onnxReady = true
-                Log.i(TAG, "ONNX models loaded — offline generation ready")
+
+                // FIX: this used to be true whenever just text+vae loaded, regardless
+                // of unet — so a broken/missing unet could leave onnxReady=true while
+                // the pipeline silently substituted an online image from inside
+                // generateOffline() (see the FIX there). onnxReady is supposed to mean
+                // "the real offline pipeline works" — generate()'s online path has its
+                // own explicit trigger (webEnabled, when onnxReady is false) and
+                // should never be reached silently through here.
+                // FIX: added bpeTokenizer != null — the old onnxReady check didn't
+                // depend on tokenization at all, since the old tokenize() always
+                // "succeeded" (it was just a hash function, nothing to fail). The
+                // real BPE tokenizer depends on a bundled file that can be missing
+                // or fail to parse, and encoding is meaningless without it.
+                onnxReady = textEncoderSession != null && vaeDecoderSession != null &&
+                    unetSession != null && bpeTokenizer != null
+                Log.i(TAG, "ONNX load finished — offline ready=$onnxReady " +
+                    "(unet=${unetSession != null} tokenizer=${bpeTokenizer != null} vaeEnc=${vaeEncoderSession != null})")
             } else {
                 Log.i(TAG, "ONNX models not found — will use online generation")
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Model load error: ${e.message}")
+        } catch (t: Throwable) {
+            // FIX: widened from "catch (e: Exception)" — a native-library failure
+            // here can surface as an Error (e.g. OutOfMemoryError), not just an
+            // Exception, and this whole feature is optional, so nothing here
+            // should ever be allowed to take the rest of the app down with it.
+            Log.e(TAG, "Model load error: ${t.message}")
+            onnxReady = false
+        }
+    }
+
+    // FIX: isolates one createSession() call so a single bad/incomplete model file
+    // can't prevent the others from loading or crash the whole process.
+    private fun loadSessionSafely(label: String, file: File, opts: OrtSession.SessionOptions): OrtSession? {
+        return try {
+            onnxEnv.createSession(file.absolutePath, opts)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to load $label (${file.length()}B): ${t.message}")
+            null
         }
     }
 
@@ -262,10 +413,14 @@ class ImageGenerator(private val context: Context) {
         return try {
             Log.i(TAG, "Offline generation: $NUM_STEPS steps, CFG=$currentGuidanceScale")
 
-            // Step 1: Encode text
+            // Step 1: Encode text (real Qwen3-VL encoding now, see encodeText())
             progressCallback?.invoke(1, NUM_STEPS + 3)
-            val textEmbeds = encodeText(prompt)
-            val negEmbeds  = encodeText(NEGATIVE_PROMPT)
+            val textEmb = encodeText(prompt)
+            val negEmb  = encodeText(negativePrompt)
+            // Cond/uncond will generally tokenize to different lengths after the
+            // template+drop_idx step — pad both to the longer one so they can share
+            // one batched UNet call, with encoder_attention_mask marking real vs pad.
+            val condSeqLen = maxOf(textEmb.seqLen, negEmb.seqLen)
 
             // Step 2: Initialize latent (random noise or from source image)
             progressCallback?.invoke(2, NUM_STEPS + 3)
@@ -274,91 +429,118 @@ class ImageGenerator(private val context: Context) {
             else
                 randomLatent()
 
-            // Step 3: DDPM denoising loop — requires UNet for real images
+            // requires UNet for real images — generateOffline() should never even be
+            // entered without one (onnxReady requires unetSession != null; see its FIX
+            // comment), so this is a defensive check, not a normal path.
             val unet = unetSession
             if (unet == null) {
-                // No UNet available — fall back to online generation
-                Log.w(TAG, "UNet not loaded, falling back to online generation")
-                return generateOnline(prompt, sourceImage)
+                Log.e(TAG, "generateOffline() entered without a loaded UNet — this shouldn't happen")
+                return GenerationResult.Failure(
+                    "Offline generation unavailable.",
+                    "The UNet model isn't loaded. This is unexpected — onnxReady should be false in this state."
+                )
             }
 
-            // Real classifier-free guidance diffusion loop.
-            // We replicate the DDPM math from DDPMScheduler inline so we can
-            // plug in the UNet noise prediction instead of the fake text-math.
-            val betas         = FloatArray(NUM_STEPS) { i -> 0.00085f + (0.012f - 0.00085f) * i / (NUM_STEPS - 1) }
-            val alphas        = FloatArray(NUM_STEPS) { i -> 1f - betas[i] }
-            val alphasCumprod = FloatArray(NUM_STEPS).also { ac ->
-                ac[0] = alphas[0]; for (i in 1 until NUM_STEPS) ac[i] = ac[i-1] * alphas[i]
+            // FIX: full rewrite — DreamLite's scheduler is FlowMatchEulerDiscreteScheduler
+            // (confirmed from the actual diffusers scheduler source read during this
+            // work), not DDPM. Flow matching predicts a velocity, not noise, and steps
+            // with a simple Euler update (latents += dt * velocity) along a sigma
+            // schedule that's *resolution-dependent* (dynamic shifting) rather than
+            // fixed — both the schedule and the step formula below are copied from
+            // that source, not approximated:
+            //   sigmas = linspace(1.0, 1/steps, steps)
+            //   mu = calculateShift(imageSeqLen, baseSeqLen, maxSeqLen, baseShift, maxShift)
+            //   sigmas = exp(mu) / (exp(mu) + (1/sigmas - 1))   [time_shift, exponential]
+            //   timesteps = sigmas * 1000 (num_train_timesteps)
+            //   dt = sigmas[i+1] - sigmas[i]; latents = latents + dt * model_output
+            val imageSeqLen = (LATENT_DIM.toFloat() * LATENT_DIM.toFloat()) / 4f
+            val mu = calculateShift(imageSeqLen, shiftBaseSeqLen, shiftMaxSeqLen, shiftBaseShift, shiftMaxShift)
+            val sigmas = FloatArray(NUM_STEPS + 1)
+            for (i in 0 until NUM_STEPS) {
+                val sInit = 1f - i * (1f - 1f / NUM_STEPS) / (NUM_STEPS - 1).coerceAtLeast(1)
+                sigmas[i] = timeShiftExponential(mu, 1f, sInit)
             }
+            sigmas[NUM_STEPS] = 0f  // terminal sigma
+
+            val latentPlaneSize = LATENT_DIM * LATENT_DIM          // one channel, one (unbatched) image
+            val halfWidthStride = LATENT_DIM                        // columns per side of the diptych
+            val fullLatentSize  = latentChannels * latentPlaneSize  // one unbatched image, all channels
 
             for (step in 0 until NUM_STEPS) {
                 progressCallback?.invoke(step + 3, NUM_STEPS + 3)
 
-                // Map denoising step to UNet's 0-999 timestep range
-                val t         = NUM_STEPS - 1 - step                     // reversal index
-                val timestep  = (t.toLong() * 999L / (NUM_STEPS - 1)).toInt()  // scaled to 0-999
+                val sigma     = sigmas[step]
+                val sigmaNext = sigmas[step + 1]
+                val timestepValue = sigma * 1000f  // num_train_timesteps
 
-                // Batch latent ×2 for classifier-free guidance → [2, 4, 64, 64]
-                val batchedLatent = FloatArray(latent.size * 2) { i ->
-                    if (i < latent.size) latent[i] else latent[i - latent.size]
-                }
-                // FIXED: correct [2, 77, 768] layout for UNet encoder_hidden_states.
-                // batch[0]=uncond(neg), batch[1]=cond(text). Old code was correct layout
-                // but used wrong flat indices — this is explicit and safe.
-                val combinedEmbeds = FloatArray(negEmbeds.size + textEmbeds.size) { i ->
-                    if (i < negEmbeds.size) negEmbeds[i] else textEmbeds[i - negEmbeds.size]
+                // FIX: DreamLite's UNet always takes a double-width "diptych" input —
+                // real latents concatenated with a same-shape block along the width
+                // axis (the source-image latents when editing; zeros for plain
+                // generation, which is the only mode implemented here — see editImage()
+                // for the gap). Batch 0 = uncond, batch 1 = cond, each itself
+                // double-width, so shape is [2, C, H, 2W].
+                val modelInput = FloatArray(2 * latentChannels * LATENT_DIM * (2 * halfWidthStride))
+                for (b in 0 until 2) for (c in 0 until latentChannels) for (y in 0 until LATENT_DIM) {
+                    val srcRowBase = c * latentPlaneSize + y * LATENT_DIM
+                    val dstRowBase = (b * latentChannels + c) * LATENT_DIM * (2 * halfWidthStride) + y * (2 * halfWidthStride)
+                    for (x in 0 until LATENT_DIM) modelInput[dstRowBase + x] = latent[srcRowBase + x]
+                    // right half (x in [halfWidthStride, 2*halfWidthStride)) stays zero — generate mode
                 }
 
-                val latentTensor = OnnxTensor.createTensor(onnxEnv,
-                    java.nio.FloatBuffer.wrap(batchedLatent),
-                    longArrayOf(2, 4, LATENT_DIM.toLong(), LATENT_DIM.toLong()))
-                // FIXED: timestep shape [1] — UNet broadcasts scalar to both batch elements.
-                // Old shape [2] caused ONNX Runtime shape mismatch errors on strict models.
+                // Padded, batched conditioning: batch 0 = negative/uncond, batch 1 = positive/cond
+                val hiddenStates = FloatArray(2 * condSeqLen * textHiddenSize)
+                val attnMask = LongArray(2 * condSeqLen)
+                negEmb.data.copyInto(hiddenStates, 0, 0, minOf(negEmb.data.size, condSeqLen * textHiddenSize))
+                textEmb.data.copyInto(hiddenStates, condSeqLen * textHiddenSize, 0, minOf(textEmb.data.size, condSeqLen * textHiddenSize))
+                for (i in 0 until negEmb.seqLen) attnMask[i] = 1L
+                for (i in 0 until textEmb.seqLen) attnMask[condSeqLen + i] = 1L
+
+                val sampleTensor = OnnxTensor.createTensor(onnxEnv,
+                    java.nio.FloatBuffer.wrap(modelInput),
+                    longArrayOf(2, latentChannels.toLong(), LATENT_DIM.toLong(), (2L * halfWidthStride)))
                 val timestepTensor = OnnxTensor.createTensor(onnxEnv,
-                    java.nio.LongBuffer.wrap(longArrayOf(timestep.toLong())),
-                    longArrayOf(1))
-                val embedTensor = OnnxTensor.createTensor(onnxEnv,
-                    java.nio.FloatBuffer.wrap(combinedEmbeds),
-                    longArrayOf(2, 77, 768))
+                    java.nio.FloatBuffer.wrap(floatArrayOf(timestepValue, timestepValue)), longArrayOf(2))
+                val hiddenTensor = OnnxTensor.createTensor(onnxEnv,
+                    java.nio.FloatBuffer.wrap(hiddenStates), longArrayOf(2, condSeqLen.toLong(), textHiddenSize.toLong()))
+                val maskTensor = OnnxTensor.createTensor(onnxEnv,
+                    java.nio.LongBuffer.wrap(attnMask), longArrayOf(2, condSeqLen.toLong()))
+                val timeIdsTensor = OnnxTensor.createTensor(onnxEnv,
+                    java.nio.FloatBuffer.wrap(floatArrayOf(
+                        RESOLUTION.toFloat(), RESOLUTION.toFloat(), RESOLUTION.toFloat(), RESOLUTION.toFloat())),
+                    longArrayOf(2, 2))
 
                 val output = unet.run(mapOf(
-                    "sample"                to latentTensor,
-                    "timestep"              to timestepTensor,
-                    "encoder_hidden_states" to embedTensor
+                    "sample" to sampleTensor, "timestep" to timestepTensor,
+                    "encoder_hidden_states" to hiddenTensor, "encoder_attention_mask" to maskTensor,
+                    "time_ids" to timeIdsTensor
                 ))
 
-                // UNet output: [2, 4, 64, 64] — uncond=[0], cond=[1]
                 @Suppress("UNCHECKED_CAST")
                 val noisePred4d = output[0].value as? Array<Array<Array<FloatArray>>>
                     ?: throw IllegalStateException("UNet output unexpected type: ${output[0].value?.javaClass?.simpleName}")
 
-                // Classifier-free guidance: guided = uncond + scale * (cond - uncond)
-                val alphaT  = alphasCumprod[t]
-                val sigma   = sqrt((1f - alphaT) / alphaT)
-                val alphaT1 = if (t > 0) alphasCumprod[t - 1] else 1f
-
-                latent = FloatArray(latent.size) { i ->
-                    val ch  = i / (LATENT_DIM * LATENT_DIM)
-                    val pos = i % (LATENT_DIM * LATENT_DIM)
+                // FIX: classifier-free guidance combines velocities here, not noise —
+                // same linear-combination formula, different physical quantity. Output
+                // is also double-width; only the left `halfWidthStride` columns (the
+                // actual generated-image half, per the pipeline's own
+                // noise_pred[..., :latents.shape[-1]] slicing) are used — the right
+                // half corresponds to the (here, zero/unused) conditioning-image side.
+                val dt = sigmaNext - sigma
+                latent = FloatArray(fullLatentSize) { i ->
+                    val ch  = i / latentPlaneSize
+                    val pos = i % latentPlaneSize
                     val y   = pos / LATENT_DIM
                     val x   = pos % LATENT_DIM
                     val uncond = noisePred4d[0][ch][y][x]
                     val cond   = noisePred4d[1][ch][y][x]
-                    val guidedNoise = uncond + currentGuidanceScale * (cond - uncond)
-
-                    // DDPM denoising step
-                    val predX0 = (latent[i] - sigma * guidedNoise) / sqrt(alphaT)
-                    // FIXED: Gaussian noise (zero-mean). Uniform [0,0.01] had +0.005 mean bias
-                    // → +0.25 cumulative latent drift over 50 steps → washed-out bright images.
-                    val noise  = if (t > 0) (java.util.Random().nextGaussian() *
-                                  Math.sqrt(Math.max(0.0, (1.0 - alphaT1).toDouble()))).toFloat() * 0.01f else 0f
-                    sqrt(alphaT1) * predX0 + sqrt(1f - alphaT1) * noise
+                    val guidedVelocity = uncond + currentGuidanceScale * (cond - uncond)
+                    latent[i] + dt * guidedVelocity   // Euler step
                 }
 
-                latentTensor.close(); timestepTensor.close()
-                embedTensor.close();  output[0].close()
+                sampleTensor.close(); timestepTensor.close(); hiddenTensor.close()
+                maskTensor.close(); timeIdsTensor.close(); output[0].close()
 
-                if (step % 5 == 0) Log.d(TAG, "Diffusion step ${step+1}/$NUM_STEPS")
+                if (step % 10 == 0) Log.d(TAG, "Flow-match step ${step+1}/$NUM_STEPS (sigma=$sigma)")
             }
 
             // Step 4: Decode latent → image via VAE
@@ -413,6 +595,16 @@ class ImageGenerator(private val context: Context) {
 
     // ── Image editing ─────────────────────────────────────────────────────────
 
+    // FIX / HONEST GAP: DreamLite's real instruction-editing uses a different prompt
+    // template ("[Edit]: A diptych with two side-by-side images...", not the
+    // "[Generate]" one — confirmed in DreamLitePipeline's source during this work)
+    // AND places the source image's real latents in the UNet's right-hand diptych
+    // half (see generateOffline()'s FIX comment — it only fills that half with
+    // zeros, the generate-mode path). This still routes through generate(), which
+    // uses imageToLatent() as a noisy img2img-style starting point only — closer to
+    // SD-style img2img than DreamLite's actual trained editing behavior. Real
+    // instruction editing (conditioning on BOTH the template and the right-half
+    // latents together) is the next piece, not implemented in this pass.
     suspend fun editImage(
         imageId: Int,
         instruction: String,
@@ -431,27 +623,76 @@ class ImageGenerator(private val context: Context) {
 
     // ── ONNX helpers ──────────────────────────────────────────────────────────
 
-    private fun encodeText(text: String): FloatArray {
+    /** A [seqLen, textHiddenSize] text-conditioning embedding, flattened row-major
+     *  (so `data[t * hiddenSize + h]`), plus the sequence length it actually used —
+     *  callers need both since cond/uncond prompts produce different lengths. */
+    private class TextEmbedding(val data: FloatArray, val seqLen: Int)
+
+    // FIX: this is a full rewrite, not a patch — the old version tokenized with the
+    // fake word-dictionary tokenize() (removed below), called CLIP's text encoder
+    // (wrong model — DreamLite's UNet was never trained against CLIP's embedding
+    // space at all), and flattened straight to a fixed 768-float vector (CLIP's
+    // pooled width; DreamLite expects per-token hidden states, not a single pooled
+    // vector, at textHiddenSize width from the manifest, not 768).
+    //
+    // Mirrors DreamLitePipeline.encode_prompt() exactly (read directly from its
+    // source during this work): wrap the prompt in the exact system/user/assistant
+    // template, tokenize, run Qwen3-VL with output_hidden_states, take the last
+    // layer, and drop the first promptTemplateDropIdx tokens (the template
+    // scaffolding) so only the actual prompt's hidden states are used as
+    // conditioning.
+    private fun encodeText(text: String): TextEmbedding {
         val session = textEncoderSession
-            ?: return FloatArray(768) { 0f }  // fallback zero embedding
+        val tok = bpeTokenizer
+        if (session == null || tok == null) return TextEmbedding(FloatArray(textHiddenSize), 1)
         return try {
-            // Simple BPE-style tokenization (77 tokens for CLIP)
-            val tokens = tokenize(text, 77)
-            val buf = java.nio.LongBuffer.wrap(tokens)
-            val tensor = OnnxTensor.createTensor(onnxEnv, buf, longArrayOf(1, 77))
-            val output = session.run(mapOf("input_ids" to tensor))
+            val formatted = promptTemplate.replace("{}", text)
+            val ids = tok.encode(formatted)
+            if (ids.size <= promptTemplateDropIdx) {
+                Log.w(TAG, "Tokenized prompt (${ids.size} tokens) shorter than drop_idx " +
+                    "($promptTemplateDropIdx) — template/tokenizer mismatch, returning empty conditioning")
+                return TextEmbedding(FloatArray(textHiddenSize), 1)
+            }
+
+            val inputIds = LongArray(ids.size) { ids[it].toLong() }
+            val attnMask = LongArray(ids.size) { 1L }
+            val idsTensor  = OnnxTensor.createTensor(onnxEnv, java.nio.LongBuffer.wrap(inputIds), longArrayOf(1, ids.size.toLong()))
+            val maskTensor = OnnxTensor.createTensor(onnxEnv, java.nio.LongBuffer.wrap(attnMask), longArrayOf(1, ids.size.toLong()))
+            val output = session.run(mapOf("input_ids" to idsTensor, "attention_mask" to maskTensor))
             val rawOutput = output[0].value
-            tensor.close()
+            idsTensor.close(); maskTensor.close()
+
             @Suppress("UNCHECKED_CAST")
             val arr3d = rawOutput as? Array<Array<FloatArray>>
-                ?: throw IllegalStateException(
-                    "Text encoder returned unexpected type: ${rawOutput?.javaClass?.simpleName}"
-                )
-            arr3d[0].flatMap { it.toList() }.toFloatArray()
+                ?: throw IllegalStateException("Text encoder returned unexpected type: ${rawOutput?.javaClass?.simpleName}")
+            output[0].close()
+
+            // Drop the template's tokens — only [dropIdx, end) is real prompt conditioning
+            val kept = arr3d[0].drop(promptTemplateDropIdx)
+            if (kept.isEmpty()) return TextEmbedding(FloatArray(textHiddenSize), 1)
+            val hiddenSize = kept[0].size
+            val flat = FloatArray(kept.size * hiddenSize)
+            kept.forEachIndexed { t, row -> row.copyInto(flat, t * hiddenSize) }
+            TextEmbedding(flat, kept.size)
         } catch (e: Exception) {
             Log.w(TAG, "Text encode error: ${e.message}")
-            FloatArray(768) { (it.toFloat() / 768f) }
+            TextEmbedding(FloatArray(textHiddenSize), 1)
         }
+    }
+
+    // FIX: both formulas copied exactly from diffusers' actual source (pipeline_dreamlite.py's
+    // module-level calculate_shift(), and FlowMatchEulerDiscreteScheduler._time_shift_exponential())
+    // — this is the standard SD3/Flux-family resolution-dependent timestep shifting, not
+    // something specific to DreamLite, so it's real, checkable, standard math.
+    private fun calculateShift(imageSeqLen: Float, baseSeqLen: Float, maxSeqLen: Float, baseShift: Float, maxShift: Float): Float {
+        val m = (maxShift - baseShift) / (maxSeqLen - baseSeqLen)
+        val b = baseShift - m * baseSeqLen
+        return imageSeqLen * m + b
+    }
+
+    private fun timeShiftExponential(mu: Float, sigma: Float, t: Float): Float {
+        val expMu = exp(mu.toDouble())
+        return (expMu / (expMu + (1.0 / t - 1.0).pow(sigma.toDouble()))).toFloat()
     }
 
     private fun decodeLatent(latent: FloatArray): Bitmap {
@@ -461,10 +702,13 @@ class ImageGenerator(private val context: Context) {
             return latentToFallbackBitmap(latent)
         }
         return try {
-            // FIXED: divide by VAE scaling factor 0.18215 before decode.
-            // Without this, VAE input is 5.5x too small → near-zero activations → gray/black images.
-            val scaled = FloatArray(latent.size) { latent[it] / 0.18215f }
-            val shape  = longArrayOf(1, 4, LATENT_DIM.toLong(), LATENT_DIM.toLong())
+            // FIX: now reads vaeScalingFactor/vaeShiftFactor from the manifest (the
+            // real madebyollin/sdxl-vae-fp16-fix config, ≈0.13025) instead of SD1.5's
+            // hardcoded 0.18215, which is architecturally the wrong constant for this
+            // VAE. Formula matches DreamLitePipeline's own decode step exactly:
+            // latents = (latents / scaling_factor) + shift_factor.
+            val scaled = FloatArray(latent.size) { latent[it] / vaeScalingFactor + vaeShiftFactor }
+            val shape  = longArrayOf(1, latentChannels.toLong(), LATENT_DIM.toLong(), LATENT_DIM.toLong())
             val buffer = FloatBuffer.wrap(scaled)
             val tensor = OnnxTensor.createTensor(onnxEnv, buffer, shape)
             val output = session.run(mapOf("latent_sample" to tensor))
@@ -478,23 +722,70 @@ class ImageGenerator(private val context: Context) {
     }
 
     private fun randomLatent(): FloatArray {
-        val size = 4 * LATENT_DIM * LATENT_DIM
+        val size = latentChannels * LATENT_DIM * LATENT_DIM
         return FloatArray(size) { Random.nextGaussian().toFloat() }
     }
 
+    // FIX: now uses the real VAE encoder (vae_encoder.onnx, loaded in
+    // extractAndLoadModels — the old code never bundled or loaded one at all) when
+    // available, instead of unconditionally downsampling raw pixels into a fake
+    // "latent" by direct RGB sampling — real latents are a learned, non-trivial
+    // transform, not a resize. NOTE: full image-conditioned editing also needs the
+    // source latents merged into the UNet's diptych "right half" (see the FIX
+    // comment in generateOffline(), which only implements the zero/generate-mode
+    // side) — this provides correct latents but the UNet wiring for editing is the
+    // next piece still needed, not implemented in this pass.
     private fun imageToLatent(bitmap: Bitmap): FloatArray {
-        // Scale image to latent space
+        val session = vaeEncoderSession
+        if (session == null) {
+            Log.w(TAG, "No VAE encoder loaded — falling back to a crude pixel-resize pseudo-latent (editing quality will be poor)")
+            return imageToLatentFallback(bitmap)
+        }
+        return try {
+            val resized = Bitmap.createScaledBitmap(bitmap, RESOLUTION, RESOLUTION, true)
+            val pixels = FloatArray(3 * RESOLUTION * RESOLUTION)
+            for (y in 0 until RESOLUTION) for (x in 0 until RESOLUTION) {
+                val p = resized.getPixel(x, y)
+                val base = y * RESOLUTION + x
+                pixels[0 * RESOLUTION * RESOLUTION + base] = Color.red(p) / 127.5f - 1f
+                pixels[1 * RESOLUTION * RESOLUTION + base] = Color.green(p) / 127.5f - 1f
+                pixels[2 * RESOLUTION * RESOLUTION + base] = Color.blue(p) / 127.5f - 1f
+            }
+            val tensor = OnnxTensor.createTensor(onnxEnv, java.nio.FloatBuffer.wrap(pixels),
+                longArrayOf(1, 3, RESOLUTION.toLong(), RESOLUTION.toLong()))
+            val output = session.run(mapOf("pixel_values" to tensor))
+            val raw = output[0].value
+            tensor.close()
+            @Suppress("UNCHECKED_CAST")
+            val arr4d = raw as? Array<Array<Array<FloatArray>>>
+                ?: throw IllegalStateException("VAE encoder returned unexpected type: ${raw?.javaClass?.simpleName}")
+            output[0].close()
+            val size = latentChannels * LATENT_DIM * LATENT_DIM
+            FloatArray(size) { i ->
+                val ch = i / (LATENT_DIM * LATENT_DIM)
+                val pos = i % (LATENT_DIM * LATENT_DIM)
+                // FIX: encode applies scaling_factor forward (mirrors decode's inverse
+                // in decodeLatent): latents = (encoded - shift_factor) * scaling_factor
+                (arr4d[0][ch][pos / LATENT_DIM][pos % LATENT_DIM] - vaeShiftFactor) * vaeScalingFactor
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "VAE encode error, falling back: ${e.message}")
+            imageToLatentFallback(bitmap)
+        }
+    }
+
+    private fun imageToLatentFallback(bitmap: Bitmap): FloatArray {
         val scaled = Bitmap.createScaledBitmap(bitmap, LATENT_DIM, LATENT_DIM, true)
-        val size   = 4 * LATENT_DIM * LATENT_DIM
+        val size   = latentChannels * LATENT_DIM * LATENT_DIM
         val latent = FloatArray(size)
         for (y in 0 until LATENT_DIM) {
             for (x in 0 until LATENT_DIM) {
                 val p = scaled.getPixel(x, y)
-                val base = (y * LATENT_DIM + x) * 4
-                latent[base]     = (Color.red(p) / 127.5f - 1f)
-                latent[base + 1] = (Color.green(p) / 127.5f - 1f)
-                latent[base + 2] = (Color.blue(p) / 127.5f - 1f)
-                latent[base + 3] = 0f
+                val pos = y * LATENT_DIM + x
+                latent[0 * LATENT_DIM * LATENT_DIM + pos] = Color.red(p) / 127.5f - 1f
+                latent[1 * LATENT_DIM * LATENT_DIM + pos] = Color.green(p) / 127.5f - 1f
+                latent[2 * LATENT_DIM * LATENT_DIM + pos] = Color.blue(p) / 127.5f - 1f
+                if (latentChannels > 3) latent[3 * LATENT_DIM * LATENT_DIM + pos] = 0f
             }
         }
         return latent
@@ -568,75 +859,6 @@ class ImageGenerator(private val context: Context) {
             }
         }
         return bmp
-    }
-
-    // FIXED tokenizer: word-level hash spread across full 49408 CLIP vocab.
-    // Old code: char.code % 49405 mapped all text to IDs 32-122 (bottom 0.2% of vocab).
-    // New code: polynomial hash per word → IDs 1000-48000, known visual words hardcoded.
-    private fun tokenize(text: String, maxLen: Int): LongArray {
-        val tokens = LongArray(maxLen) { 0L }
-        tokens[0] = 49406L
-        val known = mapOf(
-            "a" to 320L,"an" to 550L,"the" to 265L,"of" to 539L,"in" to 530L,
-            "on" to 624L,"with" to 593L,"and" to 268L,"is" to 536L,
-            "dog" to 1929L,"cat" to 2368L,"car" to 1393L,"tree" to 2894L,
-            "house" to 2563L,"man" to 786L,"woman" to 1794L,"sky" to 3262L,
-            "water" to 1300L,"sun" to 2478L,"mountain" to 4552L,"ocean" to 3253L,
-            "beautiful" to 4950L,"red" to 736L,"blue" to 1746L,"green" to 2864L,
-            "sunset" to 14008L,"forest" to 3137L,"city" to 1797L,"night" to 1990L,
-            "portrait" to 7329L,"landscape" to 8015L,"abstract" to 6308L,
-            "colorful" to 12612L,"detailed" to 7473L,"realistic" to 15689L,
-            "golden" to 4404L,"dog" to 1929L,"playing" to 2712L,"park" to 2523L
-        )
-        var pos = 1
-        for (word in text.lowercase().trim().split(Regex("\\s+"))) {
-            if (pos >= maxLen - 1) break
-            val tok = known[word] ?: run {
-                var h = 5381L
-                for (c in word) h = ((h shl 5) + h + c.code.toLong()) and 0xFFFFFFFFL
-                1000L + (h % 47000L)
-            }
-            tokens[pos++] = tok
-        }
-        if (pos < maxLen) tokens[pos] = 49407L
-        return tokens
-    }
-
-    // ── DDPM Scheduler (Gemini-config: 50 steps, CFG 7.0) ────────────────────
-
-    inner class DDPMScheduler(private val totalSteps: Int, private val cfgScale: Float) {
-        // Beta schedule (linear, matching SDXL)
-        private val betas = FloatArray(totalSteps) { i ->
-            0.00085f + (0.012f - 0.00085f) * i / (totalSteps - 1)
-        }
-        private val alphas = FloatArray(totalSteps) { i -> 1f - betas[i] }
-        private val alphasCumprod = FloatArray(totalSteps).also { ac ->
-            ac[0] = alphas[0]
-            for (i in 1 until totalSteps) ac[i] = ac[i-1] * alphas[i]
-        }
-
-        fun step(latent: FloatArray, textEmbed: FloatArray, negEmbed: FloatArray, step: Int): FloatArray {
-            val t = totalSteps - 1 - step
-            val alphaT = alphasCumprod[t]
-            val sigma  = sqrt((1f - alphaT) / alphaT)
-
-            // Classifier-Free Guidance: combine text and negative conditioning
-            // noise_pred = neg + cfgScale * (text - neg)
-            val result = FloatArray(latent.size)
-            for (i in latent.indices) {
-                val textCond = textEmbed.getOrElse(i % textEmbed.size) { 0f }
-                val negCond  = negEmbed.getOrElse(i % negEmbed.size) { 0f }
-                val guidedNoise = negCond + cfgScale * (textCond - negCond)
-
-                // DDPM denoising step
-                val predX0 = (latent[i] - sigma * guidedNoise) / sqrt(alphaT)
-                val noise  = if (t > 0) Random.nextGaussian().toFloat() * 0.01f else 0f
-                val alphaT1 = if (t > 0) alphasCumprod[t-1] else 1f
-
-                result[i] = sqrt(alphaT1) * predX0 + sqrt(1f - alphaT1) * noise
-            }
-            return result
-        }
     }
 
     private fun generateOnlineSync(prompt: String): GenerationResult {
@@ -755,8 +977,11 @@ class ImageGenerator(private val context: Context) {
         "\"${replace("\\","\\\\").replace("\"","\\\"").replace("\n","\\n")}\""
 
     fun release() {
+        // FIX: this never closed unetSession at all, and vaeEncoderSession is new.
         textEncoderSession?.close()
         vaeDecoderSession?.close()
+        vaeEncoderSession?.close()
+        unetSession?.close()
     }
 
     private fun Random.nextGaussian(): Double {
