@@ -104,11 +104,10 @@ jobs:
             accelerate \
             "onnxruntime>=1.18.0"
           pip install torchvision --index-url https://download.pytorch.org/whl/cpu
-
-      - name: Patch diffusers to remove resolve_revision import
+      - name: Patch diffusers for huggingface_hub compatibility
         run: |
           python3 << 'PYEOF'
-          import importlib.util, os, re
+          import importlib.util, os
 
           spec = importlib.util.find_spec('diffusers')
           path = os.path.join(os.path.dirname(spec.origin), 'utils', 'hub_utils.py')
@@ -117,52 +116,43 @@ jobs:
           with open(path) as f:
               text = f.read()
 
-          idx = text.find('from huggingface_hub import')
-          if idx >= 0:
-              print("--- current import block ---")
-              print(text[idx:idx+600])
-              print("----------------------------")
+          SHIM_MARKER = '# diffusers-hub-compat-shim'
+          if SHIM_MARKER in text:
+              print("Already patched, skipping")
+              raise SystemExit(0)
 
-          new_text = re.sub(r'^[ \t]*resolve_revision,?[ \t]*\n', '', text, flags=re.MULTILINE)
+          shim = f"""# {SHIM_MARKER}
+          import huggingface_hub as _hfh_shim
+          import huggingface_hub.errors as _hfh_err_shim
 
-          if 'resolve_revision' in new_text:
-              new_text = re.sub(r',\s*resolve_revision\b(?!\s*\()', '', new_text)
-              new_text = re.sub(r'\bresolve_revision\s*,\s*', '', new_text)
+          def _make_fn_stub(name):
+              def _stub(*args, **kwargs):
+                  if args:
+                      return args[0]
+                  return kwargs.get('revision', 'main')
+              _stub.__name__ = name
+              return _stub
 
-          if re.search(r'\bresolve_revision\s*\(', new_text):
-              start = new_text.find('from huggingface_hub import (')
-              if start >= 0:
-                  end = new_text.find(')', start)
-                  if end >= 0:
-                      fallback = (
-                          '\n\ntry:\n'
-                          '    resolve_revision\nexcept NameError:\n'
-                          '    def resolve_revision(*args, **kwargs):\n'
-                          '        raise NotImplementedError('
-                          '"resolve_revision requires newer huggingface_hub")\n'
-                      )
-                      new_text = new_text[:end + 1] + fallback + new_text[end + 1:]
+          def _make_exc_stub(name):
+              return type(name, (Exception,), {{}})
+
+          for _name in ('resolve_revision',):
+              if not hasattr(_hfh_shim, _name):
+                  setattr(_hfh_shim, _name, _make_fn_stub(_name))
+
+          for _name in ('RevisionResolutionError',):
+              if not hasattr(_hfh_err_shim, _name):
+                  setattr(_hfh_err_shim, _name, _make_exc_stub(_name))
+
+          """
 
           with open(path, 'w') as f:
-              f.write(new_text)
+              f.write(shim + text)
 
-          try:
-              compile(new_text, path, 'exec')
-          except SyntaxError as e:
-              print(f"✗ Patch introduced a syntax error: {e}")
-              raise SystemExit(1)
-
-          remaining = [ln for ln in new_text.splitlines()
-                       if 'resolve_revision' in ln and 'import' in ln]
-          if remaining:
-              print("✗ resolve_revision still in an import:")
-              for ln in remaining:
-                  print("   ", ln)
-              raise SystemExit(1)
-
-          print("✓ resolve_revision removed from hub_utils.py imports")
+          print("✓ Compatibility shim prepended to hub_utils.py")
           PYEOF
-
+      
+          
      
       - name: Export ONNX models for offline image generation
         run: |
