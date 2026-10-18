@@ -103,7 +103,7 @@ jobs:
             "transformers==4.57.3" \
             accelerate \
             "onnxruntime>=1.18.0"
-          pip install --no-deps "git+https://github.com/huggingface/diffusers.git"
+          pip install --no-cache-dir --no-deps "git+https://github.com/huggingface/diffusers.git@c1bf18c92c^"
           pip install torchvision --index-url https://download.pytorch.org/whl/cpu
       
       - name: Export ONNX models for offline image generation
