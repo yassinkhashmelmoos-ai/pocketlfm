@@ -570,7 +570,7 @@ jobs:
               del qwen_vision
               gc.collect()
 
-          merge_manifest({
+              merge_manifest({
                   "vision_patch_size": patch_size,
                   "vision_temporal_patch_size": temporal_patch_size,
                   "vision_merge_size": merge_size,
