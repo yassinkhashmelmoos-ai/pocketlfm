@@ -317,9 +317,11 @@ jobs:
           # flattened into a plain `time_ids` input for ONNX (dict kwargs aren't
           # ONNX-exportable). 1024x1024 output → 128x128 latents each side, 256
           # wide combined, matching DreamLite's native resolution.
-          print("\n[2/3] UNet (carlofkl/DreamLite-base)...")
+                    print("\n[2/3] UNet (carlofkl/DreamLite-base)...")
           unet_exported = False
           try:
+              from torch.export import Dim
+
               class UNetWrapper(torch.nn.Module):
                   def __init__(self, unet):
                       super().__init__()
@@ -333,11 +335,22 @@ jobs:
                           return_dict=False)[0]
 
               latent_ch = manifest["params"]["latent_channels"]
-              dummy_sample = torch.randn(2, latent_ch, 128, 256)  # width doubled (diptych)
+              dummy_sample = torch.randn(2, latent_ch, 128, 256)
               dummy_t = torch.tensor([500.0, 500.0])
               dummy_hidden = torch.randn(2, 48, 2048)
               dummy_enc_mask = torch.ones(2, 48, dtype=torch.long)
               dummy_time_ids = torch.tensor([[1024.0, 1024.0], [1024.0, 1024.0]])
+
+              batch = Dim("batch", min=1)
+              seq = Dim("seq", min=1)
+              dynamic_shapes = {
+                  "sample":                {0: batch},
+                  "timestep":              {0: batch},
+                  "encoder_hidden_states": {0: batch, 1: seq},
+                  "encoder_attention_mask":{0: batch, 1: seq},
+                  "time_ids":              {0: batch},
+              }
+
               with torch.no_grad():
                   torch.onnx.export(
                       UNetWrapper(unet),
@@ -346,21 +359,15 @@ jobs:
                       input_names=["sample", "timestep", "encoder_hidden_states",
                                    "encoder_attention_mask", "time_ids"],
                       output_names=["out_sample"],
-                      dynamic_axes={
-                          "sample":               {0: "batch"},
-                          "encoder_hidden_states":{0: "batch", 1: "sequence"},
-                          "encoder_attention_mask":{0: "batch", 1: "sequence"},
-                          "time_ids":             {0: "batch"},
-                      },
-                      opset_version=17,
-                      dynamo=False,
-                      )
+                      dynamo=True,
+                      dynamic_shapes=dynamic_shapes,
+                      opset_version=18,
+                  )
               unet_exported = True
               print(f"✓ DreamLite UNet: {os.path.getsize('dreamlite_onnx/unet.onnx')//1024//1024} MB")
               del unet
           except Exception as e:
               print(f"✗ DreamLite UNet export failed: {e}")
-
           # ── 4. Tokenizer + manifest ───────────────────────────────────────────
           # FIX: the Android app had no real tokenizer at all — ImageGenerator.kt's
           # tokenize() was a ~35-word hardcoded dictionary plus a hash fallback for
