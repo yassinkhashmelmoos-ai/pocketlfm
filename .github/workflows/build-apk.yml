@@ -41,19 +41,20 @@ jobs:
 
           echo "huggingface-hub>=0.34.0,<1.0" > /tmp/hf_constraints.txt
 
-            pip install --no-cache-dir -c /tmp/hf_constraints.txt \
+          pip install --no-cache-dir -c /tmp/hf_constraints.txt \
             "transformers==4.57.3" \
             accelerate \
             onnx \
             onnxscript \
             "onnxruntime==1.18.0" \
+            "numpy<2" \
             httpx
 
           pip install pip --no-deps --force-reinstall \
             "git+https://github.com/huggingface/diffusers.git"
 
           pip install --no-cache-dir --force-reinstall --no-deps -c /tmp/hf_constraints.txt \
-            "huggingface-hub>=0.34.0,<1.0"
+            "pip>=0.34.0,<1.0"
 
           python -c "import huggingface_hub; from packaging.version import Version; v=huggingface_hub.__version__; assert Version(v) < Version('1.0.0'), f'hf-hub {v} is >=1.0'; print(f'hf-hub {v} OK')"
       # FIX: added per the user's own debugging — diffusers-from-main (needed for
@@ -508,7 +509,9 @@ jobs:
                           "encoder_attention_mask":{0: "batch", 1: "sequence"},
                           "time_ids":             {0: "batch"},
                       },
-                      opset_version=17)
+                      opset_version=17,
+                      dynamo=False,
+                      )
               unet_exported = True
               print(f"✓ DreamLite UNet: {os.path.getsize('dreamlite_onnx/unet.onnx')//1024//1024} MB")
               del unet
