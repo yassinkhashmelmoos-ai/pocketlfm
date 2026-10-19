@@ -359,9 +359,15 @@ jobs:
                       input_names=["sample", "timestep", "encoder_hidden_states",
                                    "encoder_attention_mask", "time_ids"],
                       output_names=["out_sample"],
-                      dynamo=True,
-                      dynamic_shapes=dynamic_shapes,
-                      opset_version=18,
+                      dynamic_axes={
+                          "sample":                {0: "batch"},
+                          "encoder_hidden_states": {0: "batch", 1: "sequence"},
+                          "encoder_attention_mask":{0: "batch", 1: "sequence"},
+                          "time_ids":              {0: "batch"},
+                      },
+                      opset_version=17,
+                      dynamo=False,
+                      autograd_inlining=False,
                   )
               unet_exported = True
               print(f"✓ DreamLite UNet: {os.path.getsize('dreamlite_onnx/unet.onnx')//1024//1024} MB")
