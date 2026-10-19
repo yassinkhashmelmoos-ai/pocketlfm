@@ -496,6 +496,7 @@ jobs:
                   },
                   opset_version=17,
                   dynamo=False,
+                  autograd_inlining=False,
               )
           del qwen
           gc.collect()
@@ -566,6 +567,7 @@ jobs:
                       },
                       opset_version=17,
                       dynamo=False,
+                      autograd_inlining=False,
                   )
               del qwen_vision
               gc.collect()
