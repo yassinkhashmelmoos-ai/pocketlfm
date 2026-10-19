@@ -112,6 +112,7 @@ class ImageGenerator(private val context: Context) {
     private val outputDir = File(context.filesDir, OUTPUT_DIR).also { it.mkdirs() }
     private val onnxEnv   = OrtEnvironment.getEnvironment()
     private var textEncoderSession: OrtSession? = null
+    private var textEncoderEditSession: OrtSession? = null  // FIX: new — vision+text path for true diptych editing
     private var vaeDecoderSession: OrtSession?  = null
     private var vaeEncoderSession: OrtSession?   = null   // FIX: new — needed for image editing; the old code never exported or loaded one
     private var unetSession: OrtSession?         = null   // core denoising network
@@ -138,6 +139,16 @@ class ImageGenerator(private val context: Context) {
         "quantity, text, spatial relationships of the objects and background:<|im_end|>\n" +
         "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
     private var promptTemplateDropIdx = 34
+    // FIX: edit mode's real template and drop_idx — copied from DreamLitePipeline's
+    // actual prompt_template_encode_edit / _edit_start_idx (also read directly from
+    // source). Notably includes a vision placeholder the processor expands with real
+    // image patch embeddings — this is why editing needs QwenVisionPreprocessor.
+    private var editPromptTemplate = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, " +
+        "texture, objects, background), then explain how the user's text instruction should alter " +
+        "or modify the image. Generate a new image that meets the user's requirements while maintaining " +
+        "consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n" +
+        "<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
+    private var editPromptTemplateDropIdx = 64
     // Dynamic-shift schedule constants from FlowMatchEulerDiscreteScheduler's config
     // (base_image_seq_len, max_image_seq_len, base_shift, max_shift) — see calculateShift().
     private var shiftBaseSeqLen = 256f
@@ -213,7 +224,8 @@ class ImageGenerator(private val context: Context) {
             // FIX: added vae_encoder.onnx (image editing needs to encode a source
             // image into latents — the old code never bundled or loaded one at all)
             // and tokenizer.json (Qwen3-VL's real BPE tokenizer, see BpeTokenizer.kt).
-            val onnxFiles = listOf("vae_decoder.onnx", "vae_encoder.onnx", "text_encoder.onnx", "unet.onnx", "tokenizer.json")
+            val onnxFiles = listOf("vae_decoder.onnx", "vae_encoder.onnx", "text_encoder.onnx",
+                "text_encoder_edit.onnx", "unet.onnx", "tokenizer.json")
             val assetList = context.assets.list("") ?: emptyArray()
             for (name in onnxFiles) {
                 if (assetList.contains(name)) {
@@ -310,6 +322,16 @@ class ImageGenerator(private val context: Context) {
                 textEncoderSession = loadSessionSafely("text_encoder.onnx", teFile, opts)
                 vaeDecoderSession  = loadSessionSafely("vae_decoder.onnx",  vaeFile, opts)
 
+                // FIX: new, and deliberately NOT part of onnxReady below — true
+                // diptych editing is the least-verified part of this whole pipeline
+                // (see QwenVisionPreprocessor's honest flag), so a failure here
+                // should only disable editing specifically, never block plain
+                // generation, which doesn't depend on this at all.
+                val editFile = File(context.filesDir, "text_encoder_edit.onnx")
+                if (editFile.exists()) {
+                    textEncoderEditSession = loadSessionSafely("text_encoder_edit.onnx", editFile, opts)
+                }
+
                 // FIX: the CI export step for unet.onnx (see build-apk.yml) only
                 // copies the file named "unet.onnx" — a full SD1.5 UNet is ~3.4GB,
                 // over the single-file ONNX size limit, so torch.onnx.export very
@@ -373,6 +395,10 @@ class ImageGenerator(private val context: Context) {
     }
 
     fun isOfflineAvailable() = onnxReady
+    // FIX: new — true diptych editing needs its own encoder on top of everything
+    // onnxReady already requires; checked separately so a missing/failed edit
+    // encoder only disables editing, not generation.
+    fun isEditAvailable() = onnxReady && textEncoderEditSession != null
 
     // ── Main generation entry point ───────────────────────────────────────────
 
@@ -413,21 +439,58 @@ class ImageGenerator(private val context: Context) {
         return try {
             Log.i(TAG, "Offline generation: $NUM_STEPS steps, CFG=$currentGuidanceScale")
 
-            // Step 1: Encode text (real Qwen3-VL encoding now, see encodeText())
+            // FIX: new — true diptych-conditioned editing, per the user's explicit
+            // request, replacing the old "always zero right-half, image only used
+            // as a noisy starting point" behavior. Mirrors DreamLitePipeline's
+            // task=="edit" branch exactly (verified from source): 3-way batch
+            // [uncond, image-only, text+image] instead of generate's 2-way
+            // [uncond, cond], real VAE-encoded source latents in the right diptych
+            // half for 2 of those 3 batches (zeros for the pure-uncond one), and a
+            // triple-term CFG combination instead of the single linear blend.
+            // Falls back to generate-mode's img2img-style behavior (with a log
+            // warning) if the edit encoder isn't available — see isEditAvailable().
+            val isEditMode = sourceImage != null && textEncoderEditSession != null
+            if (sourceImage != null && !isEditMode) {
+                Log.w(TAG, "Source image given but edit encoder unavailable — using img2img-style noising instead of true diptych editing")
+            }
+            val batchSize = if (isEditMode) 3 else 2
+
+            // Step 1: Encode text/vision conditioning
             progressCallback?.invoke(1, NUM_STEPS + 3)
-            val textEmb = encodeText(prompt)
-            val negEmb  = encodeText(negativePrompt)
+            val textEmb: TextEmbedding
+            val negEmb: TextEmbedding
+            if (isEditMode) {
+                // Edit mode: negative_prompt appears TWICE in the real pipeline's
+                // prompt list (once for the pure-uncond slot, once for the
+                // image-only slot) — both are the SAME embedding here, reused for
+                // both batch 0 and batch 1 below, matching that exactly.
+                textEmb = encodeTextWithImage(prompt, sourceImage!!)
+                negEmb  = encodeTextWithImage(negativePrompt, sourceImage)
+            } else {
+                textEmb = encodeText(prompt)
+                negEmb  = encodeText(negativePrompt)
+            }
             // Cond/uncond will generally tokenize to different lengths after the
             // template+drop_idx step — pad both to the longer one so they can share
             // one batched UNet call, with encoder_attention_mask marking real vs pad.
             val condSeqLen = maxOf(textEmb.seqLen, negEmb.seqLen)
 
-            // Step 2: Initialize latent (random noise or from source image)
+            // Step 2: Initialize latent (random noise, or the source image's own
+            // latents as the starting point when editing — matches the real
+            // pipeline's "latents = image_latents" initialization for img2img-style
+            // starting noise level, separate from the diptych right-half below)
             progressCallback?.invoke(2, NUM_STEPS + 3)
             var latent = if (sourceImage != null)
                 imageToLatent(sourceImage)
             else
                 randomLatent()
+
+            // Real source-image latents for the diptych's right half (edit mode
+            // only) — separate from `latent` above, which is the thing actually
+            // being denoised; this is the fixed "reference" half the UNet attends
+            // to throughout all NUM_STEPS, re-encoded once up front.
+            val zeroImageLatents = FloatArray(latentChannels * LATENT_DIM * LATENT_DIM)
+            val realImageLatents = if (isEditMode) imageToLatent(sourceImage!!) else zeroImageLatents
 
             // requires UNet for real images — generateOffline() should never even be
             // entered without one (onnxReady requires unetSession != null; see its FIX
@@ -466,6 +529,16 @@ class ImageGenerator(private val context: Context) {
             val halfWidthStride = LATENT_DIM                        // columns per side of the diptych
             val fullLatentSize  = latentChannels * latentPlaneSize  // one unbatched image, all channels
 
+            // FIX: per-batch embedding/image-latent assignment, verified against the
+            // real pipeline's exact construction: generate mode batches
+            // [uncond, cond]; edit mode batches [uncond, image-only, text+image] —
+            // note negative_prompt's embedding is reused for BOTH batch 0 and batch
+            // 1 in edit mode (same negative text, condaitioned on no-image vs.
+            // image respectively via the right-half source below), not re-encoded.
+            val embeddingsPerBatch = if (isEditMode) listOf(negEmb, negEmb, textEmb) else listOf(negEmb, textEmb)
+            val rightHalfPerBatch  = if (isEditMode) listOf(zeroImageLatents, realImageLatents, realImageLatents)
+                                     else listOf(zeroImageLatents, zeroImageLatents)
+
             for (step in 0 until NUM_STEPS) {
                 progressCallback?.invoke(step + 3, NUM_STEPS + 3)
 
@@ -475,39 +548,47 @@ class ImageGenerator(private val context: Context) {
 
                 // FIX: DreamLite's UNet always takes a double-width "diptych" input —
                 // real latents concatenated with a same-shape block along the width
-                // axis (the source-image latents when editing; zeros for plain
-                // generation, which is the only mode implemented here — see editImage()
-                // for the gap). Batch 0 = uncond, batch 1 = cond, each itself
-                // double-width, so shape is [2, C, H, 2W].
-                val modelInput = FloatArray(2 * latentChannels * LATENT_DIM * (2 * halfWidthStride))
-                for (b in 0 until 2) for (c in 0 until latentChannels) for (y in 0 until LATENT_DIM) {
-                    val srcRowBase = c * latentPlaneSize + y * LATENT_DIM
-                    val dstRowBase = (b * latentChannels + c) * LATENT_DIM * (2 * halfWidthStride) + y * (2 * halfWidthStride)
-                    for (x in 0 until LATENT_DIM) modelInput[dstRowBase + x] = latent[srcRowBase + x]
-                    // right half (x in [halfWidthStride, 2*halfWidthStride)) stays zero — generate mode
+                // axis. Right half is zero for generate mode, or the real
+                // VAE-encoded source image for edit mode's image-conditioned
+                // batches (see rightHalfPerBatch above) — this replaces the old
+                // always-zero behavior, which is the actual "true diptych
+                // conditioning" fix the user asked for.
+                val modelInput = FloatArray(batchSize * latentChannels * LATENT_DIM * (2 * halfWidthStride))
+                for (b in 0 until batchSize) {
+                    val rightHalf = rightHalfPerBatch[b]
+                    for (c in 0 until latentChannels) for (y in 0 until LATENT_DIM) {
+                        val srcRowBase = c * latentPlaneSize + y * LATENT_DIM
+                        val dstRowBase = (b * latentChannels + c) * LATENT_DIM * (2 * halfWidthStride) + y * (2 * halfWidthStride)
+                        for (x in 0 until LATENT_DIM) {
+                            modelInput[dstRowBase + x] = latent[srcRowBase + x]
+                            modelInput[dstRowBase + halfWidthStride + x] = rightHalf[srcRowBase + x]
+                        }
+                    }
                 }
 
-                // Padded, batched conditioning: batch 0 = negative/uncond, batch 1 = positive/cond
-                val hiddenStates = FloatArray(2 * condSeqLen * textHiddenSize)
-                val attnMask = LongArray(2 * condSeqLen)
-                negEmb.data.copyInto(hiddenStates, 0, 0, minOf(negEmb.data.size, condSeqLen * textHiddenSize))
-                textEmb.data.copyInto(hiddenStates, condSeqLen * textHiddenSize, 0, minOf(textEmb.data.size, condSeqLen * textHiddenSize))
-                for (i in 0 until negEmb.seqLen) attnMask[i] = 1L
-                for (i in 0 until textEmb.seqLen) attnMask[condSeqLen + i] = 1L
+                // Padded, batched conditioning — one slot per embeddingsPerBatch entry.
+                val hiddenStates = FloatArray(batchSize * condSeqLen * textHiddenSize)
+                val attnMask = LongArray(batchSize * condSeqLen)
+                for (b in 0 until batchSize) {
+                    val emb = embeddingsPerBatch[b]
+                    emb.data.copyInto(hiddenStates, b * condSeqLen * textHiddenSize, 0, minOf(emb.data.size, condSeqLen * textHiddenSize))
+                    for (i in 0 until emb.seqLen) attnMask[b * condSeqLen + i] = 1L
+                }
+
+                val timestepArr = FloatArray(batchSize) { timestepValue }
+                val timeIdsArr  = FloatArray(batchSize * 2) { RESOLUTION.toFloat() }
 
                 val sampleTensor = OnnxTensor.createTensor(onnxEnv,
                     java.nio.FloatBuffer.wrap(modelInput),
-                    longArrayOf(2, latentChannels.toLong(), LATENT_DIM.toLong(), (2L * halfWidthStride)))
+                    longArrayOf(batchSize.toLong(), latentChannels.toLong(), LATENT_DIM.toLong(), (2L * halfWidthStride)))
                 val timestepTensor = OnnxTensor.createTensor(onnxEnv,
-                    java.nio.FloatBuffer.wrap(floatArrayOf(timestepValue, timestepValue)), longArrayOf(2))
+                    java.nio.FloatBuffer.wrap(timestepArr), longArrayOf(batchSize.toLong()))
                 val hiddenTensor = OnnxTensor.createTensor(onnxEnv,
-                    java.nio.FloatBuffer.wrap(hiddenStates), longArrayOf(2, condSeqLen.toLong(), textHiddenSize.toLong()))
+                    java.nio.FloatBuffer.wrap(hiddenStates), longArrayOf(batchSize.toLong(), condSeqLen.toLong(), textHiddenSize.toLong()))
                 val maskTensor = OnnxTensor.createTensor(onnxEnv,
-                    java.nio.LongBuffer.wrap(attnMask), longArrayOf(2, condSeqLen.toLong()))
+                    java.nio.LongBuffer.wrap(attnMask), longArrayOf(batchSize.toLong(), condSeqLen.toLong()))
                 val timeIdsTensor = OnnxTensor.createTensor(onnxEnv,
-                    java.nio.FloatBuffer.wrap(floatArrayOf(
-                        RESOLUTION.toFloat(), RESOLUTION.toFloat(), RESOLUTION.toFloat(), RESOLUTION.toFloat())),
-                    longArrayOf(2, 2))
+                    java.nio.FloatBuffer.wrap(timeIdsArr), longArrayOf(batchSize.toLong(), 2))
 
                 val output = unet.run(mapOf(
                     "sample" to sampleTensor, "timestep" to timestepTensor,
@@ -520,27 +601,41 @@ class ImageGenerator(private val context: Context) {
                     ?: throw IllegalStateException("UNet output unexpected type: ${output[0].value?.javaClass?.simpleName}")
 
                 // FIX: classifier-free guidance combines velocities here, not noise —
-                // same linear-combination formula, different physical quantity. Output
-                // is also double-width; only the left `halfWidthStride` columns (the
-                // actual generated-image half, per the pipeline's own
-                // noise_pred[..., :latents.shape[-1]] slicing) are used — the right
-                // half corresponds to the (here, zero/unused) conditioning-image side.
+                // same linear-combination formula(s), different physical quantity.
+                // Output is also double-width; only the left `halfWidthStride`
+                // columns are used, per the pipeline's own
+                // noise_pred[..., :latents.shape[-1]] slicing.
+                //
+                // Generate mode: standard 2-term CFG, as before.
+                // Edit mode: the real triple-CFG formula (verified from source) —
+                //   pred = uncond + guidance_scale*(text - image_only)
+                //                 + image_guidance_scale*(image_only - uncond)
+                // NOT the same as generate's formula with an extra term bolted on —
+                // note text/image_only appear symmetrically swapped from the naive
+                // guess, confirmed by direct source read, not inferred.
                 val dt = sigmaNext - sigma
                 latent = FloatArray(fullLatentSize) { i ->
                     val ch  = i / latentPlaneSize
                     val pos = i % latentPlaneSize
                     val y   = pos / LATENT_DIM
                     val x   = pos % LATENT_DIM
-                    val uncond = noisePred4d[0][ch][y][x]
-                    val cond   = noisePred4d[1][ch][y][x]
-                    val guidedVelocity = uncond + currentGuidanceScale * (cond - uncond)
+                    val guidedVelocity = if (isEditMode) {
+                        val uncond    = noisePred4d[0][ch][y][x]
+                        val imageOnly = noisePred4d[1][ch][y][x]
+                        val textImage = noisePred4d[2][ch][y][x]
+                        uncond + currentGuidanceScale * (textImage - imageOnly) + IMG_CFG * (imageOnly - uncond)
+                    } else {
+                        val uncond = noisePred4d[0][ch][y][x]
+                        val cond   = noisePred4d[1][ch][y][x]
+                        uncond + currentGuidanceScale * (cond - uncond)
+                    }
                     latent[i] + dt * guidedVelocity   // Euler step
                 }
 
                 sampleTensor.close(); timestepTensor.close(); hiddenTensor.close()
                 maskTensor.close(); timeIdsTensor.close(); output[0].close()
 
-                if (step % 10 == 0) Log.d(TAG, "Flow-match step ${step+1}/$NUM_STEPS (sigma=$sigma)")
+                if (step % 10 == 0) Log.d(TAG, "Flow-match step ${step+1}/$NUM_STEPS (sigma=$sigma, edit=$isEditMode)")
             }
 
             // Step 4: Decode latent → image via VAE
@@ -595,16 +690,13 @@ class ImageGenerator(private val context: Context) {
 
     // ── Image editing ─────────────────────────────────────────────────────────
 
-    // FIX / HONEST GAP: DreamLite's real instruction-editing uses a different prompt
-    // template ("[Edit]: A diptych with two side-by-side images...", not the
-    // "[Generate]" one — confirmed in DreamLitePipeline's source during this work)
-    // AND places the source image's real latents in the UNet's right-hand diptych
-    // half (see generateOffline()'s FIX comment — it only fills that half with
-    // zeros, the generate-mode path). This still routes through generate(), which
-    // uses imageToLatent() as a noisy img2img-style starting point only — closer to
-    // SD-style img2img than DreamLite's actual trained editing behavior. Real
-    // instruction editing (conditioning on BOTH the template and the right-half
-    // latents together) is the next piece, not implemented in this pass.
+    // FIX: now routes through true diptych-conditioned editing when the edit
+    // encoder is available (isEditMode in generateOffline()) — the real edit
+    // template with the vision placeholder, QwenVisionPreprocessor patchifying the
+    // source image, and the real source latents in the UNet's right diptych half,
+    // combined via the actual triple-CFG formula. Falls back to generate()'s plain
+    // img2img-style noising (source image as a starting point only, no diptych
+    // conditioning) if the edit encoder failed to load/export — see isEditAvailable().
     suspend fun editImage(
         imageId: Int,
         instruction: String,
@@ -676,6 +768,78 @@ class ImageGenerator(private val context: Context) {
             TextEmbedding(flat, kept.size)
         } catch (e: Exception) {
             Log.w(TAG, "Text encode error: ${e.message}")
+            TextEmbedding(FloatArray(textHiddenSize), 1)
+        }
+    }
+
+    // FIX: new — the vision-conditioned counterpart to encodeText(), for true
+    // diptych editing. Mirrors encode_prompt(mode="edit", ...): format with the
+    // edit template (real text, verified above), patchify the source image
+    // (QwenVisionPreprocessor — see its honest flag), and — confirmed in
+    // processing_qwen3_vl.py's own token-expansion logic — replace the template's
+    // single <|image_pad|> placeholder with (numPatches / merge_size²) repeats of
+    // that same token, matching how many image tokens the vision tower actually
+    // produces after its merge-reduction step. Getting this count wrong would
+    // desync the text/image token alignment the model expects.
+    private fun encodeTextWithImage(text: String, sourceImage: Bitmap): TextEmbedding {
+        val session = textEncoderEditSession
+        val tok = bpeTokenizer
+        if (session == null || tok == null) return TextEmbedding(FloatArray(textHiddenSize), 1)
+        return try {
+            val patches = QwenVisionPreprocessor.patchify(sourceImage)
+            val imagePadId = tok.specialTokenId("<|image_pad|>")
+            if (imagePadId == null) {
+                Log.w(TAG, "No <|image_pad|> token in tokenizer vocab — can't build edit conditioning")
+                return TextEmbedding(FloatArray(textHiddenSize), 1)
+            }
+            val mergedTokenCount = (patches.gridT * patches.gridH * patches.gridW) / 4  // merge_size^2 = 4
+
+            val formatted = editPromptTemplate.replace("{}", text)
+            val rawIds = tok.encode(formatted)
+            val padPos = rawIds.indexOf(imagePadId)
+            val ids = if (padPos < 0) {
+                Log.w(TAG, "<|image_pad|> not found in tokenized edit template — template/tokenizer mismatch")
+                rawIds
+            } else {
+                IntArray(rawIds.size - 1 + mergedTokenCount).also { out ->
+                    rawIds.copyInto(out, 0, 0, padPos)
+                    for (i in 0 until mergedTokenCount) out[padPos + i] = imagePadId
+                    rawIds.copyInto(out, padPos + mergedTokenCount, padPos + 1, rawIds.size)
+                }
+            }
+            if (ids.size <= editPromptTemplateDropIdx) {
+                return TextEmbedding(FloatArray(textHiddenSize), 1)
+            }
+
+            val inputIds = LongArray(ids.size) { ids[it].toLong() }
+            val attnMask = LongArray(ids.size) { 1L }
+            val idsTensor   = OnnxTensor.createTensor(onnxEnv, java.nio.LongBuffer.wrap(inputIds), longArrayOf(1, ids.size.toLong()))
+            val maskTensor  = OnnxTensor.createTensor(onnxEnv, java.nio.LongBuffer.wrap(attnMask), longArrayOf(1, ids.size.toLong()))
+            val pixelTensor = OnnxTensor.createTensor(onnxEnv, java.nio.FloatBuffer.wrap(patches.pixelValues),
+                longArrayOf((patches.gridT.toLong() * patches.gridH * patches.gridW), 3L * 2 * 14 * 14))
+            val gridTensor  = OnnxTensor.createTensor(onnxEnv,
+                java.nio.LongBuffer.wrap(longArrayOf(patches.gridT.toLong(), patches.gridH.toLong(), patches.gridW.toLong())),
+                longArrayOf(1, 3))
+
+            val output = session.run(mapOf(
+                "input_ids" to idsTensor, "attention_mask" to maskTensor,
+                "pixel_values" to pixelTensor, "image_grid_thw" to gridTensor))
+            val rawOutput = output[0].value
+            idsTensor.close(); maskTensor.close(); pixelTensor.close(); gridTensor.close()
+
+            @Suppress("UNCHECKED_CAST")
+            val arr3d = rawOutput as? Array<Array<FloatArray>>
+                ?: throw IllegalStateException("Edit text encoder returned unexpected type: ${rawOutput?.javaClass?.simpleName}")
+            output[0].close()
+
+            val kept = arr3d[0].drop(editPromptTemplateDropIdx)
+            if (kept.isEmpty()) return TextEmbedding(FloatArray(textHiddenSize), 1)
+            val hiddenSize = kept[0].size
+            val flat = FloatArray(kept.size * hiddenSize)
+            kept.forEachIndexed { t, row -> row.copyInto(flat, t * hiddenSize) }
+            TextEmbedding(flat, kept.size)
+        } catch (e: Exception) {
+            Log.w(TAG, "Edit text encode error: ${e.message}")
             TextEmbedding(FloatArray(textHiddenSize), 1)
         }
     }
@@ -979,6 +1143,7 @@ class ImageGenerator(private val context: Context) {
     fun release() {
         // FIX: this never closed unetSession at all, and vaeEncoderSession is new.
         textEncoderSession?.close()
+        textEncoderEditSession?.close()
         vaeDecoderSession?.close()
         vaeEncoderSession?.close()
         unetSession?.close()
