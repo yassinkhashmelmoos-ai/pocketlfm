@@ -35,6 +35,7 @@ jobs:
 
       - name: Install Python deps
         run: |
+          python -m pip install --upgrade pip
           pip install Pillow
           # FIX: torch 2.3.1 / transformers 4.40.2 / diffusers 0.27.2 predate DreamLite
           # and Qwen3-VL entirely (both are 2026 architectures) — those pins could
@@ -44,78 +45,25 @@ jobs:
           # card warns that >=5.0 produces visible artifacts with its Qwen3-VL
           # encoder). DreamLitePipeline/DreamLiteUNetModel aren't in a tagged
           # diffusers release yet, so diffusers must come from the main branch.
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install "transformers==4.57.3" accelerate onnx "onnxruntime==1.18.0"
+          # torch==2.14.1 and the huggingface-hub floor below are pinned per the
+          # user's own debugging of the previous run — diffusers-from-main drifted
+          # ahead of what an older huggingface-hub exposes; httpx is needed by the
+          # compatibility shim in the next step.
+          pip install "torch==2.14.1" torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-cache-dir --upgrade \
+            "huggingface-hub>=0.34.0,<1.0" \
+            "transformers==4.57.3" \
+            accelerate onnx "onnxruntime==1.18.0" httpx
           pip install "git+https://github.com/huggingface/diffusers.git"
-          pip install "huggingface_hub>=0.25.0"
 
-      - name: Generate mipmap icon sizes
-        run: |
-          python3 << 'PYEOF'
-          from PIL import Image
-          import os
-          src = "lfm25/app/src/main/assets/app_icon_source.jpg"
-          if not os.path.exists(src):
-              print("WARNING: app_icon_source.jpg not found, skipping icons")
-          else:
-              sizes = {"mdpi":48,"hdpi":72,"xhdpi":96,"xxhdpi":144,"xxxhdpi":192}
-              img = Image.open(src).convert("RGBA")
-              for name, size in sizes.items():
-                  d = f"lfm25/app/src/main/res/mipmap-{name}"
-                  os.makedirs(d, exist_ok=True)
-                  r = img.resize((size,size), Image.LANCZOS)
-                  r.save(f"{d}/ic_launcher.webp","WEBP")
-                  r.save(f"{d}/ic_launcher_round.webp","WEBP")
-                  print(f"✓ {name} {size}x{size}")
-          PYEOF
-
-      - name: Download LFM2.5-VL model
-        run: |
-          mkdir -p lfm25/app/src/main/assets
-          wget -q --show-progress \
-            "https://huggingface.co/LiquidAI/LFM2.5-VL-450M-GGUF/resolve/main/LFM2.5-VL-450M-Q4_K_M.gguf" \
-            -O lfm25/app/src/main/assets/model.gguf
-          echo "LFM model: $(du -sh lfm25/app/src/main/assets/model.gguf)"
-
-      # FIX: this entire step used to silently abandon DreamLite and export a
-      # plain full-size SD1.5 UNet + mismatched SDXL VAE instead (see the old
-      # comments this replaces). This version actually loads DreamLite-base's
-      # real UNet and Qwen3-VL-2B-Instruct's real text encoder (per the user's
-      # explicit instruction to follow Gemini's component choices), grounded in
-      # the actual DreamLitePipeline/scheduler source read directly from the
-      # installed diffusers package rather than guessed — exact prompt template,
-      # exact drop-index, exact flow-matching math, exact CFG formula. See the
-      # per-section comments below for what's confirmed vs. best-effort.
-      #
-      # Known real risk, stated plainly rather than hidden: exporting a 2B-
-      # parameter model on a standard GitHub-hosted runner (~7GB RAM) is tight.
-      # The text-encoder export is wrapped so if it fails (OOM, timeout), the
-      # UNet + VAE (the part closest to validated by community precedent) still
-      # get bundled, and ImageGenerator.kt's existing per-session loading guard
-      # (see FIX comments there) degrades to the online fallback rather than
-      # crashing if text_encoder.onnx ends up missing.
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install "torch==2.14.1" --index-url https://download.pytorch.org/whl/cpu
-          pip install --no-cache-dir --upgrade \
-            "huggingface-hub>=0.34.0,<1.0" \
-            "transformers==4.57.3" \
-            accelerate \
-            "onnxruntime>=1.18.0"
-          pip install torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install --no-cache-dir --upgrade \
-            "huggingface-hub>=0.34.0,<1.0" \
-            "transformers==4.57.3" \
-            accelerate \
-            "onnxruntime>=1.18.0" \
-            pip
-                pip install --no-cache-dir --upgrade \
-            "huggingface-hub>=0.34.0,<1.0" \
-            "transformers==4.57.3" \
-            accelerate \
-            "onnxruntime>=1.18.0" \
-            httpx
+      # FIX: added per the user's own debugging — diffusers-from-main (needed for
+      # DreamLitePipeline/DreamLiteUNetModel, neither tagged in a release yet) calls
+      # a few huggingface_hub APIs (resolve_revision, RevisionResolutionError,
+      # get_cached_repo_tree) that the pinned huggingface-hub version above doesn't
+      # have yet. This patches diffusers/utils/hub_utils.py with no-op/pass-through
+      # stubs for exactly those, plus broad __getattr__ fallbacks for anything else
+      # missing, so pipeline loading doesn't hard-fail on an AttributeError before
+      # ever reaching the actual export code.
       - name: Patch diffusers for huggingface_hub compatibility
         run: |
           SHIM=/tmp/hub_compat_shim.py
@@ -191,8 +139,52 @@ jobs:
               f.write(shim + text)
           print("Patched " + path)
           '
-          
-     
+
+      - name: Generate mipmap icon sizes
+        run: |
+          python3 << 'PYEOF'
+          from PIL import Image
+          import os
+          src = "lfm25/app/src/main/assets/app_icon_source.jpg"
+          if not os.path.exists(src):
+              print("WARNING: app_icon_source.jpg not found, skipping icons")
+          else:
+              sizes = {"mdpi":48,"hdpi":72,"xhdpi":96,"xxhdpi":144,"xxxhdpi":192}
+              img = Image.open(src).convert("RGBA")
+              for name, size in sizes.items():
+                  d = f"lfm25/app/src/main/res/mipmap-{name}"
+                  os.makedirs(d, exist_ok=True)
+                  r = img.resize((size,size), Image.LANCZOS)
+                  r.save(f"{d}/ic_launcher.webp","WEBP")
+                  r.save(f"{d}/ic_launcher_round.webp","WEBP")
+                  print(f"✓ {name} {size}x{size}")
+          PYEOF
+
+      - name: Download LFM2.5-VL model
+        run: |
+          mkdir -p lfm25/app/src/main/assets
+          wget -q --show-progress \
+            "https://huggingface.co/LiquidAI/LFM2.5-VL-450M-GGUF/resolve/main/LFM2.5-VL-450M-Q4_K_M.gguf" \
+            -O lfm25/app/src/main/assets/model.gguf
+          echo "LFM model: $(du -sh lfm25/app/src/main/assets/model.gguf)"
+
+      # FIX: this entire step used to silently abandon DreamLite and export a
+      # plain full-size SD1.5 UNet + mismatched SDXL VAE instead (see the old
+      # comments this replaces). This version actually loads DreamLite-base's
+      # real UNet and Qwen3-VL-2B-Instruct's real text encoder (per the user's
+      # explicit instruction to follow Gemini's component choices), grounded in
+      # the actual DreamLitePipeline/scheduler source read directly from the
+      # installed diffusers package rather than guessed — exact prompt template,
+      # exact drop-index, exact flow-matching math, exact CFG formula. See the
+      # per-section comments below for what's confirmed vs. best-effort.
+      #
+      # Known real risk, stated plainly rather than hidden: exporting a 2B-
+      # parameter model on a standard GitHub-hosted runner (~7GB RAM) is tight.
+      # The text-encoder export is wrapped so if it fails (OOM, timeout), the
+      # UNet + VAE (the part closest to validated by community precedent) still
+      # get bundled, and ImageGenerator.kt's existing per-session loading guard
+      # (see FIX comments there) degrades to the online fallback rather than
+      # crashing if text_encoder.onnx ends up missing.
       - name: Export ONNX models for offline image generation
         run: |
           python3 << 'PYEOF'
@@ -200,31 +192,49 @@ jobs:
           print(f"torch version: {torch.__version__}")
           print("=== ONNX Export Pipeline (DreamLite-base + Qwen3-VL-2B + SDXL-VAE) ===")
 
-          from diffusers import AutoencoderKL, DreamLitePipeline
+          from diffusers import AutoencoderKL, DreamLiteUNetModel
+          from transformers import AutoTokenizer
           import numpy as np
 
           os.makedirs("dreamlite_onnx", exist_ok=True)
           manifest = {"version": "3.0", "components": [], "params": {}}
 
-          # ── 0. Load DreamLite-base's real pipeline (UNet + Qwen3-VL text encoder) ──
-          # FIX: the old code never did this — it only ever downloaded DreamLite's
-          # *configs* (explicitly excluding weights) and exported a substitute SD1.5
-          # UNet instead. DreamLitePipeline / DreamLiteUNetModel are real classes
-          # confirmed present in diffusers' main branch; the earlier "incompatible
-          # with standard UNet2DConditionModel" failure was from trying to load this
-          # checkpoint with the generic class instead of its own subclass.
-          print("\n[0/4] Loading carlofkl/DreamLite-base (this is the big one)...")
-          pipe = DreamLitePipeline.from_pretrained(
-              "carlofkl/DreamLite-base", revision="diffusers", torch_dtype=torch.float32)
-          unet = pipe.unet
+          # ── 0. Load DreamLite-base's UNet directly (not the full pipeline) ────────
+          # FIX: the exit-143 (SIGTERM, almost certainly the runner's OOM handling)
+          # from the previous run happened right after "Loading pipeline components:
+          # 6/6" — i.e. inside DreamLitePipeline.from_pretrained() itself.
+          # DiffusionPipeline.from_pretrained() loads *every* registered component
+          # before returning, which for this pipeline means a full fp32 copy of the
+          # 2B-parameter Qwen3-VL text encoder gets loaded as pipe.text_encoder —
+          # on top of the *separate* Qwen3-VL load this script does a few lines
+          # below for the actual export. That's two full 2B-parameter models in
+          # memory at once, ~16GB+ in fp32, against a runner with ~7GB RAM; the
+          # earlier del pipe/gc.collect() came too late, since the peak already
+          # happened inside from_pretrained() before that line could ever run.
+          #
+          # Fix: load only DreamLiteUNetModel directly via its own subfolder (the
+          # standard diffusers convention — every component's subfolder matches its
+          # model_index.json attribute name) instead of the whole pipeline. This
+          # never touches DreamLite's own bundled text_encoder at all — this script
+          # replaces it with a standalone Qwen3-VL load further down regardless, so
+          # that copy was always redundant, not just mistimed.
+          print("\n[0/4] Loading carlofkl/DreamLite-base's UNet only (not the full pipeline)...")
+          unet = DreamLiteUNetModel.from_pretrained(
+              "carlofkl/DreamLite-base", revision="diffusers", subfolder="unet", dtype=torch.float32)
           unet.eval()
-          text_encoder = pipe.text_encoder
-          tokenizer = pipe.tokenizer
           cross_attention_dim = unet.config.cross_attention_dim
           if isinstance(cross_attention_dim, (list, tuple)):
               cross_attention_dim = cross_attention_dim[-1]
           print(f"  UNet cross_attention_dim (expected text hidden size): {cross_attention_dim}")
           print(f"  UNet in_channels: {unet.config.in_channels}")
+
+          # FIX: tokenizer loaded straight from the canonical Qwen3-VL repo rather
+          # than DreamLite-base's bundled copy — it's the same tokenizer either way
+          # (DreamLite's *is* Qwen3-VL's), and this avoids depending on a subfolder
+          # name for it that wasn't directly confirmed, on top of being a tiny,
+          # cheap download regardless.
+          tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
+          gc.collect()
 
           # Prompt-encoding constants copied verbatim from DreamLitePipeline's own
           # __init__ (self.prompt_template_encode_generate / _start_idx) — these are
@@ -246,7 +256,7 @@ jobs:
           print("\n[1/4] VAE encoder + decoder (madebyollin/sdxl-vae-fp16-fix)...")
           vae = AutoencoderKL.from_pretrained(
               "madebyollin/sdxl-vae-fp16-fix",
-              torch_dtype=torch.float32)
+              dtype=torch.float32)
           vae.eval()
           manifest["params"]["vae_scaling_factor"] = float(vae.config.scaling_factor)
           manifest["params"]["vae_shift_factor"] = float(getattr(vae.config, "shift_factor", 0.0) or 0.0)
@@ -323,10 +333,13 @@ jobs:
           try:
               from transformers import Qwen3VLForConditionalGeneration
 
-              del pipe  # free the DreamLite pipeline's copy before loading a 2nd big model
-              gc.collect()
+              # FIX: bf16 instead of fp32 — roughly halves this model's ~2B-parameter
+              # footprint (the official on-device deployment quantizes it to 4-bit,
+              # which has no direct ONNX Runtime equivalent, as flagged below; bf16 is
+              # the safest meaningfully-smaller step available here, and has solid CPU
+              # kernel support, unlike fp16 which is much more GPU-oriented).
               qwen = Qwen3VLForConditionalGeneration.from_pretrained(
-                  "Qwen/Qwen3-VL-2B-Instruct", torch_dtype=torch.float32)
+                  "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.bfloat16)
               qwen.eval()
               real_hidden_size = qwen.config.text_config.hidden_size
               print(f"  Qwen3-VL-2B text hidden_size: {real_hidden_size} "
@@ -373,6 +386,70 @@ jobs:
                   weight_type=QuantType.QInt8)
               os.remove("dreamlite_onnx/text_encoder_fp32.onnx")
               print(f"✓ Text encoder (INT8): {os.path.getsize('dreamlite_onnx/text_encoder.onnx')//1024//1024} MB")
+
+              # FIX: new — true diptych-conditioned editing (per the user's explicit
+              # request) needs the text encoder's *vision*-language path too, not
+              # just text: DreamLitePipeline's edit template embeds
+              # <|vision_start|><|image_pad|><|vision_end|>, so Qwen3-VL must process
+              # the actual source image alongside the text. This is the least-
+              # verified export in this whole pipeline — the patch-flattening order
+              # below is transliterated directly from Qwen2VLImageProcessor's
+              # _preprocess (confirmed present and reused by Qwen3-VL; there is no
+              # separate Qwen3-VL image processor file), but unlike the generate-mode
+              # text path, this hasn't been checked against any reference output —
+              # getting the 8-axis transpose order even slightly wrong silently
+              # scrambles every patch rather than erroring. Flagged honestly, not
+              # hidden — see the matching, equally-explicit flag in ImageGenerator.kt.
+              print("\n[2b/4] Edit-mode (vision) text encoder path...")
+              qwen_vision = Qwen3VLForConditionalGeneration.from_pretrained(
+                  "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.bfloat16)
+              qwen_vision.eval()
+
+              class VisionTextEncoderWrapper(torch.nn.Module):
+                  def __init__(self, model):
+                      super().__init__()
+                      self.model = model
+                  def forward(self, input_ids, attention_mask, pixel_values, image_grid_thw):
+                      out = self.model(
+                          input_ids=input_ids, attention_mask=attention_mask,
+                          pixel_values=pixel_values, image_grid_thw=image_grid_thw,
+                          output_hidden_states=True, use_cache=False)
+                      return out.hidden_states[-1]
+
+              patch_size, temporal_patch_size, merge_size = 14, 2, 2
+              grid_h, grid_w = 36, 36  # 504x504-ish dummy — real size varies per export call at trace time only for shape tracing, actual runtime shape is dynamic (see dynamic_axes)
+              n_patches = grid_h * grid_w
+              dummy_pixel_values = torch.randn(n_patches, 3 * temporal_patch_size * patch_size * patch_size)
+              dummy_grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
+              dummy_vis_ids = torch.randint(0, 1000, (1, 80), dtype=torch.long)
+              dummy_vis_mask = torch.ones((1, 80), dtype=torch.long)
+              with torch.no_grad():
+                  torch.onnx.export(
+                      VisionTextEncoderWrapper(qwen_vision),
+                      (dummy_vis_ids, dummy_vis_mask, dummy_pixel_values, dummy_grid_thw),
+                      "dreamlite_onnx/text_encoder_edit_fp32.onnx",
+                      input_names=["input_ids", "attention_mask", "pixel_values", "image_grid_thw"],
+                      output_names=["last_hidden_state"],
+                      dynamic_axes={
+                          "input_ids":         {0: "batch", 1: "sequence"},
+                          "attention_mask":    {0: "batch", 1: "sequence"},
+                          "pixel_values":      {0: "num_patches"},
+                          "last_hidden_state": {0: "batch", 1: "sequence"},
+                      },
+                      opset_version=17)
+              del qwen_vision
+              gc.collect()
+              quantize_dynamic(
+                  "dreamlite_onnx/text_encoder_edit_fp32.onnx",
+                  "dreamlite_onnx/text_encoder_edit.onnx",
+                  weight_type=QuantType.QInt8)
+              os.remove("dreamlite_onnx/text_encoder_edit_fp32.onnx")
+              print(f"✓ Edit-mode text encoder (INT8): {os.path.getsize('dreamlite_onnx/text_encoder_edit.onnx')//1024//1024} MB")
+              manifest["params"]["vision_patch_size"] = patch_size
+              manifest["params"]["vision_temporal_patch_size"] = temporal_patch_size
+              manifest["params"]["vision_merge_size"] = merge_size
+              manifest["params"]["vision_image_mean"] = [0.48145466, 0.4578275, 0.40821073]  # OPENAI_CLIP_MEAN, confirmed in the shared Qwen-VL image processor source
+              manifest["params"]["vision_image_std"]  = [0.26862954, 0.26130258, 0.27577711]  # OPENAI_CLIP_STD, same source
           except Exception as e:
               print(f"✗ Text encoder export failed: {e}")
               print("  Offline generation will be unavailable this build — the app")
@@ -468,7 +545,8 @@ jobs:
           manifest["components"] = onnx_files
           manifest["has_vae_decoder"] = "vae_decoder.onnx"  in onnx_files
           manifest["has_vae_encoder"] = "vae_encoder.onnx"  in onnx_files
-          manifest["has_encoder"]     = "text_encoder.onnx" in onnx_files
+          manifest["has_encoder"]      = "text_encoder.onnx" in onnx_files
+          manifest["has_edit_encoder"] = "text_encoder_edit.onnx" in onnx_files
           manifest["has_unet"]        = "unet.onnx"          in onnx_files
           manifest["has_tokenizer"]   = os.path.exists("dreamlite_onnx/tokenizer.json")
           manifest["params"].update({
@@ -501,7 +579,7 @@ jobs:
         run: |
           mkdir -p lfm25/app/src/main/assets
           exported=0
-          for f in dreamlite_onnx/vae_decoder.onnx dreamlite_onnx/vae_encoder.onnx dreamlite_onnx/text_encoder.onnx dreamlite_onnx/unet.onnx dreamlite_onnx/tokenizer.json dreamlite_onnx/manifest.json; do
+          for f in dreamlite_onnx/vae_decoder.onnx dreamlite_onnx/vae_encoder.onnx dreamlite_onnx/text_encoder.onnx dreamlite_onnx/text_encoder_edit.onnx dreamlite_onnx/unet.onnx dreamlite_onnx/tokenizer.json dreamlite_onnx/manifest.json; do
             if [ -f "$f" ]; then
               cp "$f" lfm25/app/src/main/assets/
               echo "✓ Copied $(basename $f): $(du -sh $f | cut -f1)"
