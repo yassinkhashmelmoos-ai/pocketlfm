@@ -37,25 +37,24 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install Pillow
-          # FIX: torch 2.3.1 / transformers 4.40.2 / diffusers 0.27.2 predate DreamLite
-          # and Qwen3-VL entirely (both are 2026 architectures) — those pins could
-          # never have loaded DreamLitePipeline or Qwen3VLForConditionalGeneration,
-          # which is the real reason the old export silently fell back to SD1.5.
-          # transformers==4.57.3 is DreamLite's own pinned requirement (its model
-          # card warns that >=5.0 produces visible artifacts with its Qwen3-VL
-          # encoder). DreamLitePipeline/DreamLiteUNetModel aren't in a tagged
-          # diffusers release yet, so diffusers must come from the main branch.
-          # torch==2.14.1 and the huggingface-hub floor below are pinned per the
-          # user's own debugging of the previous run — diffusers-from-main drifted
-          # ahead of what an older huggingface-hub exposes; httpx is needed by the
-          # compatibility shim in the next step.
           pip install "torch==2.14.1" torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install --no-cache-dir --upgrade \
-            "huggingface-hub>=0.34.0,<1.0" \
-            "transformers==4.57.3" \
-            accelerate onnx "onnxruntime==1.18.0" httpx
-          pip install "git+https://github.com/huggingface/diffusers.git"
 
+          echo "huggingface-hub>=0.34.0,<1.0" > /tmp/hf_constraints.txt
+
+          pip install --no-cache-dir -c /tmp/hf_constraints.txt \
+            "transformers==4.57.3" \
+            accelerate \
+            onnx \
+            "onnxruntime==1.18.0" \
+            httpx
+
+          pip install --no-cache-dir --no-deps --force-reinstall \
+            "git+https://github.com/huggingface/diffusers.git"
+
+          pip install --no-cache-dir --force-reinstall --no-deps -c /tmp/hf_constraints.txt \
+            "huggingface-hub>=0.34.0,<1.0"
+
+          python -c "import huggingface_hub; from packaging.version import Version; v=huggingface_hub.__version__; assert Version(v) < Version('1.0.0'), f'hf-hub {v} is >=1.0'; print(f'hf-hub {v} OK')"
       # FIX: added per the user's own debugging — diffusers-from-main (needed for
       # DreamLitePipeline/DreamLiteUNetModel, neither tagged in a release yet) calls
       # a few huggingface_hub APIs (resolve_revision, RevisionResolutionError,
