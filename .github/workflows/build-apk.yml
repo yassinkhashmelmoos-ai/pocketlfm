@@ -506,14 +506,7 @@ jobs:
           gc.collect()
           print(f"  fp16 export: {os.path.getsize('dreamlite_onnx/text_encoder_fp16.onnx')//1024//1024} MB")
 
-          quantize_dynamic(
-              "dreamlite_onnx/text_encoder_fp16.onnx",
-              "dreamlite_onnx/text_encoder.onnx",
-              weight_type=QuantType.QInt8,
-              use_external_data_format=True,
-          )
-          os.remove("dreamlite_onnx/text_encoder_fp16.onnx")
-          print(f"✓ text_encoder.onnx: {os.path.getsize('dreamlite_onnx/text_encoder.onnx')//1024//1024} MB")
+          
           merge_manifest({"text_hidden_size": int(hidden)})
 
           # ── [2/2] Edit-mode (vision) encoder ────────────────────────────────
@@ -577,16 +570,7 @@ jobs:
               del qwen_vision
               gc.collect()
 
-              quantize_dynamic(
-                  "dreamlite_onnx/text_encoder_edit_fp16.onnx",
-                  "dreamlite_onnx/text_encoder_edit.onnx",
-                  weight_type=QuantType.QInt8,
-                  use_external_data_format=True,
-              )
-              os.remove("dreamlite_onnx/text_encoder_edit_fp16.onnx")
-              print(f"✓ text_encoder_edit.onnx: {os.path.getsize('dreamlite_onnx/text_encoder_edit.onnx')//1024//1024} MB")
-
-              merge_manifest({
+             export          merge_manifest({
                   "vision_patch_size": patch_size,
                   "vision_temporal_patch_size": temporal_patch_size,
                   "vision_merge_size": merge_size,
@@ -602,7 +586,45 @@ jobs:
               s = os.path.getsize(p)
               print(f"  {f}: {s//1024//1024} MB" if s > 1024*1024 else f"  {f}: {s} B")
           PYEOF
+      
+      - name: Quantize text encoders (separate process, clean memory)
+        run: |
+          python3 << 'PYEOF'
+          import os, json
+          from onnxruntime.quantization import quantize_dynamic, QuantType
 
+          def quantize_and_clean(src, dst):
+              if not os.path.exists(src):
+                  print(f"⚠ {src} not found — skipping")
+                  return False
+              size_before = os.path.getsize(src) // 1024 // 1024
+              print(f"  quantizing {src} ({size_before} MB)...")
+              quantize_dynamic(
+                  src, dst,
+                  weight_type=QuantType.QInt8,
+                  use_external_data_format=True,
+              )
+              os.remove(src)
+              print(f"✓ {dst}: {os.path.getsize(dst)//1024//1024} MB")
+              return True
+
+          quantize_and_clean(
+              "dreamlite_onnx/text_encoder_fp16.onnx",
+              "dreamlite_onnx/text_encoder.onnx")
+          quantize_and_clean(
+              "dreamlite_onnx/text_encoder_edit_fp16.onnx",
+              "dreamlite_onnx/text_encoder_edit.onnx")
+
+          with open("dreamlite_onnx/manifest.json") as f:
+              m = json.load(f)
+          files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
+          m["components"] = files
+          m["has_encoder"]      = "text_encoder.onnx" in files
+          m["has_edit_encoder"] = "text_encoder_edit.onnx" in files
+          with open("dreamlite_onnx/manifest.json", "w") as f:
+              json.dump(m, f, indent=2)
+          print(f"\nmanifest updated: has_encoder={m['has_encoder']}, has_edit_encoder={m['has_edit_encoder']}")
+          PYEOF
       # FIX: Copy ONNX files DIRECTLY into assets — no zip container.
       # Previously the workflow ran "zip -r assets/dreamlite.zip ." which caused
       # double-compression: aapt re-compressed the zip inside the APK even with
