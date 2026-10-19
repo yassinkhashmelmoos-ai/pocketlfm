@@ -52,6 +52,8 @@ fun ChatScreen(
     onThumbsUp:          (String) -> Unit,
     onThumbsDown:        (String) -> Unit,
     onDeleteMessage:     (String) -> Unit,
+    onShareImage:        (ChatMessage) -> Intent? = { null }, // builds a FileProvider share Intent for a 🎨 image message
+    onSaveImage:         (ChatMessage) -> Unit     = {},      // saves it to the device gallery
     onImportFineTune:    (Uri) -> Unit,
     onExportFeedback:    () -> Unit,
     onClearSnackbar:     () -> Unit,
@@ -277,6 +279,8 @@ fun ChatScreen(
                     onDown          = onThumbsDown,
                     onDeleteMessage = onDeleteMessage,
                     onEditMessage   = onEditMessage,
+                    onShareImage    = onShareImage,
+                    onSaveImage     = onSaveImage,
                     onClear         = if (uiState.messages.isNotEmpty()) onClearChat else null,
                     modifier        = Modifier.fillMaxSize()
                 )
@@ -462,6 +466,8 @@ private fun MessageList(
     onDown:         (String) -> Unit,
     onDeleteMessage:(String) -> Unit,
     onEditMessage:  ((String, String) -> Unit)?,
+    onShareImage:   (ChatMessage) -> Intent?,
+    onSaveImage:    (ChatMessage) -> Unit,
     onClear:        (() -> Unit)?,
     modifier:       Modifier
 ) {
@@ -483,7 +489,7 @@ private fun MessageList(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             items(messages, key = { it.id }) { msg ->
-                MessageBubble(msg, userName, onUp, onDown, onDeleteMessage, onEditMessage)
+                MessageBubble(msg, userName, onUp, onDown, onDeleteMessage, onEditMessage, onShareImage, onSaveImage)
             }
             if (onClear != null) {
                 item {
@@ -510,10 +516,13 @@ private fun MessageBubble(
     onUp:           (String) -> Unit,
     onDown:         (String) -> Unit,
     onDeleteMessage:(String) -> Unit,
-    onEditMessage:  ((String, String) -> Unit)?
+    onEditMessage:  ((String, String) -> Unit)?,
+    onShareImage:   (ChatMessage) -> Intent? = { null },
+    onSaveImage:    (ChatMessage) -> Unit     = {}
 ) {
     val isUser    = msg.isUser
     val clipboard = LocalClipboardManager.current
+    val localCtx  = LocalContext.current
     var showMenu      by remember { mutableStateOf(false) }
     var showTimestamp by remember { mutableStateOf(false) }
 
@@ -639,6 +648,26 @@ private fun MessageBubble(
                         DropdownMenuItem(
                             text = { Text("👎 Bad response", color = ThunderRed) },
                             onClick = { onDown(msg.id); showMenu = false }
+                        )
+                    }
+                    // Per-image actions — save to gallery / share via any local app /
+                    // delete, for a 🎨 generated-image message specifically (as opposed
+                    // to the general "Share / Save" button, which exports the chat text).
+                    if (!msg.mediaPath.isNullOrBlank() && msg.mediaType == "image") {
+                        DropdownMenuItem(
+                            text = { Text("💾 Save to gallery", color = ThunderWhite) },
+                            leadingIcon = { Icon(Icons.Default.Download, null, tint = ThunderElectric) },
+                            onClick = { onSaveImage(msg); showMenu = false }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("📤 Share image", color = ThunderWhite) },
+                            leadingIcon = { Icon(Icons.Default.Share, null, tint = ThunderElectric) },
+                            onClick = {
+                                onShareImage(msg)?.let {
+                                    localCtx.startActivity(Intent.createChooser(it, "Share image"))
+                                }
+                                showMenu = false
+                            }
                         )
                     }
                     DropdownMenuItem(
