@@ -491,7 +491,7 @@ jobs:
               latent_ch = manifest["params"]["latent_channels"]
               dummy_sample = torch.randn(2, latent_ch, 128, 256)  # width doubled (diptych)
               dummy_t = torch.tensor([500.0, 500.0])
-              dummy_hidden = torch.randn(2, 48, cross_attention_dim)
+              dummy_hidden = torch.randn(2, 48, 2048)
               dummy_enc_mask = torch.ones(2, 48, dtype=torch.long)
               dummy_time_ids = torch.tensor([[1024.0, 1024.0], [1024.0, 1024.0]])
               with torch.no_grad():
