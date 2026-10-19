@@ -335,7 +335,7 @@ jobs:
               # the safest meaningfully-smaller step available here, and has solid CPU
               # kernel support, unlike fp16 which is much more GPU-oriented).
               qwen = Qwen3VLForConditionalGeneration.from_pretrained(
-                  "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.bfloat16)
+                  "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float16)
               qwen.eval()
               real_hidden_size = qwen.config.text_config.hidden_size
               print(f"  Qwen3-VL-2B text hidden_size: {real_hidden_size} "
@@ -398,7 +398,7 @@ jobs:
               # hidden — see the matching, equally-explicit flag in ImageGenerator.kt.
               print("\n[2b/4] Edit-mode (vision) text encoder path...")
               qwen_vision = Qwen3VLForConditionalGeneration.from_pretrained(
-                  "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.bfloat16)
+                  "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float16)
               qwen_vision.eval()
 
               class VisionTextEncoderWrapper(torch.nn.Module):
