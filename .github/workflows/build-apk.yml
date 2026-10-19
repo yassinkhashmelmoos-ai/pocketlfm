@@ -527,13 +527,13 @@ jobs:
           # of this.
           
 
-              merge_manifest({
+          merge_manifest({
                   "vision_patch_size": patch_size,
                   "vision_temporal_patch_size": temporal_patch_size,
                   "vision_merge_size": merge_size,
                   "vision_image_mean": [0.48145466, 0.4578275, 0.40821073],
                   "vision_image_std":  [0.26862954, 0.26130258, 0.27577711],
-              })
+          })
      
           print("\n=== Text encoder step summary ===")
           for f in sorted(os.listdir("dreamlite_onnx")):
