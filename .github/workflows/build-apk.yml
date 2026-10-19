@@ -525,50 +525,7 @@ jobs:
           # this specific model's actual config). Wrapped in try/except so a
           # failure here doesn't take down generate-mode, which doesn't need any
           # of this.
-          print("\n[2/2] Edit-mode text encoder...")
-          try:
-              qwen_vision = Qwen3VLForConditionalGeneration.from_pretrained(
-                  "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float16)
-              qwen_vision.eval()
-
-              class VisionTextEncoderWrapper(torch.nn.Module):
-                  def __init__(self, model):
-                      super().__init__()
-                      self.model = model
-                  def forward(self, input_ids, attention_mask, pixel_values, image_grid_thw):
-                      out = self.model(
-                          input_ids=input_ids, attention_mask=attention_mask,
-                          pixel_values=pixel_values, image_grid_thw=image_grid_thw,
-                          output_hidden_states=True, use_cache=False)
-                      return out.hidden_states[-1]
-
-              patch_size, temporal_patch_size, merge_size = 14, 2, 2
-              grid_h = grid_w = 36  # dummy shape for export tracing only — real runtime shape is dynamic (see dynamic_axes)
-              n_patches = grid_h * grid_w
-              dummy_pixel_values = torch.randn(n_patches, 3 * temporal_patch_size * patch_size * patch_size)
-              dummy_grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
-              dummy_vis_ids  = torch.randint(0, 1000, (1, 80), dtype=torch.long)
-              dummy_vis_mask = torch.ones((1, 80), dtype=torch.long)
           
-
-              with torch.no_grad():
-                  torch.onnx.export(
-                      VisionTextEncoderWrapper(qwen_vision),
-                      (dummy_vis_ids, dummy_vis_mask, dummy_pixel_values, dummy_grid_thw),
-                      "dreamlite_onnx/text_encoder_edit_fp16.onnx",
-                      input_names=["input_ids", "attention_mask", "pixel_values", "image_grid_thw"],
-                      output_names=["last_hidden_state"],
-                      dynamo=True,
-                      dynamic_shapes={
-                          "input_ids":         {0: batch, 1: seq},
-                          "attention_mask":    {0: batch, 1: seq},
-                          "pixel_values":      {0: patches},
-                          "image_grid_thw":    {},
-                      },
-                      opset_version=18,
-                  )
-              del qwen_vision
-              gc.collect()
 
               merge_manifest({
                   "vision_patch_size": patch_size,
@@ -577,9 +534,7 @@ jobs:
                   "vision_image_mean": [0.48145466, 0.4578275, 0.40821073],
                   "vision_image_std":  [0.26862954, 0.26130258, 0.27577711],
               })
-          except Exception as e:
-              print(f"✗ Edit-mode encoder failed (non-fatal — generate mode is unaffected): {e}")
-
+     
           print("\n=== Text encoder step summary ===")
           for f in sorted(os.listdir("dreamlite_onnx")):
               p = f"dreamlite_onnx/{f}"
@@ -587,6 +542,82 @@ jobs:
               print(f"  {f}: {s//1024//1024} MB" if s > 1024*1024 else f"  {f}: {s} B")
           PYEOF
       
+      - name: Export edit-mode text encoder (isolated, non-fatal)
+        continue-on-error: true
+        run: |
+          python3 << 'PYEOF'
+          import os, gc, json, torch
+
+          def merge_manifest(extra):
+              with open("dreamlite_onnx/manifest.json") as f:
+                  m = json.load(f)
+              m["params"].update(extra)
+              files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
+              m["components"] = files
+              m["has_edit_encoder"] = "text_encoder_edit_fp16.onnx" in files or "text_encoder_edit.onnx" in files
+              with open("dreamlite_onnx/manifest.json", "w") as f:
+                  json.dump(m, f, indent=2)
+
+          from transformers import Qwen3VLForConditionalGeneration
+          from torch.export import Dim
+
+          batch   = Dim("batch", min=1)
+          seq     = Dim("seq", min=1)
+          patches = Dim("patches", min=1)
+
+          print("[1/1] Edit-mode text encoder...")
+          qwen_vision = Qwen3VLForConditionalGeneration.from_pretrained(
+              "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float16)
+          qwen_vision.eval()
+
+          class VisionTextEncoderWrapper(torch.nn.Module):
+              def __init__(self, model):
+                  super().__init__()
+                  self.model = model
+              def forward(self, input_ids, attention_mask, pixel_values, image_grid_thw):
+                  out = self.model(
+                      input_ids=input_ids, attention_mask=attention_mask,
+                      pixel_values=pixel_values, image_grid_thw=image_grid_thw,
+                      output_hidden_states=True, use_cache=False)
+                  return out.hidden_states[-1]
+
+          patch_size, temporal_patch_size, merge_size = 14, 2, 2
+          grid_h = grid_w = 36
+          n_patches = grid_h * grid_w
+          dummy_pixel_values = torch.randn(n_patches, 3 * temporal_patch_size * patch_size * patch_size)
+          dummy_grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
+          dummy_vis_ids  = torch.randint(0, 1000, (1, 80), dtype=torch.long)
+          dummy_vis_mask = torch.ones((1, 80), dtype=torch.long)
+
+          with torch.no_grad():
+              torch.onnx.export(
+                  VisionTextEncoderWrapper(qwen_vision),
+                  (dummy_vis_ids, dummy_vis_mask, dummy_pixel_values, dummy_grid_thw),
+                  "dreamlite_onnx/text_encoder_edit_fp16.onnx",
+                  input_names=["input_ids", "attention_mask", "pixel_values", "image_grid_thw"],
+                  output_names=["last_hidden_state"],
+                  dynamo=True,
+                  dynamic_shapes={
+                      "input_ids":         {0: batch, 1: seq},
+                      "attention_mask":    {0: batch, 1: seq},
+                      "pixel_values":      {0: patches},
+                      "image_grid_thw":    {},
+                  },
+                  opset_version=18,
+              )
+          del qwen_vision
+          gc.collect()
+          print(f"✓ text_encoder_edit_fp16.onnx: {os.path.getsize('dreamlite_onnx/text_encoder_edit_fp16.onnx')//1024//1024} MB")
+
+          merge_manifest({
+              "vision_patch_size": patch_size,
+              "vision_temporal_patch_size": temporal_patch_size,
+              "vision_merge_size": merge_size,
+              "vision_image_mean": [0.48145466, 0.4578275, 0.40821073],
+              "vision_image_std":  [0.26862954, 0.26130258, 0.27577711],
+          })
+          PYEOF
+          
       - name: Quantize text encoders (separate process, clean memory)
         run: |
           python3 << 'PYEOF'
