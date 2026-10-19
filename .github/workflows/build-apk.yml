@@ -483,20 +483,24 @@ jobs:
 
           dummy_ids  = torch.randint(0, 1000, (2, 48), dtype=torch.long)
           dummy_mask = torch.ones((2, 48), dtype=torch.long)
+
+          from torch.export import Dim
+          batch = Dim("batch", min=1)
+          seq   = Dim("seq", min=1)
+
           with torch.no_grad():
               torch.onnx.export(
                   TextEncoderWrapper(qwen), (dummy_ids, dummy_mask),
                   "dreamlite_onnx/text_encoder_fp16.onnx",
                   input_names=["input_ids", "attention_mask"],
                   output_names=["last_hidden_state"],
-                  dynamic_axes={
-                      "input_ids":         {0: "batch", 1: "sequence"},
-                      "attention_mask":    {0: "batch", 1: "sequence"},
-                      "last_hidden_state": {0: "batch", 1: "sequence"},
+                  dynamo=True,
+                  dynamic_shapes={
+                      "input_ids":         {0: batch, 1: seq},
+                      "attention_mask":    {0: batch, 1: seq},
+                      "last_hidden_state": {0: batch, 1: seq},
                   },
                   opset_version=18,
-                  dynamo=False,
-                  autograd_inlining=False,
               )
           del qwen
           gc.collect()
@@ -552,6 +556,11 @@ jobs:
               dummy_grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
               dummy_vis_ids  = torch.randint(0, 1000, (1, 80), dtype=torch.long)
               dummy_vis_mask = torch.ones((1, 80), dtype=torch.long)
+                            from torch.export import Dim
+              batch   = Dim("batch", min=1)
+              seq     = Dim("seq", min=1)
+              patches = Dim("patches", min=1)
+
               with torch.no_grad():
                   torch.onnx.export(
                       VisionTextEncoderWrapper(qwen_vision),
@@ -559,15 +568,14 @@ jobs:
                       "dreamlite_onnx/text_encoder_edit_fp16.onnx",
                       input_names=["input_ids", "attention_mask", "pixel_values", "image_grid_thw"],
                       output_names=["last_hidden_state"],
-                      dynamic_axes={
-                          "input_ids":         {0: "batch", 1: "sequence"},
-                          "attention_mask":    {0: "batch", 1: "sequence"},
-                          "pixel_values":      {0: "num_patches"},
-                          "last_hidden_state": {0: "batch", 1: "sequence"},
+                      dynamo=True,
+                      dynamic_shapes={
+                          "input_ids":         {0: batch, 1: seq},
+                          "attention_mask":    {0: batch, 1: seq},
+                          "pixel_values":      {0: patches},
+                          "last_hidden_state": {0: batch, 1: seq},
                       },
                       opset_version=18,
-                      dynamo=False,
-                      autograd_inlining=False,
                   )
               del qwen_vision
               gc.collect()
