@@ -214,7 +214,7 @@ jobs:
           # never touches DreamLite's own bundled text_encoder at all — this script
           # replaces it with a standalone Qwen3-VL load further down regardless, so
           # that copy was always redundant, not just mistimed.
-          print("\n[0/4] Loading carlofkl/DreamLite-base's UNet only (not the full pipeline)...")
+          print("\n[0/3] Loading carlofkl/DreamLite-base's UNet only (not the full pipeline)...")
           unet = DreamLiteUNetModel.from_pretrained(
               "carlofkl/DreamLite-base", revision="diffusers", subfolder="unet", dtype=torch.float32)
           unet.eval()
@@ -249,7 +249,7 @@ jobs:
           # differ from SD1.5's 0.18215 — the manifest carries the REAL values read
           # from this VAE's own config, not a hardcoded assumption, and
           # ImageGenerator.kt must read them from there (see its FIX comment).
-          print("\n[1/4] VAE encoder + decoder (madebyollin/sdxl-vae-fp16-fix)...")
+          print("\n[1/3] VAE encoder + decoder (madebyollin/sdxl-vae-fp16-fix)...")
           vae = AutoencoderKL.from_pretrained(
               "madebyollin/sdxl-vae-fp16-fix",
               dtype=torch.float32)
@@ -300,159 +300,7 @@ jobs:
           del vae
           gc.collect()
 
-          # ── 2. Text encoder: Qwen3-VL-2B-Instruct (DreamLite's real encoder) ──
-          # FIX: this used to export plain CLIP ViT-L/14, which DreamLite's UNet
-          # was never trained to read (wrong dimensionality, wrong semantics
-          # entirely) — that pairing could only ever produce noise. DreamLite
-          # genuinely requires Qwen3VLForConditionalGeneration (confirmed in its
-          # own model card and in the pipeline's __init__ type hints, read
-          # directly above). Per the user's explicit instruction, this exports the
-          # real thing rather than a smaller substitute.
-          #
-          # HONEST FLAG: two independent community Android/WebGPU ports of
-          # DreamLite both export the UNet+VAE successfully but explicitly do NOT
-          # run this 2B encoder on-device at all (one hardcodes a single prompt,
-          # the other requires a server) — this is genuinely unproven territory,
-          # not a routine export. Two concrete, specific risks: (1) a 2B model may
-          # simply exceed this runner's RAM during export, so this is wrapped to
-          # let the rest of the pipeline still ship if it fails; (2) a dynamically
-          # INT8-quantized 2B-parameter vision-language model used as a diffusion
-          # conditioning signal has no known precedent to validate against — it
-          # may export cleanly and still not produce coherent conditioning.
-          #
-          # output_hidden_states=True + hidden_states[-1], dropping the first
-          # prompt_template_drop_idx (34) tokens — exactly mirrors
-          # DreamLitePipeline.encode_prompt() read above. Only the text-only
-          # ("generate" mode) path is exported; image-conditioned "edit" mode
-          # uses a different template/processor path not covered by this export.
-          print("\n[2/4] Text encoder (Qwen/Qwen3-VL-2B-Instruct)...")
-          try:
-              from transformers import Qwen3VLForConditionalGeneration
-
-              # FIX: bf16 instead of fp32 — roughly halves this model's ~2B-parameter
-              # footprint (the official on-device deployment quantizes it to 4-bit,
-              # which has no direct ONNX Runtime equivalent, as flagged below; bf16 is
-              # the safest meaningfully-smaller step available here, and has solid CPU
-              # kernel support, unlike fp16 which is much more GPU-oriented).
-              qwen = Qwen3VLForConditionalGeneration.from_pretrained(
-                  "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.bfloat16)
-              qwen.eval()
-              real_hidden_size = qwen.config.text_config.hidden_size
-              print(f"  Qwen3-VL-2B text hidden_size: {real_hidden_size} "
-                    f"(UNet expects {cross_attention_dim} — {'MATCH' if real_hidden_size == cross_attention_dim else 'MISMATCH, will likely fail at UNet runtime'})")
-              manifest["params"]["text_hidden_size"] = int(real_hidden_size)
-
-              class TextEncoderWrapper(torch.nn.Module):
-                  def __init__(self, model):
-                      super().__init__()
-                      self.model = model
-                  def forward(self, input_ids, attention_mask):
-                      out = self.model(input_ids=input_ids, attention_mask=attention_mask,
-                                        output_hidden_states=True, use_cache=False)
-                      return out.hidden_states[-1]
-
-              dummy_ids = torch.randint(0, 1000, (2, 48), dtype=torch.long)
-              dummy_mask = torch.ones((2, 48), dtype=torch.long)
-              with torch.no_grad():
-                  torch.onnx.export(
-                      TextEncoderWrapper(qwen),
-                      (dummy_ids, dummy_mask),
-                      "dreamlite_onnx/text_encoder_fp32.onnx",
-                      input_names=["input_ids", "attention_mask"],
-                      output_names=["last_hidden_state"],
-                      dynamic_axes={
-                          "input_ids":        {0: "batch", 1: "sequence"},
-                          "attention_mask":   {0: "batch", 1: "sequence"},
-                          "last_hidden_state":{0: "batch", 1: "sequence"},
-                      },
-                      opset_version=17)
-              print(f"  Raw export: {os.path.getsize('dreamlite_onnx/text_encoder_fp32.onnx')//1024//1024} MB")
-              del qwen
-              gc.collect()
-
-              # FIX: there is no Android/ONNX equivalent of the official 4-bit MLX
-              # deployment — ONNX Runtime's own dynamic INT8 quantization is the
-              # most defensible available substitute (not a faithful port of the
-              # official config, which this honestly can't be). Still far smaller
-              # than shipping fp32/fp16.
-              from onnxruntime.quantization import quantize_dynamic, QuantType
-              quantize_dynamic(
-                  "dreamlite_onnx/text_encoder_fp32.onnx",
-                  "dreamlite_onnx/text_encoder.onnx",
-                  weight_type=QuantType.QInt8)
-              os.remove("dreamlite_onnx/text_encoder_fp32.onnx")
-              print(f"✓ Text encoder (INT8): {os.path.getsize('dreamlite_onnx/text_encoder.onnx')//1024//1024} MB")
-
-              # FIX: new — true diptych-conditioned editing (per the user's explicit
-              # request) needs the text encoder's *vision*-language path too, not
-              # just text: DreamLitePipeline's edit template embeds
-              # <|vision_start|><|image_pad|><|vision_end|>, so Qwen3-VL must process
-              # the actual source image alongside the text. This is the least-
-              # verified export in this whole pipeline — the patch-flattening order
-              # below is transliterated directly from Qwen2VLImageProcessor's
-              # _preprocess (confirmed present and reused by Qwen3-VL; there is no
-              # separate Qwen3-VL image processor file), but unlike the generate-mode
-              # text path, this hasn't been checked against any reference output —
-              # getting the 8-axis transpose order even slightly wrong silently
-              # scrambles every patch rather than erroring. Flagged honestly, not
-              # hidden — see the matching, equally-explicit flag in ImageGenerator.kt.
-              print("\n[2b/4] Edit-mode (vision) text encoder path...")
-              qwen_vision = Qwen3VLForConditionalGeneration.from_pretrained(
-                  "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.bfloat16)
-              qwen_vision.eval()
-
-              class VisionTextEncoderWrapper(torch.nn.Module):
-                  def __init__(self, model):
-                      super().__init__()
-                      self.model = model
-                  def forward(self, input_ids, attention_mask, pixel_values, image_grid_thw):
-                      out = self.model(
-                          input_ids=input_ids, attention_mask=attention_mask,
-                          pixel_values=pixel_values, image_grid_thw=image_grid_thw,
-                          output_hidden_states=True, use_cache=False)
-                      return out.hidden_states[-1]
-
-              patch_size, temporal_patch_size, merge_size = 14, 2, 2
-              grid_h, grid_w = 36, 36  # 504x504-ish dummy — real size varies per export call at trace time only for shape tracing, actual runtime shape is dynamic (see dynamic_axes)
-              n_patches = grid_h * grid_w
-              dummy_pixel_values = torch.randn(n_patches, 3 * temporal_patch_size * patch_size * patch_size)
-              dummy_grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
-              dummy_vis_ids = torch.randint(0, 1000, (1, 80), dtype=torch.long)
-              dummy_vis_mask = torch.ones((1, 80), dtype=torch.long)
-              with torch.no_grad():
-                  torch.onnx.export(
-                      VisionTextEncoderWrapper(qwen_vision),
-                      (dummy_vis_ids, dummy_vis_mask, dummy_pixel_values, dummy_grid_thw),
-                      "dreamlite_onnx/text_encoder_edit_fp32.onnx",
-                      input_names=["input_ids", "attention_mask", "pixel_values", "image_grid_thw"],
-                      output_names=["last_hidden_state"],
-                      dynamic_axes={
-                          "input_ids":         {0: "batch", 1: "sequence"},
-                          "attention_mask":    {0: "batch", 1: "sequence"},
-                          "pixel_values":      {0: "num_patches"},
-                          "last_hidden_state": {0: "batch", 1: "sequence"},
-                      },
-                      opset_version=17)
-              del qwen_vision
-              gc.collect()
-              quantize_dynamic(
-                  "dreamlite_onnx/text_encoder_edit_fp32.onnx",
-                  "dreamlite_onnx/text_encoder_edit.onnx",
-                  weight_type=QuantType.QInt8)
-              os.remove("dreamlite_onnx/text_encoder_edit_fp32.onnx")
-              print(f"✓ Edit-mode text encoder (INT8): {os.path.getsize('dreamlite_onnx/text_encoder_edit.onnx')//1024//1024} MB")
-              manifest["params"]["vision_patch_size"] = patch_size
-              manifest["params"]["vision_temporal_patch_size"] = temporal_patch_size
-              manifest["params"]["vision_merge_size"] = merge_size
-              manifest["params"]["vision_image_mean"] = [0.48145466, 0.4578275, 0.40821073]  # OPENAI_CLIP_MEAN, confirmed in the shared Qwen-VL image processor source
-              manifest["params"]["vision_image_std"]  = [0.26862954, 0.26130258, 0.27577711]  # OPENAI_CLIP_STD, same source
-          except Exception as e:
-              print(f"✗ Text encoder export failed: {e}")
-              print("  Offline generation will be unavailable this build — the app")
-              print("  degrades to online generation rather than crashing (see")
-              print("  ImageGenerator.kt's FIX comments on per-session loading).")
-
-          # ── 3. UNet (DreamLite-base's real DreamLiteUNetModel) ────────────────
+          # ── 2. UNet (DreamLite-base's real DreamLiteUNetModel) ────────────────
           # FIX: this used to silently substitute a full SD1.5 UNet (~3.4GB,
           # external-data weights the old copy step never bundled — the root cause
           # of the crash this whole investigation started from) paired with a
@@ -469,7 +317,7 @@ jobs:
           # flattened into a plain `time_ids` input for ONNX (dict kwargs aren't
           # ONNX-exportable). 1024x1024 output → 128x128 latents each side, 256
           # wide combined, matching DreamLite's native resolution.
-          print("\n[3/4] UNet (carlofkl/DreamLite-base)...")
+          print("\n[2/3] UNet (carlofkl/DreamLite-base)...")
           unet_exported = False
           try:
               class UNetWrapper(torch.nn.Module):
@@ -521,7 +369,7 @@ jobs:
           # real HF "fast tokenizer" as a single tokenizer.json (byte-level BPE);
           # bundling that file lets the Kotlin side do real tokenization instead of
           # another placeholder. See the matching FIX in ImageGenerator.kt.
-          print("\n[4/4] Tokenizer...")
+          print("\n[3/3] Tokenizer...")
           try:
               tokenizer.save_pretrained("dreamlite_onnx/tokenizer_dir")
               import shutil
@@ -564,6 +412,175 @@ jobs:
           for f in sorted(os.listdir("dreamlite_onnx")):
               size = os.path.getsize(f"dreamlite_onnx/{f}")
               print(f"  {f}: {size//1024//1024} MB" if size > 1024*1024 else f"  {f}: {size} B")
+          PYEOF
+
+      # FIX: exit 137 (SIGKILL/OOM) — the text encoder export used to run inside
+      # the same Python process as the VAE+UNet export above. Even after that
+      # earlier step's own fixes (UNet-only load, no full pipeline), loading a
+      # 2B-parameter model and quantizing it in a process that had already
+      # handled VAE+UNet still peaked past this runner's ~7GB. A brand new step
+      # is a brand new process — the OS fully reclaims whatever the previous
+      # step used, which `del`/`gc.collect()` within one process cannot do for
+      # every allocation. Two more changes beyond isolation, both required:
+      # fp16 instead of bf16 (quantize_dynamic doesn't quantize bf16 tensors —
+      # elem_type 16 — so a bf16 export was silently skipping quantization and
+      # leaving a multi-GB unquantized file resident) and
+      # use_external_data_format=True (quantize_dynamic's default keeps the
+      # whole model in memory twice — original and quantized copy; streaming
+      # from disk avoids that, and is close to mandatory for a model near
+      # ONNX's 2GB protobuf message limit either way).
+      - name: Export text encoder + quantize (isolated process)
+        run: |
+          python3 << 'PYEOF'
+          import os, gc, json, torch
+
+          def merge_manifest(extra):
+              with open("dreamlite_onnx/manifest.json") as f:
+                  m = json.load(f)
+              m["params"].update(extra)
+              files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
+              m["components"] = files
+              m["has_encoder"]      = "text_encoder.onnx" in files
+              m["has_edit_encoder"] = "text_encoder_edit.onnx" in files
+              with open("dreamlite_onnx/manifest.json", "w") as f:
+                  json.dump(m, f, indent=2)
+
+          from transformers import Qwen3VLForConditionalGeneration
+          from onnxruntime.quantization import quantize_dynamic, QuantType
+
+          # ── [1/2] Text encoder (generate-mode: text only) ──────────────────
+          # Same encode_prompt() logic as before (output_hidden_states=True,
+          # hidden_states[-1], prompt_template_drop_idx=34 applied on the
+          # Kotlin side) — only the process isolation and dtype changed here.
+          print("[1/2] Text encoder (Qwen/Qwen3-VL-2B-Instruct, fp16)...")
+          qwen = Qwen3VLForConditionalGeneration.from_pretrained(
+              "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float16)
+          qwen.eval()
+          hidden = qwen.config.text_config.hidden_size
+          print(f"  Qwen3-VL-2B text hidden_size: {hidden}")
+
+          class TextEncoderWrapper(torch.nn.Module):
+              def __init__(self, model):
+                  super().__init__()
+                  self.model = model
+              def forward(self, input_ids, attention_mask):
+                  out = self.model(input_ids=input_ids, attention_mask=attention_mask,
+                                    output_hidden_states=True, use_cache=False)
+                  return out.hidden_states[-1]
+
+          dummy_ids  = torch.randint(0, 1000, (2, 48), dtype=torch.long)
+          dummy_mask = torch.ones((2, 48), dtype=torch.long)
+          with torch.no_grad():
+              torch.onnx.export(
+                  TextEncoderWrapper(qwen), (dummy_ids, dummy_mask),
+                  "dreamlite_onnx/text_encoder_fp16.onnx",
+                  input_names=["input_ids", "attention_mask"],
+                  output_names=["last_hidden_state"],
+                  dynamic_axes={
+                      "input_ids":         {0: "batch", 1: "sequence"},
+                      "attention_mask":    {0: "batch", 1: "sequence"},
+                      "last_hidden_state": {0: "batch", 1: "sequence"},
+                  },
+                  opset_version=17,
+                  dynamo=False,
+              )
+          del qwen
+          gc.collect()
+          print(f"  fp16 export: {os.path.getsize('dreamlite_onnx/text_encoder_fp16.onnx')//1024//1024} MB")
+
+          quantize_dynamic(
+              "dreamlite_onnx/text_encoder_fp16.onnx",
+              "dreamlite_onnx/text_encoder.onnx",
+              weight_type=QuantType.QInt8,
+              use_external_data_format=True,
+          )
+          os.remove("dreamlite_onnx/text_encoder_fp16.onnx")
+          print(f"✓ text_encoder.onnx: {os.path.getsize('dreamlite_onnx/text_encoder.onnx')//1024//1024} MB")
+          merge_manifest({"text_hidden_size": int(hidden)})
+
+          # ── [2/2] Edit-mode (vision) encoder ────────────────────────────────
+          # HONEST FLAG (unchanged from the previous pass — this step's fix is
+          # about memory, not about this remaining uncertainty): the patch-
+          # flattening order in QwenVisionPreprocessor.kt is transliterated from
+          # Qwen2VLImageProcessor._preprocess, reused by Qwen3-VL. patch_size=14,
+          # temporal_patch_size=2, merge_size=2, and the OPENAI_CLIP mean/std
+          # below are independently confirmed (Qwen2-VL-2B's own
+          # preprocessor_config.json, multiple independent Qwen2-VL source
+          # mirrors). The exact 9D reshape + transpose(0,3,6,4,7,2,1,5,8) is also
+          # confirmed against several independent copies of the real
+          # Qwen2VLImageProcessor source. What's NOT independently confirmed:
+          # that Qwen3-VL-2B-Instruct's checkpoint uses identical values (very
+          # likely — standard across the Qwen-VL family — but unverified against
+          # this specific model's actual config). Wrapped in try/except so a
+          # failure here doesn't take down generate-mode, which doesn't need any
+          # of this.
+          print("\n[2/2] Edit-mode text encoder...")
+          try:
+              qwen_vision = Qwen3VLForConditionalGeneration.from_pretrained(
+                  "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float16)
+              qwen_vision.eval()
+
+              class VisionTextEncoderWrapper(torch.nn.Module):
+                  def __init__(self, model):
+                      super().__init__()
+                      self.model = model
+                  def forward(self, input_ids, attention_mask, pixel_values, image_grid_thw):
+                      out = self.model(
+                          input_ids=input_ids, attention_mask=attention_mask,
+                          pixel_values=pixel_values, image_grid_thw=image_grid_thw,
+                          output_hidden_states=True, use_cache=False)
+                      return out.hidden_states[-1]
+
+              patch_size, temporal_patch_size, merge_size = 14, 2, 2
+              grid_h = grid_w = 36  # dummy shape for export tracing only — real runtime shape is dynamic (see dynamic_axes)
+              n_patches = grid_h * grid_w
+              dummy_pixel_values = torch.randn(n_patches, 3 * temporal_patch_size * patch_size * patch_size)
+              dummy_grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
+              dummy_vis_ids  = torch.randint(0, 1000, (1, 80), dtype=torch.long)
+              dummy_vis_mask = torch.ones((1, 80), dtype=torch.long)
+              with torch.no_grad():
+                  torch.onnx.export(
+                      VisionTextEncoderWrapper(qwen_vision),
+                      (dummy_vis_ids, dummy_vis_mask, dummy_pixel_values, dummy_grid_thw),
+                      "dreamlite_onnx/text_encoder_edit_fp16.onnx",
+                      input_names=["input_ids", "attention_mask", "pixel_values", "image_grid_thw"],
+                      output_names=["last_hidden_state"],
+                      dynamic_axes={
+                          "input_ids":         {0: "batch", 1: "sequence"},
+                          "attention_mask":    {0: "batch", 1: "sequence"},
+                          "pixel_values":      {0: "num_patches"},
+                          "last_hidden_state": {0: "batch", 1: "sequence"},
+                      },
+                      opset_version=17,
+                      dynamo=False,
+                  )
+              del qwen_vision
+              gc.collect()
+
+              quantize_dynamic(
+                  "dreamlite_onnx/text_encoder_edit_fp16.onnx",
+                  "dreamlite_onnx/text_encoder_edit.onnx",
+                  weight_type=QuantType.QInt8,
+                  use_external_data_format=True,
+              )
+              os.remove("dreamlite_onnx/text_encoder_edit_fp16.onnx")
+              print(f"✓ text_encoder_edit.onnx: {os.path.getsize('dreamlite_onnx/text_encoder_edit.onnx')//1024//1024} MB")
+
+              merge_manifest({
+                  "vision_patch_size": patch_size,
+                  "vision_temporal_patch_size": temporal_patch_size,
+                  "vision_merge_size": merge_size,
+                  "vision_image_mean": [0.48145466, 0.4578275, 0.40821073],
+                  "vision_image_std":  [0.26862954, 0.26130258, 0.27577711],
+              })
+          except Exception as e:
+              print(f"✗ Edit-mode encoder failed (non-fatal — generate mode is unaffected): {e}")
+
+          print("\n=== Text encoder step summary ===")
+          for f in sorted(os.listdir("dreamlite_onnx")):
+              p = f"dreamlite_onnx/{f}"
+              s = os.path.getsize(p)
+              print(f"  {f}: {s//1024//1024} MB" if s > 1024*1024 else f"  {f}: {s} B")
           PYEOF
 
       # FIX: Copy ONNX files DIRECTLY into assets — no zip container.
