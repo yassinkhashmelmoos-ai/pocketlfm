@@ -498,7 +498,7 @@ jobs:
                   dynamic_shapes={
                       "input_ids":         {0: batch, 1: seq},
                       "attention_mask":    {0: batch, 1: seq},
-                      "last_hidden_state": {0: batch, 1: seq},
+                      
                   },
                   opset_version=18,
               )
@@ -570,7 +570,7 @@ jobs:
                           "input_ids":         {0: batch, 1: seq},
                           "attention_mask":    {0: batch, 1: seq},
                           "pixel_values":      {0: patches},
-                          "last_hidden_state": {0: batch, 1: seq},
+                          
                       },
                       opset_version=18,
                   )
