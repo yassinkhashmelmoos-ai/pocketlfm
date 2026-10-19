@@ -494,7 +494,7 @@ jobs:
                       "attention_mask":    {0: "batch", 1: "sequence"},
                       "last_hidden_state": {0: "batch", 1: "sequence"},
                   },
-                  opset_version=17,
+                  opset_version=18,
                   dynamo=False,
                   autograd_inlining=False,
               )
@@ -565,7 +565,7 @@ jobs:
                           "pixel_values":      {0: "num_patches"},
                           "last_hidden_state": {0: "batch", 1: "sequence"},
                       },
-                      opset_version=17,
+                      opset_version=18,
                       dynamo=False,
                       autograd_inlining=False,
                   )
