@@ -487,7 +487,7 @@ jobs:
           from torch.export import Dim
           batch = Dim("batch", min=1)
           seq   = Dim("seq", min=1)
-
+          patches = Dim("patches", min=1)
           with torch.no_grad():
               torch.onnx.export(
                   TextEncoderWrapper(qwen), (dummy_ids, dummy_mask),
@@ -556,10 +556,7 @@ jobs:
               dummy_grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
               dummy_vis_ids  = torch.randint(0, 1000, (1, 80), dtype=torch.long)
               dummy_vis_mask = torch.ones((1, 80), dtype=torch.long)
-                            from torch.export import Dim
-              batch   = Dim("batch", min=1)
-              seq     = Dim("seq", min=1)
-              patches = Dim("patches", min=1)
+          
 
               with torch.no_grad():
                   torch.onnx.export(
