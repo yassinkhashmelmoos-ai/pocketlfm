@@ -41,14 +41,15 @@ jobs:
 
           echo "huggingface-hub>=0.34.0,<1.0" > /tmp/hf_constraints.txt
 
-          pip install --no-cache-dir -c /tmp/hf_constraints.txt \
+            pip install --no-cache-dir -c /tmp/hf_constraints.txt \
             "transformers==4.57.3" \
             accelerate \
             onnx \
+            onnxscript \
             "onnxruntime==1.18.0" \
             httpx
 
-          pip install --no-cache-dir --no-deps --force-reinstall \
+          pip install pip --no-deps --force-reinstall \
             "git+https://github.com/huggingface/diffusers.git"
 
           pip install --no-cache-dir --force-reinstall --no-deps -c /tmp/hf_constraints.txt \
