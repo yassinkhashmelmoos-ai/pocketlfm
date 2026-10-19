@@ -317,7 +317,7 @@ jobs:
           # flattened into a plain `time_ids` input for ONNX (dict kwargs aren't
           # ONNX-exportable). 1024x1024 output → 128x128 latents each side, 256
           # wide combined, matching DreamLite's native resolution.
-                    print("\n[2/3] UNet (carlofkl/DreamLite-base)...")
+          print("\n[2/3] UNet (carlofkl/DreamLite-base)...")
           unet_exported = False
           try:
               from torch.export import Dim
