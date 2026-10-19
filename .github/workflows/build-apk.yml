@@ -563,7 +563,7 @@ jobs:
                           "input_ids":         {0: batch, 1: seq},
                           "attention_mask":    {0: batch, 1: seq},
                           "pixel_values":      {0: patches},
-                          
+                          "image_grid_thw":    {},
                       },
                       opset_version=18,
                   )
