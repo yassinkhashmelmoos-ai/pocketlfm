@@ -569,38 +569,8 @@ jobs:
           qwen_vision = Qwen3VLForConditionalGeneration.from_pretrained(
               "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float16)
           qwen_vision.eval()
-          
-          
-          
-          FIXED_GRID = torch.tensor([[1, 36, 36]], dtype=torch.long)
-          seq_len = 36 * 36
 
-          # Bypass fast_pos_embed_interpolate: it calls torch.linspace with a
-          # data-dependent length derived from grid_thw, which torch.export
-          # cannot trace. Precompute the embeddings once with concrete values,
-          # then replace the method so tracing never enters the original code.
-          FIXED_GRID = torch.tensor([[1, 36, 36]], dtype=torch.long)
-          vision_tower = qwen_vision.model.visual
-
-          with torch.no_grad():
-              pos_embeds_fixed = vision_tower.fast_pos_embed_interpolate(FIXED_GRID)
-              rotary_fixed = vision_tower.rot_pos_emb(FIXED_GRID)
-              emb = torch.cat((rotary_fixed, rotary_fixed), dim=-1)
-              rot_cos_fixed = emb.cos()
-              rot_sin_fixed = emb.sin()
-
-          def _fixed_pos_embed(self, grid_thw):
-              return pos_embeds_fixed
-
-          def _fixed_rotary(self, grid_thw):
-              return rotary_fixed
-
-          vision_tower.fast_pos_embed_interpolate = _fixed_pos_embed.__get__(vision_tower)
-          vision_tower.rot_pos_emb = _fixed_rotary.__get__(vision_tower)
-
-          # Replace vision attention forward: skip torch.split entirely.
-          # For a single image, all patches attend to all patches — the split
-          # is a no-op. Uses plain SDPA, which the legacy exporter can trace.
+          # ── Patch 1: replace vision attention forward to skip torch.split ──
           import types
           import torch.nn.functional as F
           from transformers.models.qwen3_vl.modeling_qwen3_vl import (
@@ -625,21 +595,67 @@ jobs:
 
               attn_output = F.scaled_dot_product_attention(
                   q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
-
               attn_output = attn_output.transpose(1, 2).reshape(seq_length, -1).contiguous()
               return self.proj(attn_output)
 
           vision_tower = qwen_vision.model.visual
           for blk in vision_tower.blocks:
               blk.attn.forward = types.MethodType(_patched_vision_attn_forward, blk.attn)
-              
+
+          # ── Patch 2: precompute pos_embeds / rotary for the fixed grid ──
+          FIXED_GRID = torch.tensor([[1, 36, 36]], dtype=torch.long)
+
+          with torch.no_grad():
+              pos_embeds_fixed = vision_tower.fast_pos_embed_interpolate(FIXED_GRID)
+              rotary_fixed = vision_tower.rot_pos_emb(FIXED_GRID)
+
+          def _fixed_pos_embed(self, grid_thw):
+              return pos_embeds_fixed
+
+          def _fixed_rotary(self, grid_thw):
+              return rotary_fixed
+
+          vision_tower.fast_pos_embed_interpolate = _fixed_pos_embed.__get__(vision_tower)
+          vision_tower.rot_pos_emb = _fixed_rotary.__get__(vision_tower)
+
+          # ── Build valid dummy inputs ──
+          from transformers import AutoTokenizer
+          _tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
+          image_pad_id    = _tok.convert_tokens_to_ids("<|image_pad|>")
+          vision_start_id = _tok.convert_tokens_to_ids("<|vision_start|>")
+          vision_end_id   = _tok.convert_tokens_to_ids("<|vision_end|>")
+
+          num_image_tokens = (36 // 2) * (36 // 2)  # 324
+          text_ids = _tok.encode("describe this image", add_special_tokens=False)
+
+          dummy_vis_ids = torch.tensor([[
+              vision_start_id,
+              *([image_pad_id] * num_image_tokens),
+              vision_end_id,
+              *text_ids,
+          ]], dtype=torch.long)
+          dummy_vis_mask = torch.ones_like(dummy_vis_ids)
+
+          patch_size, temporal_patch_size, merge_size = 16, 2, 2
+          grid_h = grid_w = 36
+          n_patches = grid_h * grid_w
+          dummy_pixel_values = torch.randn(
+              n_patches, 3 * temporal_patch_size * patch_size * patch_size)
+
+          # ── Wrapper ──
           class VisionTextEncoderWrapper(torch.nn.Module):
               def __init__(self, model):
                   super().__init__()
                   self.model = model
               def forward(self, input_ids, attention_mask, pixel_values):
-          from torch.export import Dim
+                  out = self.model(
+                      input_ids=input_ids, attention_mask=attention_mask,
+                      pixel_values=pixel_values, image_grid_thw=FIXED_GRID,
+                      output_hidden_states=True, use_cache=False)
+                  return out.hidden_states[-1]
 
+          # ── Export ──
+          from torch.export import Dim
           batch = Dim("batch", min=1)
           seq   = Dim("seq", min=1)
 
@@ -654,7 +670,7 @@ jobs:
                   dynamic_shapes={
                       "input_ids":      {0: batch, 1: seq},
                       "attention_mask": {0: batch, 1: seq},
-                      "pixel_values":   {},          # static: 1296 patches
+                      "pixel_values":   {},
                   },
                   opset_version=18,
               )
