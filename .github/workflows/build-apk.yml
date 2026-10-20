@@ -659,7 +659,7 @@ jobs:
                   input_names=["input_ids", "attention_mask", "pixel_values"],
                   output_names=["last_hidden_state"],
                   dynamo=True,
-                  dynamic_shapes={
+                  dynamic_axes={
                       "input_ids":      {0: batch, 1: seq},
                       "attention_mask": {0: batch, 1: seq},
                       "pixel_values":   {},
