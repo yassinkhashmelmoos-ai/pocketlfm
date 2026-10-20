@@ -595,9 +595,7 @@ jobs:
           fixed_seq = (36 // 2) * (36 // 2)  # merge_size=2 → 324 tokens
           vision_tower = qwen_vision.model.visual
           
-          for blk in vision_tower.blocks:
-              blk.attn.forward = patched_attn_forward.__get__(blk.attn)
-              
+          
           # Precompute pos_embeds and rot_pos_emb for fixed 36x36 grid
           # to avoid torch.linspace(data-dependent) in fast_pos_embed_interpolate
           grid_thw_fixed = torch.tensor([[1, 36, 36]], dtype=torch.long)
