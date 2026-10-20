@@ -494,13 +494,27 @@ jobs:
                   "dreamlite_onnx/text_encoder_fp16.onnx",
                   input_names=["input_ids", "attention_mask"],
                   output_names=["last_hidden_state"],
-                  dynamo=True,
-                  dynamic_shapes={
-                      "input_ids":         {0: batch, 1: seq},
-                      "attention_mask":    {0: batch, 1: seq},
-                      
+                  # FIX: dynamo=True (torch.export-based exporter) fails this specific
+                  # model with "Could not guard on data-dependent expression Eq(u0, 0)"
+                  # inside Qwen3-VL's attention forward (modeling_qwen3_vl.py:227,
+                  # torch.split(tensor, lengths.tolist(), ...)) — torch.export demands a
+                  # static guarantee about a value (whether there are zero attention
+                  # "segments") that's only known at runtime. This wrapper is always
+                  # called with text-only input (no images), so that branch is the same
+                  # branch on every real call it will ever make — the legacy, trace-
+                  # based exporter (dynamo=False, same mode already used for the UNet
+                  # export above) just records that one concrete trace instead of
+                  # proving it holds for all inputs, which sidesteps the guard entirely
+                  # and is correct here precisely because this encoder's input shape
+                  # of problem (text-only) never varies. dynamic_axes replaces
+                  # dynamic_shapes because that's what the legacy exporter accepts
+                  # (see the matching dynamic_axes on the VAE/UNet exports above).
+                  dynamic_axes={
+                      "input_ids":         {0: "batch", 1: "sequence"},
+                      "attention_mask":    {0: "batch", 1: "sequence"},
                   },
                   opset_version=18,
+                  dynamo=False,
               )
           del qwen
           gc.collect()
