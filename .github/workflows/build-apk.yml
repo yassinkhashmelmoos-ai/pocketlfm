@@ -597,29 +597,38 @@ jobs:
           def _full_vision_attn_forward(self, hidden_states, cu_seqlens=None,
                                         rotary_pos_emb=None, position_embeddings=None, **kwargs):
               seq_length = hidden_states.shape[0]
-              q, k, v = (self.qkv(hidden_states)
-                         .reshape(seq_length, 3, self.num_heads, -1)
-                         .permute(1, 0, 2, 3).unbind(0))
 
-              cos, sin = position_embeddings
-              cos = cos.unsqueeze(-2).float()
-              sin = sin.unsqueeze(-2).float()
+              # qkv: Linear(3072, 1024) → (seq, 3072)
+              qkv = self.qkv(hidden_states)
+              qkv = qkv.reshape(seq_length, 3, self.num_heads, self.head_dim)  # (seq, 3, 16, 64)
+              qkv = qkv.permute(1, 0, 2, 3)  # (3, seq, 16, 64)
+              q, k, v = qkv.unbind(0)  # each (seq, 16, 64)
 
-              def _rot(x):
-                  x1, x2 = torch.chunk(x.float(), 2, dim=-1)
-                  return torch.cat((-x2, x1), dim=-1)
+              # Apply rotary if position embeddings provided
+              if position_embeddings is not None:
+                  cos, sin = position_embeddings
+                  if cos.dim() == 2:
+                      cos = cos.unsqueeze(1)  # (seq, 1, head_dim)
+                      sin = sin.unsqueeze(1)
+                  def _rotate_half(x):
+                      x1 = x[..., :x.shape[-1] // 2]
+                      x2 = x[..., x.shape[-1] // 2:]
+                      return torch.cat((-x2, x1), dim=-1)
+                  q = q * cos + _rotate_half(q) * sin
+                  k = k * cos + _rotate_half(k) * sin
 
-              q = ((q.float() * cos) + (_rot(q) * sin)).to(v.dtype)
-              k = ((k.float() * cos) + (_rot(k) * sin)).to(v.dtype)
+              # (seq, 16, 64) → (16, seq, 64) → (1, 16, seq, 64)
+              q = q.permute(1, 0, 2).unsqueeze(0)
+              k = k.permute(1, 0, 2).unsqueeze(0)
+              v = v.permute(1, 0, 2).unsqueeze(0)
 
-              q = q.transpose(0, 1).unsqueeze(0)
-              k = k.transpose(0, 1).unsqueeze(0)
-              v = v.transpose(0, 1).unsqueeze(0)
-
-              attn_output = torch.nn.functional.scaled_dot_product_attention(
+              attn_out = torch.nn.functional.scaled_dot_product_attention(
                   q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
-              attn_output = attn_output.transpose(1, 2).reshape(seq_length, -1).contiguous()
-              return self.proj(attn_output)
+
+              # (1, 16, seq, 64) → (seq, 16, 64) → (seq, 1024)
+              attn_out = attn_out.squeeze(0).permute(1, 0, 2).reshape(seq_length, -1)
+              return self.proj(attn_out)
+              
 
           import types
           vision_tower = qwen_vision.model.visual
