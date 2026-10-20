@@ -660,12 +660,40 @@ jobs:
               def __init__(self, model):
                   super().__init__()
                   self.model = model
-              def forward(self, input_ids, attention_mask, pixel_values, position_ids):
+
+              def forward(self, input_ids, attention_mask, pixel_values):
+                  seq_len = input_ids.shape[1]
+                  device = input_ids.device
+
+                  # Fixed image token count for 36x36 grid, merge_size 2
+                  num_image = (36 // 2) * (36 // 2)  # 324
+                  merged_w = 36 // 2                # 18
+
+                  # Image positions: T=0, H=row, W=col
+                  i = torch.arange(num_image, device=device)
+                  img_t = torch.zeros(num_image, dtype=torch.long, device=device)
+                  img_h = i // merged_w
+                  img_w = i % merged_w
+
+                  # Text positions: start at max(image H/W) + 1 = 18
+                  text_len = seq_len - num_image
+                  text_pos = torch.arange(text_len, device=device) + 18
+
+                  # Assemble [3, batch=1, seq_len]
+                  pos_t = torch.cat([img_t, text_pos], dim=0).unsqueeze(0).unsqueeze(0)
+                  pos_h = torch.cat([img_h, text_pos], dim=0).unsqueeze(0).unsqueeze(0)
+                  pos_w = torch.cat([img_w, text_pos], dim=0).unsqueeze(0).unsqueeze(0)
+                  position_ids = torch.cat([pos_t, pos_h, pos_w], dim=0)  # [3, 1, seq_len]
+
                   out = self.model(
-                      input_ids=input_ids, attention_mask=attention_mask,
-                      pixel_values=pixel_values, image_grid_thw=FIXED_GRID,
+                      input_ids=input_ids,
+                      attention_mask=attention_mask,
+                      pixel_values=pixel_values,
+                      image_grid_thw=FIXED_GRID,
                       position_ids=position_ids,
-                      output_hidden_states=True, use_cache=False)
+                      output_hidden_states=True,
+                      use_cache=False,
+                  )
                   return out.hidden_states[-1]
 
           from torch.export import Dim
@@ -675,16 +703,15 @@ jobs:
           with torch.no_grad():
               torch.onnx.export(
                   VisionTextEncoderWrapper(qwen_vision),
-                  (dummy_vis_ids, dummy_vis_mask, dummy_pixel_values, dummy_pos_ids),
+                  (dummy_vis_ids, dummy_vis_mask, dummy_pixel_values),
                   "dreamlite_onnx/text_encoder_edit_fp16.onnx",
-                  input_names=["input_ids", "attention_mask", "pixel_values", "position_ids"],
+                  input_names=["input_ids", "attention_mask", "pixel_values"],
                   output_names=["last_hidden_state"],
                   dynamo=True,
                   dynamic_shapes={
                       "input_ids":      {0: batch, 1: seq},
                       "attention_mask": {0: batch, 1: seq},
                       "pixel_values":   {},
-                      "position_ids":   {1: batch, 2: seq},
                   },
                   opset_version=18,
               )
@@ -744,6 +771,7 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import os, gc, json
+          import onnx
           from onnxruntime.quantization import quantize_dynamic, QuantType
 
           src = "dreamlite_onnx/text_encoder_edit_fp16.onnx"
@@ -752,6 +780,12 @@ jobs:
           if not os.path.exists(src):
               print(f"⚠ {src} not found — skipping (edit mode unavailable)")
           else:
+              # ── Strip stale value_info before quantization ──
+              model = onnx.load(src)
+              del model.graph.value_info[:]
+              onnx.save(model, src)
+              print(f"  stripped value_info from {src}")
+
               print(f"quantizing {src} ({os.path.getsize(src)//1024//1024} MB)...")
               quantize_dynamic(
                   model_input=str(src),
