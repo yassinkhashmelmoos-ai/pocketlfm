@@ -638,18 +638,7 @@ jobs:
           ]], dtype=torch.long)
           dummy_vis_mask = torch.ones_like(dummy_vis_ids)
 
-          # ── Compute dummy position_ids ONCE with the ORIGINAL get_rope_index ──
-          # These values are used only for tracing; at runtime the Kotlin side
-          # computes real position_ids for the actual prompt length.
-          with torch.no_grad():
-              dummy_pos_ids, _ = Qwen3VLModel.get_rope_index(
-                  qwen_vision.model,
-                  input_ids=dummy_vis_ids,
-                  image_grid_thw=FIXED_GRID,
-                  attention_mask=dummy_vis_mask,
-              )
-          print(f"  dummy position_ids shape: {tuple(dummy_pos_ids.shape)}")
-
+          
           patch_size, temporal_patch_size, merge_size = 16, 2, 2
           grid_h = grid_w = 36
           n_patches = grid_h * grid_w
