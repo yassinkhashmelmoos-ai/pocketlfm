@@ -641,7 +641,32 @@ jobs:
           n_patches = grid_h * grid_w
           dummy_pixel_values = torch.randn(
               n_patches, 3 * temporal_patch_size * patch_size * patch_size)
+          
+          # ── Patch 3: skip get_placeholder_mask validation and deepstack fusion ──
+          # These use boolean-mask indexing (nonzero()) whose output shape depends
+          # on tensor VALUES, not shapes. torch.export cannot trace them.
+          # Source: Ascend/msmodeling production patch for Qwen3-VL export.
+          from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+              Qwen3VLModel,
+              Qwen3VLTextModel,
+          )
 
+          _ORIGINAL_GET_PLACEHOLDER = Qwen3VLModel.get_placeholder_mask
+
+          def _patched_get_placeholder_mask(self, *args, **kwargs):
+              # Force image_features to None → skips tensor-count validation
+              kwargs["image_features"] = None
+              return _ORIGINAL_GET_PLACEHOLDER(self, *args, **kwargs)
+
+          Qwen3VLModel.get_placeholder_mask = _patched_get_placeholder_mask
+
+          def _patched_deepstack_process(self, hidden_states, visual_pos_masks, visual_embeds):
+              # Skip deepstack fusion (not needed for export; numerically a no-op
+              # for single-image inference where deepstack embeddings are zero)
+              return hidden_states
+
+          Qwen3VLTextModel._deepstack_process = _patched_deepstack_process
+          
           # ── Wrapper ──
           class VisionTextEncoderWrapper(torch.nn.Module):
               def __init__(self, model):
