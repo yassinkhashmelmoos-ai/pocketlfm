@@ -650,28 +650,28 @@ jobs:
                   super().__init__()
                   self.model = model
 
-              def forward(self, input_ids, attention_mask, pixel_values):
+                  def forward(self, input_ids, attention_mask, pixel_values):
                   seq_len = input_ids.shape[1]
                   device = input_ids.device
 
-                  # Fixed image token count for 36x36 grid, merge_size 2
                   num_image = (36 // 2) * (36 // 2)  # 324
                   merged_w = 36 // 2                # 18
+                  merged_h = 36 // 2                # 18
 
-                  # Image positions: T=0, H=row, W=col
+                  # Layout: [vision_start] + [image_pad × 324] + [vision_end + text]
+                  tail_len = seq_len - num_image - 1  # -1 for vision_start
+
                   i = torch.arange(num_image, device=device)
                   img_t = torch.zeros(num_image, dtype=torch.long, device=device)
                   img_h = i // merged_w
                   img_w = i % merged_w
 
-                  # Text positions: start at max(image H/W) + 1 = 18
-                  text_len = seq_len - num_image
-                  text_pos = torch.arange(text_len, device=device) + 18
+                  start = torch.zeros(1, dtype=torch.long, device=device)
+                  tail = torch.arange(tail_len, device=device) + merged_h
 
-                  # Assemble [3, batch=1, seq_len]
-                  pos_t = torch.cat([img_t, text_pos], dim=0).unsqueeze(0).unsqueeze(0)
-                  pos_h = torch.cat([img_h, text_pos], dim=0).unsqueeze(0).unsqueeze(0)
-                  pos_w = torch.cat([img_w, text_pos], dim=0).unsqueeze(0).unsqueeze(0)
+                  pos_t = torch.cat([start, img_t, tail], dim=0).unsqueeze(0).unsqueeze(0)
+                  pos_h = torch.cat([start, img_h, tail], dim=0).unsqueeze(0).unsqueeze(0)
+                  pos_w = torch.cat([start, img_w, tail], dim=0).unsqueeze(0).unsqueeze(0)
                   position_ids = torch.cat([pos_t, pos_h, pos_w], dim=0)  # [3, 1, seq_len]
 
                   out = self.model(
