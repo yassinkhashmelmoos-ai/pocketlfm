@@ -588,7 +588,28 @@ jobs:
           dummy_grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
           dummy_vis_ids  = torch.randint(0, 1000, (1, 80), dtype=torch.long)
           dummy_vis_mask = torch.ones((1, 80), dtype=torch.long)
+          
+          # Precompute pos_embeds and rot_pos_emb for fixed 36x36 grid
+          # to avoid torch.linspace(data-dependent) in fast_pos_embed_interpolate
+          grid_thw_fixed = torch.tensor([[1, 36, 36]], dtype=torch.long)
+          vision = qwen_vision.model.visual   # Qwen3-VL vision tower
 
+          with torch.no_grad():
+              pos_embeds_fixed = vision.fast_pos_embed_interpolate(grid_thw_fixed)
+              rotary_fixed = vision.rot_pos_emb(grid_thw_fixed)
+              emb = torch.cat((rotary_fixed, rotary_fixed), dim=-1)
+              rot_cos_fixed = emb.cos()
+              rot_sin_fixed = emb.sin()
+
+          # Monkey-patch so tracing never calls the dynamic linspace path
+          def _fixed_pos_embed(self, grid_thw):
+              return pos_embeds_fixed
+          def _fixed_rotary(self, grid_thw):
+              return rotary_fixed
+
+          vision.fast_pos_embed_interpolate = _fixed_pos_embed.__get__(vision)
+          vision.rot_pos_emb = _fixed_rotary.__get__(vision)
+          
           with torch.no_grad():
               torch.onnx.export(
                   VisionTextEncoderWrapper(qwen_vision),
