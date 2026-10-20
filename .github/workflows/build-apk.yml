@@ -570,26 +570,7 @@ jobs:
               "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float16)
           qwen_vision.eval()
           
-          # DIAGNOSTIC: capture original vision attention source
-          import inspect
-          _attn = qwen_vision.model.visual.blocks[0].attn
-          print("=== VISION ATTENTION FORWARD SOURCE ===")
-          print(inspect.getsource(_attn.forward))
-          print("=== ATTN CHILDREN ===")
-          for _n, _ in _attn.named_children():
-              print(f"  {_n}")
-          print("=== ATTN ATTRS ===")
-          for _a in ("num_heads", "head_dim", "hidden_size", "embed_dim", "qkv", "proj"):
-              _v = getattr(_attn, _a, "<missing>")
-              if hasattr(_v, "weight"):
-                  print(f"  {_a}: {type(_v).__name__}({tuple(_v.weight.shape)})")
-              else:
-                  print(f"  {_a}: {_v}")
-          _vc = qwen_vision.config.vision_config
-          print("=== VISION CONFIG ===")
-          for _a in ("num_heads", "head_dim", "hidden_size", "embed_dim", "depth", "patch_size"):
-              print(f"  {_a}: {getattr(_vc, _a, '<missing>')}")
-          print("=== END DIAGNOSTIC ===")
+          
           
           FIXED_GRID = torch.tensor([[1, 36, 36]], dtype=torch.long)
           seq_len = 36 * 36
@@ -616,7 +597,42 @@ jobs:
 
           vision_tower.fast_pos_embed_interpolate = _fixed_pos_embed.__get__(vision_tower)
           vision_tower.rot_pos_emb = _fixed_rotary.__get__(vision_tower)
-          
+
+          # Replace vision attention forward: skip torch.split entirely.
+          # For a single image, all patches attend to all patches — the split
+          # is a no-op. Uses plain SDPA, which the legacy exporter can trace.
+          import types
+          import torch.nn.functional as F
+          from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+              apply_rotary_pos_emb_vision,
+          )
+
+          def _patched_vision_attn_forward(self, hidden_states, cu_seqlens=None,
+                                            position_embeddings=None, **kwargs):
+              seq_length = hidden_states.shape[0]
+              q, k, v = (
+                  self.qkv(hidden_states)
+                  .reshape(seq_length, 3, self.num_heads, self.head_dim)
+                  .permute(1, 0, 2, 3)
+                  .unbind(0)
+              )
+              cos, sin = position_embeddings
+              q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+
+              q = q.transpose(0, 1).unsqueeze(0)
+              k = k.transpose(0, 1).unsqueeze(0)
+              v = v.transpose(0, 1).unsqueeze(0)
+
+              attn_output = F.scaled_dot_product_attention(
+                  q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+
+              attn_output = attn_output.transpose(1, 2).reshape(seq_length, -1).contiguous()
+              return self.proj(attn_output)
+
+          vision_tower = qwen_vision.model.visual
+          for blk in vision_tower.blocks:
+              blk.attn.forward = types.MethodType(_patched_vision_attn_forward, blk.attn)
+              
           class VisionTextEncoderWrapper(torch.nn.Module):
               def __init__(self, model):
                   super().__init__()
@@ -648,7 +664,8 @@ jobs:
                       "attention_mask": {0: batch, 1: seq},
                       "pixel_values":   {},
                   },
-                  opset_version=18,
+                  opset_version=19,
+                  dynamo=False,
               )
               
           del qwen_vision
