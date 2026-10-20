@@ -650,7 +650,7 @@ jobs:
                   super().__init__()
                   self.model = model
 
-                  def forward(self, input_ids, attention_mask, pixel_values):
+              def forward(self, input_ids, attention_mask, pixel_values):
                   seq_len = input_ids.shape[1]
                   device = input_ids.device
 
