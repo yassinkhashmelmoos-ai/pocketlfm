@@ -602,7 +602,59 @@ jobs:
           for blk in vision_tower.blocks:
               blk.attn.forward = types.MethodType(_patched_vision_attn_forward, blk.attn)
 
-          # ── Patch 2: precompute pos_embeds / rotary for the fixed grid ──
+                - name: Export edit-mode text encoder (isolated, non-fatal)
+        continue-on-error: true
+        run: |
+          python3 << 'PYEOF'
+          import os, gc, json, torch
+
+          def merge_manifest(extra):
+              with open("dreamlite_onnx/manifest.json") as f:
+                  m = json.load(f)
+              m["params"].update(extra)
+              files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
+              m["components"] = files
+              m["has_edit_encoder"] = "text_encoder_edit_fp16.onnx" in files or "text_encoder_edit.onnx" in files
+              with open("dreamlite_onnx/manifest.json", "w") as f:
+                  json.dump(m, f, indent=2)
+
+          from transformers import Qwen3VLForConditionalGeneration, AutoTokenizer
+
+          print("[1/1] Edit-mode text encoder...")
+          qwen_vision = Qwen3VLForConditionalGeneration.from_pretrained(
+              "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float16)
+          qwen_vision.eval()
+
+          import types
+          import torch.nn.functional as F
+          from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+              apply_rotary_pos_emb_vision,
+              Qwen3VLModel,
+          )
+
+          def _patched_vision_attn_forward(self, hidden_states, cu_seqlens=None,
+                                            position_embeddings=None, **kwargs):
+              seq_length = hidden_states.shape[0]
+              q, k, v = (
+                  self.qkv(hidden_states)
+                  .reshape(seq_length, 3, self.num_heads, self.head_dim)
+                  .permute(1, 0, 2, 3)
+                  .unbind(0)
+              )
+              cos, sin = position_embeddings
+              q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+              q = q.transpose(0, 1).unsqueeze(0)
+              k = k.transpose(0, 1).unsqueeze(0)
+              v = v.transpose(0, 1).unsqueeze(0)
+              attn_output = F.scaled_dot_product_attention(
+                  q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+              attn_output = attn_output.transpose(1, 2).reshape(seq_length, -1).contiguous()
+              return self.proj(attn_output)
+
+          vision_tower = qwen_vision.model.visual
+          for blk in vision_tower.blocks:
+              blk.attn.forward = types.MethodType(_patched_vision_attn_forward, blk.attn)
+
           FIXED_GRID = torch.tensor([[1, 36, 36]], dtype=torch.long)
 
           with torch.no_grad():
@@ -618,14 +670,23 @@ jobs:
           vision_tower.fast_pos_embed_interpolate = _fixed_pos_embed.__get__(vision_tower)
           vision_tower.rot_pos_emb = _fixed_rotary.__get__(vision_tower)
 
-          # ── Build valid dummy inputs ──
-          from transformers import AutoTokenizer
+          _ORIGINAL_GET_PLACEHOLDER = Qwen3VLModel.get_placeholder_mask
+          def _patched_get_placeholder_mask(self, *args, **kwargs):
+              kwargs["image_features"] = None
+              return _ORIGINAL_GET_PLACEHOLDER(self, *args, **kwargs)
+          Qwen3VLModel.get_placeholder_mask = _patched_get_placeholder_mask
+
+          from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
+          def _patched_deepstack_process(self, hidden_states, visual_pos_masks, visual_embeds):
+              return hidden_states
+          Qwen3VLTextModel._deepstack_process = _patched_deepstack_process
+
           _tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
           image_pad_id    = _tok.convert_tokens_to_ids("<|image_pad|>")
           vision_start_id = _tok.convert_tokens_to_ids("<|vision_start|>")
           vision_end_id   = _tok.convert_tokens_to_ids("<|vision_end|>")
 
-          num_image_tokens = (36 // 2) * (36 // 2)  # 324
+          num_image_tokens = (36 // 2) * (36 // 2)
           text_ids = _tok.encode("describe this image", add_special_tokens=False)
 
           dummy_vis_ids = torch.tensor([[
@@ -636,72 +697,36 @@ jobs:
           ]], dtype=torch.long)
           dummy_vis_mask = torch.ones_like(dummy_vis_ids)
 
+          # ── Compute dummy position_ids ONCE with the ORIGINAL get_rope_index ──
+          # These values are used only for tracing; at runtime the Kotlin side
+          # computes real position_ids for the actual prompt length.
+          with torch.no_grad():
+              dummy_pos_ids, _ = Qwen3VLModel.get_rope_index(
+                  qwen_vision.model,
+                  input_ids=dummy_vis_ids,
+                  image_grid_thw=FIXED_GRID,
+                  attention_mask=dummy_vis_mask,
+              )
+          print(f"  dummy position_ids shape: {tuple(dummy_pos_ids.shape)}")
+
           patch_size, temporal_patch_size, merge_size = 16, 2, 2
           grid_h = grid_w = 36
           n_patches = grid_h * grid_w
           dummy_pixel_values = torch.randn(
               n_patches, 3 * temporal_patch_size * patch_size * patch_size)
-          
-          # ── Patch 3: skip get_placeholder_mask validation and deepstack fusion ──
-          # These use boolean-mask indexing (nonzero()) whose output shape depends
-          # on tensor VALUES, not shapes. torch.export cannot trace them.
-          # Source: Ascend/msmodeling production patch for Qwen3-VL export.
-          from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-              Qwen3VLModel,
-              Qwen3VLTextModel,
-          )
 
-          _ORIGINAL_GET_PLACEHOLDER = Qwen3VLModel.get_placeholder_mask
-
-          def _patched_get_placeholder_mask(self, *args, **kwargs):
-              # Force image_features to None → skips tensor-count validation
-              kwargs["image_features"] = None
-              return _ORIGINAL_GET_PLACEHOLDER(self, *args, **kwargs)
-
-          Qwen3VLModel.get_placeholder_mask = _patched_get_placeholder_mask
-
-          def _patched_deepstack_process(self, hidden_states, visual_pos_masks, visual_embeds):
-              # Skip deepstack fusion (not needed for export; numerically a no-op
-              # for single-image inference where deepstack embeddings are zero)
-              return hidden_states
-
-          Qwen3VLTextModel._deepstack_process = _patched_deepstack_process
-          
-          # ── Patch 4: bypass get_rope_index (input_ids.tolist() is data-dependent) ──
-          # Production ONNX exporters precompute position_ids once with concrete
-          # inputs, then replace the method so tracing never enters .tolist().
-          # Source: Isaac-GR00T export_onnx_n1d7.py, Ascend msmodeling.
-          from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
-
-          _orig_get_rope_index = Qwen3VLModel.get_rope_index
-
-          with torch.no_grad():
-              _pos_ids_fixed, _rope_deltas_fixed = _orig_get_rope_index(
-                  qwen_vision.model,
-                  input_ids=dummy_vis_ids,
-                  image_grid_thw=FIXED_GRID,
-                  video_grid_thw=None,
-                  attention_mask=dummy_vis_mask,
-              )
-
-          def _fixed_get_rope_index(self, *args, **kwargs):
-              return _pos_ids_fixed, _rope_deltas_fixed
-
-          Qwen3VLModel.get_rope_index = _fixed_get_rope_index
-          
-          # ── Wrapper ──
           class VisionTextEncoderWrapper(torch.nn.Module):
               def __init__(self, model):
                   super().__init__()
                   self.model = model
-              def forward(self, input_ids, attention_mask, pixel_values):
+              def forward(self, input_ids, attention_mask, pixel_values, position_ids):
                   out = self.model(
                       input_ids=input_ids, attention_mask=attention_mask,
                       pixel_values=pixel_values, image_grid_thw=FIXED_GRID,
+                      position_ids=position_ids,
                       output_hidden_states=True, use_cache=False)
                   return out.hidden_states[-1]
 
-          # ── Export ──
           from torch.export import Dim
           batch = Dim("batch", min=1)
           seq   = Dim("seq", min=1)
@@ -709,29 +734,31 @@ jobs:
           with torch.no_grad():
               torch.onnx.export(
                   VisionTextEncoderWrapper(qwen_vision),
-                  (dummy_vis_ids, dummy_vis_mask, dummy_pixel_values),
+                  (dummy_vis_ids, dummy_vis_mask, dummy_pixel_values, dummy_pos_ids),
                   "dreamlite_onnx/text_encoder_edit_fp16.onnx",
-                  input_names=["input_ids", "attention_mask", "pixel_values"],
+                  input_names=["input_ids", "attention_mask", "pixel_values", "position_ids"],
                   output_names=["last_hidden_state"],
                   dynamo=True,
                   dynamic_shapes={
                       "input_ids":      {0: batch, 1: seq},
                       "attention_mask": {0: batch, 1: seq},
                       "pixel_values":   {},
+                      "position_ids":   {1: batch, 2: seq},
                   },
                   opset_version=18,
               )
-            
           del qwen_vision
           gc.collect()
           print(f"✓ text_encoder_edit_fp16.onnx: {os.path.getsize('dreamlite_onnx/text_encoder_edit_fp16.onnx')//1024//1024} MB")
 
           merge_manifest({
-              "vision_patch_size": patch_size,
-              "vision_temporal_patch_size": temporal_patch_size,
-              "vision_merge_size": merge_size,
+              "vision_patch_size": 16,
+              "vision_temporal_patch_size": 2,
+              "vision_merge_size": 2,
               "vision_image_mean": [0.48145466, 0.4578275, 0.40821073],
               "vision_image_std":  [0.26862954, 0.26130258, 0.27577711],
+              "vision_grid_h": 36,
+              "vision_grid_w": 36,
           })
           PYEOF
           
