@@ -667,6 +667,28 @@ jobs:
 
           Qwen3VLTextModel._deepstack_process = _patched_deepstack_process
           
+          # ── Patch 4: bypass get_rope_index (input_ids.tolist() is data-dependent) ──
+          # Production ONNX exporters precompute position_ids once with concrete
+          # inputs, then replace the method so tracing never enters .tolist().
+          # Source: Isaac-GR00T export_onnx_n1d7.py, Ascend msmodeling.
+          from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLModel
+
+          _orig_get_rope_index = Qwen3VLModel.get_rope_index
+
+          with torch.no_grad():
+              _pos_ids_fixed, _rope_deltas_fixed = _orig_get_rope_index(
+                  qwen_vision.model,
+                  input_ids=dummy_vis_ids,
+                  image_grid_thw=FIXED_GRID,
+                  video_grid_thw=None,
+                  attention_mask=dummy_vis_mask,
+              )
+
+          def _fixed_get_rope_index(self, *args, **kwargs):
+              return _pos_ids_fixed, _rope_deltas_fixed
+
+          Qwen3VLModel.get_rope_index = _fixed_get_rope_index
+          
           # ── Wrapper ──
           class VisionTextEncoderWrapper(torch.nn.Module):
               def __init__(self, model):
