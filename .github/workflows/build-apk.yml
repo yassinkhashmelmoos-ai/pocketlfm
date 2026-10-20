@@ -526,7 +526,7 @@ jobs:
           # failure here doesn't take down generate-mode, which doesn't need any
           # of this.
           
-
+          patch_size, temporal_patch_size, merge_size = 14, 2, 2
           merge_manifest({
                   "vision_patch_size": patch_size,
                   "vision_temporal_patch_size": temporal_patch_size,
@@ -560,7 +560,7 @@ jobs:
 
           from transformers import Qwen3VLForConditionalGeneration
           from torch.export import Dim
-          patch_size, temporal_patch_size, merge_size = 14, 2, 2
+          
           batch   = Dim("batch", min=1)
           seq     = Dim("seq", min=1)
           patches = Dim("patches", min=1)
