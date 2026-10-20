@@ -594,6 +594,28 @@ jobs:
           FIXED_GRID = torch.tensor([[1, 36, 36]], dtype=torch.long)
           seq_len = 36 * 36
 
+          # Bypass fast_pos_embed_interpolate: it calls torch.linspace with a
+          # data-dependent length derived from grid_thw, which torch.export
+          # cannot trace. Precompute the embeddings once with concrete values,
+          # then replace the method so tracing never enters the original code.
+          FIXED_GRID = torch.tensor([[1, 36, 36]], dtype=torch.long)
+          vision_tower = qwen_vision.model.visual
+
+          with torch.no_grad():
+              pos_embeds_fixed = vision_tower.fast_pos_embed_interpolate(FIXED_GRID)
+              rotary_fixed = vision_tower.rot_pos_emb(FIXED_GRID)
+              emb = torch.cat((rotary_fixed, rotary_fixed), dim=-1)
+              rot_cos_fixed = emb.cos()
+              rot_sin_fixed = emb.sin()
+
+          def _fixed_pos_embed(self, grid_thw):
+              return pos_embeds_fixed
+
+          def _fixed_rotary(self, grid_thw):
+              return rot_cos_fixed, rot_sin_fixed
+
+          vision_tower.fast_pos_embed_interpolate = _fixed_pos_embed.__get__(vision_tower)
+          vision_tower.rot_pos_emb = _fixed_rotary.__get__(vision_tower)
           
           class VisionTextEncoderWrapper(torch.nn.Module):
               def __init__(self, model):
