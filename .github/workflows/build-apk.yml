@@ -717,6 +717,28 @@ jobs:
               "vision_grid_h": 36,
               "vision_grid_w": 36,
           })
+          # Verify ONNX matches PyTorch reference
+          try:
+              import onnxruntime as ort, numpy as np
+              with torch.no_grad():
+                  ref = qwen_vision(
+                      input_ids=dummy_vis_ids, attention_mask=dummy_vis_mask,
+                      pixel_values=dummy_pixel_values, image_grid_thw=FIXED_GRID,
+                      output_hidden_states=True, use_cache=False,
+                  ).hidden_states[-1].float().numpy()
+              sess = ort.InferenceSession(
+                  "dreamlite_onnx/text_encoder_edit_fp16.onnx",
+                  providers=["CPUExecutionProvider"])
+              ort_out = sess.run(None, {
+                  "input_ids": dummy_vis_ids.numpy(),
+                  "attention_mask": dummy_vis_mask.numpy(),
+                  "pixel_values": dummy_pixel_values.numpy(),
+              })[0]
+              diff = float(np.abs(ref - ort_out).max())
+              print(f"  VERIFY: max abs diff = {diff:.6f}")
+              print(f"  {'✓ MATCH' if diff < 0.01 else '⚠ MISMATCH — position_ids formula wrong'}")
+          except Exception as ve:
+              print(f"  (verification skipped: {ve})")
           PYEOF
           
       - name: Quantize generate-mode text encoder
@@ -770,7 +792,7 @@ jobs:
               print(f"⚠ {src} not found — skipping (edit mode unavailable)")
           else:
               # ── Strip stale value_info before quantization ──
-              model = onnx.load(src)
+              model = onnx.load(src, load_external_data=False)
               del model.graph.value_info[:]
               onnx.save(model, src)
               print(f"  stripped value_info from {src}")
