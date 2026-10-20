@@ -606,7 +606,7 @@ jobs:
                       output_hidden_states=True, use_cache=False)
                   return out.hidden_states[-1]
 
-          patch_size, temporal_patch_size, merge_size = 14, 2, 2
+          patch_size, temporal_patch_size, merge_size = 16, 2, 2
           grid_h = grid_w = 36
           n_patches = grid_h * grid_w
           dummy_pixel_values = torch.randn(n_patches, 3 * temporal_patch_size * patch_size * patch_size)
