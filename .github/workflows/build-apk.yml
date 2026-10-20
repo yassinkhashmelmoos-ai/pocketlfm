@@ -596,11 +596,9 @@ jobs:
           vision_tower = qwen_vision.model.visual
           original_attn_fwd = vision_tower.blocks[0].attn.forward
 
-          def patched_attn_forward(self, hidden_states, cu_seqlens, rotary_pos_emb=None, attention_mask=None):
-              return original_attn_fwd(
-                  hidden_states, cu_seqlens=None,
-                  rotary_pos_emb=rotary_pos_emb, attention_mask=attention_mask)
-
+          def patched_attn_forward(self, hidden_states, cu_seqlens=None, **kwargs):
+              return original_attn_fwd(hidden_states, cu_seqlens=None, **kwargs)
+              
           for blk in vision_tower.blocks:
               blk.attn.forward = patched_attn_forward.__get__(blk.attn)
               
