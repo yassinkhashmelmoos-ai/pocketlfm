@@ -703,7 +703,7 @@ jobs:
           })
           PYEOF
           
-            - name: Quantize generate-mode text encoder
+      - name: Quantize generate-mode text encoder
         run: |
           python3 << 'PYEOF'
           import os, gc, json
