@@ -658,7 +658,7 @@ jobs:
                   "dreamlite_onnx/text_encoder_edit_fp16.onnx",
                   input_names=["input_ids", "attention_mask", "pixel_values"],
                   output_names=["last_hidden_state"],
-                  dynamo=True,
+                
                   dynamic_axes={
                       "input_ids":      {0: batch, 1: seq},
                       "attention_mask": {0: batch, 1: seq},
