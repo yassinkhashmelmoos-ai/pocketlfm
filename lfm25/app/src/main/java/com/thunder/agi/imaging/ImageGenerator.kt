@@ -1,10 +1,15 @@
 package com.thunder.agi.imaging
 
 import ai.onnxruntime.*
+import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.os.Build
+import android.provider.MediaStore
 import android.util.Log
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -103,7 +108,14 @@ class ImageGenerator(private val context: Context) {
             val imageId: Int,
             val prompt: String,
             val source: String,
-            val bitmap: Bitmap? = null
+            val bitmap: Bitmap? = null,
+            // FIX (new): used by ChatViewModel's judgeGeneratedImage() to give the
+            // LFM real, grounded signals to reason over when deciding whether to
+            // retry — not vision (there's no vision tower wired in), just facts
+            // about what actually happened during generation.
+            val stepsUsed: Int = NUM_STEPS,
+            val guidanceUsed: Float = CFG_SCALE,
+            val qualityHint: String = "ok"
         ) : GenerationResult()
         data class Failure(val reason: String, val suggestion: String = "") : GenerationResult()
         data class InProgress(val step: Int, val totalSteps: Int, val preview: String) : GenerationResult()
@@ -111,6 +123,11 @@ class ImageGenerator(private val context: Context) {
 
     private val outputDir = File(context.filesDir, OUTPUT_DIR).also { it.mkdirs() }
     private val onnxEnv   = OrtEnvironment.getEnvironment()
+    // FIX (new): currentGuidanceScale/currentImageGuidanceScale previously lived
+    // only in memory — the self-improvement nudging (see launchSelfImprovementComparison)
+    // was silently thrown away every app restart. Persisting it is a one-line change
+    // and is the entire point of the self-improvement loop existing at all.
+    private val prefs = context.getSharedPreferences("thunder_imagen_prefs", Context.MODE_PRIVATE)
     private var textEncoderSession: OrtSession? = null
     private var textEncoderEditSession: OrtSession? = null  // FIX: new — vision+text path for true diptych editing
     private var vaeDecoderSession: OrtSession?  = null
@@ -120,8 +137,18 @@ class ImageGenerator(private val context: Context) {
     @Volatile private var onnxReady = false
     @Volatile private var modelsChecked = false  // FIX: guards the one-time lazy load below
     private val modelsLoadMutex = Mutex()
-    private var currentGuidanceScale = CFG_SCALE
-    private var registry = mutableMapOf<Int, String>()  // imageId → path
+    private var currentGuidanceScale = prefs.getFloat("cfg_scale", CFG_SCALE)
+    // FIX (new): the Gemini-specified image_guidance_scale parameter — this was a
+    // hardcoded constant (IMG_CFG) that could never be tuned or remembered. Now a
+    // persisted var, same treatment as currentGuidanceScale above, so the two stay
+    // consistent — see its use in the edit-mode triple-CFG formula below.
+    private var currentImageGuidanceScale = prefs.getFloat("image_cfg_scale", IMG_CFG)
+    // FIX: was Map<Int,String> (id -> path only). Extended with parentId so an
+    // edit chain can be walked back to "the original picture", and prompt/source
+    // so a message can later be re-described without re-reading the chat log —
+    // same registry, no new storage mechanism, just two more fields per entry.
+    data class ImageRecord(val path: String, val prompt: String, val source: String, val parentId: Int? = null)
+    private var registry = mutableMapOf<Int, ImageRecord>()
 
     // FIX: all of these are read from manifest.json (written by the export step in
     // build-apk.yml) in extractAndLoadModels() — the consts above are only the
@@ -407,14 +434,18 @@ class ImageGenerator(private val context: Context) {
         sourceImage: Bitmap? = null,
         webEnabled: Boolean = true,
         forceOffline: Boolean = false,
+        // FIX (new): lets a caller (editImage, below) say which existing image this
+        // one was derived from, so the registry can record real lineage instead of
+        // every image looking like a fresh, unrelated generation.
+        sourceImageId: Int? = null,
         progressCallback: ((Int, Int) -> Unit)? = null
     ): GenerationResult = withContext(Dispatchers.IO) {
         ensureModelsReady()  // FIX: no-op if preload() already finished; otherwise loads now
         Log.i(TAG, "Generate: '$prompt' offline=$onnxReady web=$webEnabled")
 
         val result = when {
-            onnxReady                  -> generateOffline(prompt, sourceImage, progressCallback)
-            webEnabled && !forceOffline -> generateOnline(prompt, sourceImage)
+            onnxReady                  -> generateOffline(prompt, sourceImage, sourceImageId, progressCallback)
+            webEnabled && !forceOffline -> generateOnline(prompt, sourceImage, sourceImageId)
             else -> GenerationResult.Failure(
                 "Image generation not available.",
                 "Enable web search for online generation, or the ONNX models will be bundled in the next build."
@@ -434,6 +465,7 @@ class ImageGenerator(private val context: Context) {
     private suspend fun generateOffline(
         prompt: String,
         sourceImage: Bitmap?,
+        sourceImageId: Int?,
         progressCallback: ((Int, Int) -> Unit)?
     ): GenerationResult {
         return try {
@@ -623,7 +655,7 @@ class ImageGenerator(private val context: Context) {
                         val uncond    = noisePred4d[0][ch][y][x]
                         val imageOnly = noisePred4d[1][ch][y][x]
                         val textImage = noisePred4d[2][ch][y][x]
-                        uncond + currentGuidanceScale * (textImage - imageOnly) + IMG_CFG * (imageOnly - uncond)
+                        uncond + currentGuidanceScale * (textImage - imageOnly) + currentImageGuidanceScale * (imageOnly - uncond)
                     } else {
                         val uncond = noisePred4d[0][ch][y][x]
                         val cond   = noisePred4d[1][ch][y][x]
@@ -647,10 +679,11 @@ class ImageGenerator(private val context: Context) {
             FileOutputStream(file).use { fos ->
                 bitmap.compress(Bitmap.CompressFormat.JPEG, 92, fos)
             }
-            registerImage(imageId, file.absolutePath)
+            registerImage(imageId, file.absolutePath, prompt, if (isEditMode) "offline-edit" else "offline", sourceImageId)
 
             Log.i(TAG, "Offline generation complete: image #$imageId")
-            GenerationResult.Success(file.absolutePath, imageId, prompt, "ThunderImagen-offline", bitmap)
+            GenerationResult.Success(file.absolutePath, imageId, prompt, "ThunderImagen-offline", bitmap,
+                NUM_STEPS, currentGuidanceScale, degenerateHint(bitmap))
         } catch (e: Exception) {
             Log.e(TAG, "Offline generation failed", e)
             GenerationResult.Failure("Offline generation error: ${e.message}")
@@ -659,7 +692,7 @@ class ImageGenerator(private val context: Context) {
 
     // ── Online generation (Pollinations.ai) ──────────────────────────────────
 
-    private suspend fun generateOnline(prompt: String, @Suppress("UNUSED_PARAMETER") sourceImage: Bitmap?): GenerationResult {
+    private suspend fun generateOnline(prompt: String, @Suppress("UNUSED_PARAMETER") sourceImage: Bitmap?, sourceImageId: Int? = null): GenerationResult {
         return try {
             val encoded = URLEncoder.encode(prompt, "UTF-8")
             val seed    = Random.nextInt(99999)
@@ -677,11 +710,12 @@ class ImageGenerator(private val context: Context) {
             val imageId = nextImageId()
             val file    = File(outputDir, "thunder_img_${imageId}.jpg")
             file.writeBytes(bytes)
-            registerImage(imageId, file.absolutePath)
+            registerImage(imageId, file.absolutePath, prompt, "online", sourceImageId)
 
             val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             Log.i(TAG, "Online generation complete: image #$imageId (${bytes.size/1024}KB)")
-            GenerationResult.Success(file.absolutePath, imageId, prompt, "Pollinations.ai", bitmap)
+            GenerationResult.Success(file.absolutePath, imageId, prompt, "Pollinations.ai", bitmap,
+                0, 0f, degenerateHint(bitmap))
         } catch (e: Exception) {
             Log.e(TAG, "Online generation failed", e)
             GenerationResult.Failure("Online generation failed: ${e.message}", "Check internet connection.")
@@ -703,14 +737,17 @@ class ImageGenerator(private val context: Context) {
         webEnabled: Boolean = true,
         progressCallback: ((Int, Int) -> Unit)? = null
     ): GenerationResult {
-        val sourcePath = registry[imageId]
+        val sourcePath = registry[imageId]?.path
             ?: return GenerationResult.Failure("Image #$imageId not found.")
         val sourceBitmap = android.graphics.BitmapFactory.decodeFile(sourcePath)
             ?: return GenerationResult.Failure("Cannot load image #$imageId")
 
         // Build an edit prompt combining instruction + image context
         val editPrompt = "$instruction, high quality, detailed"
-        return generate(editPrompt, sourceBitmap, webEnabled, false, progressCallback)
+        // FIX: pass sourceImageId through so the registry records this edit's
+        // lineage — without it, getLineageRoot()/"the original picture" has
+        // nothing to walk back through.
+        return generate(editPrompt, sourceBitmap, webEnabled, false, sourceImageId = imageId, progressCallback = progressCallback)
     }
 
     // ── ONNX helpers ──────────────────────────────────────────────────────────
@@ -857,6 +894,25 @@ class ImageGenerator(private val context: Context) {
     private fun timeShiftExponential(mu: Float, sigma: Float, t: Float): Float {
         val expMu = exp(mu.toDouble())
         return (expMu / (expMu + (1.0 / t - 1.0).pow(sigma.toDouble()))).toFloat()
+    }
+
+    // FIX (new): there's no vision tower wired in here, so the LFM can't actually
+    // "look at" a generated image — judgeGeneratedImage() in ChatViewModel needs a
+    // real, grounded signal instead of letting the model hallucinate about pixels
+    // it was never shown. This is a pixel-variance check handed to it as text.
+    private fun degenerateHint(bitmap: Bitmap): String {
+        val s = Bitmap.createScaledBitmap(bitmap, 16, 16, false)
+        var sum = 0.0; var sumSq = 0.0; val n = 16 * 16
+        for (y in 0 until 16) for (x in 0 until 16) {
+            val p = s.getPixel(x, y)
+            val lum = 0.299 * Color.red(p) + 0.587 * Color.green(p) + 0.114 * Color.blue(p)
+            sum += lum; sumSq += lum * lum
+        }
+        val mean = sum / n
+        val variance = sumSq / n - mean * mean
+        return if (variance < 4.0)
+            "warning: low pixel variance (${"%.1f".format(variance)}) — output may be blank or degenerate"
+        else "ok"
     }
 
     private fun decodeLatent(latent: FloatArray): Bitmap {
@@ -1036,7 +1092,8 @@ class ImageGenerator(private val context: Context) {
             val file = File(outputDir, "thunder_img_cmp_${imageId}.jpg")
             file.writeBytes(bytes)
             val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            GenerationResult.Success(file.absolutePath, imageId, prompt, "Pollinations.ai", bitmap)
+            GenerationResult.Success(file.absolutePath, imageId, prompt, "Pollinations.ai", bitmap,
+                0, 0f, degenerateHint(bitmap))
         } catch (e: Exception) { GenerationResult.Failure(e.message ?: "failed") }
     }
 
@@ -1057,11 +1114,16 @@ class ImageGenerator(private val context: Context) {
                             """{"prompt":${prompt.take(50).jsonStr()},"ssim":$ssim,"guidance":$currentGuidanceScale}""" + "\n"
                         )
                         // Auto-adjust guidance scale based on SSIM
+                        // FIX: this nudging used to live only in the in-memory var — every
+                        // restart threw away everything the self-improvement loop had
+                        // learned. Now persisted, same as currentImageGuidanceScale.
                         if (ssim < 0.3f && currentGuidanceScale < 9f) {
                             currentGuidanceScale = (currentGuidanceScale + 0.5f).coerceAtMost(9f)
+                            prefs.edit().putFloat("cfg_scale", currentGuidanceScale).apply()
                             Log.i(TAG, "Auto-increased CFG to $currentGuidanceScale (low SSIM: $ssim)")
                         } else if (ssim > 0.7f && currentGuidanceScale > 5f) {
                             currentGuidanceScale = (currentGuidanceScale - 0.2f).coerceAtLeast(5f)
+                            prefs.edit().putFloat("cfg_scale", currentGuidanceScale).apply()
                         }
                     }
                 }
@@ -1097,29 +1159,100 @@ class ImageGenerator(private val context: Context) {
         return id
     }
 
-    private fun registerImage(id: Int, path: String) {
-        registry[id] = path
+    private fun registerImage(id: Int, path: String, prompt: String = "", source: String = "offline", parentId: Int? = null) {
+        registry[id] = ImageRecord(path, prompt, source, parentId)
         saveRegistry()
     }
 
     fun getImage(id: Int): Bitmap? {
-        val path = registry[id] ?: return null
+        val path = registry[id]?.path ?: return null
         return android.graphics.BitmapFactory.decodeFile(path)
     }
 
-    fun getImagePath(id: Int): String? = registry[id]
+    fun getImagePath(id: Int): String? = registry[id]?.path
+    fun getImageRecord(id: Int): ImageRecord? = registry[id]
+
+    /** Registers an image the user uploaded (not generated here) so it gets a
+     *  number too and can be referred back to the same way as a generated one. */
+    fun registerUploadedImage(path: String, note: String = "user upload"): Int {
+        val id = nextImageId()
+        registerImage(id, path, note, "uploaded")
+        return id
+    }
+
+    /** Walks parentId back to the root of an edit chain — resolves "the original picture". */
+    fun getLineageRoot(id: Int): Int {
+        var current = id
+        var guard = 0
+        while (guard++ < 64) {
+            val parent = registry[current]?.parentId ?: return current
+            current = parent
+        }
+        return current
+    }
+
+    fun getLatestImageId(): Int? = registry.keys.maxOrNull()
 
     fun listImages(): List<Pair<Int, String>> =
-        registry.entries.sortedByDescending { it.key }.map { Pair(it.key, it.value) }
+        registry.entries.sortedByDescending { it.key }.map { Pair(it.key, it.value.path) }
 
     fun deleteImage(id: Int) {
-        registry.remove(id)?.let { File(it).delete() }
+        registry.remove(id)?.let { File(it.path).delete() }
         saveRegistry()
+    }
+
+    // ── Save / share (used by ChatScreen's per-image menu) ───────────────────
+
+    /** Saves image #[id] into the device's public Pictures gallery via MediaStore. */
+    fun saveToGallery(id: Int): Boolean {
+        val record = registry[id] ?: return false
+        val src = File(record.path)
+        if (!src.exists()) return false
+        return try {
+            val resolver = context.contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, "thunder_agi_$id.jpg")
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ThunderAGI")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+            }
+            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return false
+            val wrote = resolver.openOutputStream(uri)?.use { out -> src.inputStream().use { it.copyTo(out) } }
+            if (wrote == null) return false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                values.clear(); values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                resolver.update(uri, values, null, null)
+            }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "saveToGallery failed: ${e.message}")
+            false
+        }
+    }
+
+    /** Builds a share Intent for image #[id] — any local app (WhatsApp, Gmail, Files…). */
+    fun shareIntent(id: Int): Intent? {
+        val record = registry[id] ?: return null
+        val file = File(record.path)
+        if (!file.exists()) return null
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+        return Intent(Intent.ACTION_SEND).apply {
+            type = "image/jpeg"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
     }
 
     private fun saveRegistry() {
         val json = JSONObject()
-        registry.forEach { (k, v) -> json.put(k.toString(), v) }
+        registry.forEach { (k, v) ->
+            val entry = JSONObject()
+            entry.put("path", v.path); entry.put("prompt", v.prompt); entry.put("source", v.source)
+            if (v.parentId != null) entry.put("parentId", v.parentId)
+            json.put(k.toString(), entry)
+        }
         File(context.filesDir, REGISTRY_FILE).writeText(json.toString())
     }
 
@@ -1130,8 +1263,16 @@ class ImageGenerator(private val context: Context) {
             val json = JSONObject(file.readText())
             json.keys().forEach { k ->
                 val id = k.toIntOrNull() ?: return@forEach
-                val path = json.getString(k)
-                if (File(path).exists()) registry[id] = path
+                when (val v = json.get(k)) {
+                    is JSONObject -> {
+                        val path = v.optString("path")
+                        if (File(path).exists()) registry[id] = ImageRecord(
+                            path, v.optString("prompt"), v.optString("source", "unknown"),
+                            if (v.has("parentId")) v.getInt("parentId") else null)
+                    }
+                    is String -> if (File(v).exists()) registry[id] = ImageRecord(v, "", "unknown") // pre-upgrade format
+                    else -> {}
+                }
             }
             Log.i(TAG, "Registry loaded: ${registry.size} images")
         } catch (e: Exception) { Log.w(TAG, "Registry load: ${e.message}") }
