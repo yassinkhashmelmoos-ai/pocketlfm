@@ -477,8 +477,20 @@ jobs:
                   super().__init__()
                   self.model = model
               def forward(self, input_ids, attention_mask):
-                  out = self.model(input_ids=input_ids, attention_mask=attention_mask,
-                                    output_hidden_states=True, use_cache=False)
+                  # Text-only position_ids: cumsum of attention_mask - 1.
+                  # Passing position_ids directly means get_rope_index is never
+                  # called, so rope_deltas is never computed and never baked.
+                  position_ids = attention_mask.long().cumsum(-1) - 1
+                  position_ids = position_ids.masked_fill(attention_mask == 0, 1)
+                  position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+
+                  out = self.model(
+                      input_ids=input_ids,
+                      attention_mask=attention_mask,
+                      position_ids=position_ids,
+                      output_hidden_states=True,
+                      use_cache=False,
+                  )
                   return out.hidden_states[-1]
 
           dummy_ids  = torch.randint(0, 1000, (2, 48), dtype=torch.long)
