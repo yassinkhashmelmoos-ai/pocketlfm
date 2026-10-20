@@ -648,9 +648,26 @@ jobs:
           grid_h = grid_w = 36
           n_patches = grid_h * grid_w
           dummy_pixel_values = torch.randn(n_patches, 3 * temporal_patch_size * patch_size * patch_size)
-          dummy_vis_ids  = torch.randint(0, 1000, (1, 80), dtype=torch.long)
-          dummy_vis_mask = torch.ones((1, 80), dtype=torch.long)
 
+          from transformers import AutoTokenizer
+          _tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
+          image_pad_id  = _tok.convert_tokens_to_ids("<|image_pad|>")
+          vision_start_id = _tok.convert_tokens_to_ids("<|vision_start|>")
+          vision_end_id   = _tok.convert_tokens_to_ids("<|vision_end|>")
+
+          # 36x36 grid, merge_size=2 → 324 image tokens must match vision features
+          num_image_tokens = (36 // 2) * (36 // 2)  # = 324
+
+          text_ids = _tok.encode("describe this image", add_special_tokens=False)
+
+          dummy_vis_ids = torch.tensor([[
+              vision_start_id,
+              *([image_pad_id] * num_image_tokens),
+              vision_end_id,
+              *text_ids,
+          ]], dtype=torch.long)
+          dummy_vis_mask = torch.ones_like(dummy_vis_ids)
+          
           with torch.no_grad():
               torch.onnx.export(
                   VisionTextEncoderWrapper(qwen_vision),
