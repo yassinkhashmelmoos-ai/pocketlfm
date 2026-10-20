@@ -716,19 +716,6 @@ jobs:
                   },
                   opset_version=18,
               )
-          del qwen_vision
-          gc.collect()
-          print(f"✓ text_encoder_edit_fp16.onnx: {os.path.getsize('dreamlite_onnx/text_encoder_edit_fp16.onnx')//1024//1024} MB")
-
-          merge_manifest({
-              "vision_patch_size": 16,
-              "vision_temporal_patch_size": 2,
-              "vision_merge_size": 2,
-              "vision_image_mean": [0.48145466, 0.4578275, 0.40821073],
-              "vision_image_std":  [0.26862954, 0.26130258, 0.27577711],
-              "vision_grid_h": 36,
-              "vision_grid_w": 36,
-          })
           # Verify ONNX matches PyTorch reference
           try:
               import onnxruntime as ort, numpy as np
@@ -751,6 +738,21 @@ jobs:
               print(f"  {'✓ MATCH' if diff < 0.01 else '⚠ MISMATCH — position_ids formula wrong'}")
           except Exception as ve:
               print(f"  (verification skipped: {ve})")
+              
+          del qwen_vision
+          gc.collect()
+          print(f"✓ text_encoder_edit_fp16.onnx: {os.path.getsize('dreamlite_onnx/text_encoder_edit_fp16.onnx')//1024//1024} MB")
+
+          merge_manifest({
+              "vision_patch_size": 16,
+              "vision_temporal_patch_size": 2,
+              "vision_merge_size": 2,
+              "vision_image_mean": [0.48145466, 0.4578275, 0.40821073],
+              "vision_image_std":  [0.26862954, 0.26130258, 0.27577711],
+              "vision_grid_h": 36,
+              "vision_grid_w": 36,
+          })
+          
           PYEOF
           
       - name: Quantize generate-mode text encoder
