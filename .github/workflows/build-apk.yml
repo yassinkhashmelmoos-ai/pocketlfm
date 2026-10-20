@@ -538,7 +538,7 @@ jobs:
           # failure here doesn't take down generate-mode, which doesn't need any
           # of this.
           
-          patch_size, temporal_patch_size, merge_size = 14, 2, 2
+          patch_size, temporal_patch_size, merge_size = 16, 2, 2
           merge_manifest({
                   "vision_patch_size": patch_size,
                   "vision_temporal_patch_size": temporal_patch_size,
