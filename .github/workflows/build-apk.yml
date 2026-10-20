@@ -588,7 +588,22 @@ jobs:
           dummy_grid_thw = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long)
           dummy_vis_ids  = torch.randint(0, 1000, (1, 80), dtype=torch.long)
           dummy_vis_mask = torch.ones((1, 80), dtype=torch.long)
-          
+
+          # Monkey-patch vision attention to use constant split size during export.
+          # lengths.tolist() on a symbolic tensor is illegal for torch.export;
+          # the dummy grid is fixed at 36x36, so cu_seqlens is known constant.
+          fixed_seq = (36 // 2) * (36 // 2)  # merge_size=2 → 324 tokens
+          vision_tower = qwen_vision.model.visual
+          original_attn_fwd = vision_tower.blocks[0].attn.forward
+
+          def patched_attn_forward(self, hidden_states, cu_seqlens, rotary_pos_emb=None, attention_mask=None):
+              return original_attn_fwd(
+                  hidden_states, cu_seqlens=None,
+                  rotary_pos_emb=rotary_pos_emb, attention_mask=attention_mask)
+
+          for blk in vision_tower.blocks:
+              blk.attn.forward = patched_attn_forward.__get__(blk.attn)
+              
           # Precompute pos_embeds and rot_pos_emb for fixed 36x36 grid
           # to avoid torch.linspace(data-dependent) in fast_pos_embed_interpolate
           grid_thw_fixed = torch.tensor([[1, 36, 36]], dtype=torch.long)
