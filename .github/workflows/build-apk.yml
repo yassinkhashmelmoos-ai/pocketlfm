@@ -638,36 +638,11 @@ jobs:
                   super().__init__()
                   self.model = model
               def forward(self, input_ids, attention_mask, pixel_values):
-                  out = self.model(
-                      input_ids=input_ids, attention_mask=attention_mask,
-                      pixel_values=pixel_values, image_grid_thw=FIXED_GRID,
-                      output_hidden_states=True, use_cache=False)
-                  return out.hidden_states[-1]
+          from torch.export import Dim
 
-          patch_size, temporal_patch_size, merge_size = 16, 2, 2
-          grid_h = grid_w = 36
-          n_patches = grid_h * grid_w
-          dummy_pixel_values = torch.randn(n_patches, 3 * temporal_patch_size * patch_size * patch_size)
+          batch = Dim("batch", min=1)
+          seq   = Dim("seq", min=1)
 
-          from transformers import AutoTokenizer
-          _tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
-          image_pad_id  = _tok.convert_tokens_to_ids("<|image_pad|>")
-          vision_start_id = _tok.convert_tokens_to_ids("<|vision_start|>")
-          vision_end_id   = _tok.convert_tokens_to_ids("<|vision_end|>")
-
-          # 36x36 grid, merge_size=2 → 324 image tokens must match vision features
-          num_image_tokens = (36 // 2) * (36 // 2)  # = 324
-
-          text_ids = _tok.encode("describe this image", add_special_tokens=False)
-
-          dummy_vis_ids = torch.tensor([[
-              vision_start_id,
-              *([image_pad_id] * num_image_tokens),
-              vision_end_id,
-              *text_ids,
-          ]], dtype=torch.long)
-          dummy_vis_mask = torch.ones_like(dummy_vis_ids)
-          
           with torch.no_grad():
               torch.onnx.export(
                   VisionTextEncoderWrapper(qwen_vision),
@@ -675,17 +650,14 @@ jobs:
                   "dreamlite_onnx/text_encoder_edit_fp16.onnx",
                   input_names=["input_ids", "attention_mask", "pixel_values"],
                   output_names=["last_hidden_state"],
-                
-                  dynamic_axes={
+                  dynamo=True,
+                  dynamic_shapes={
                       "input_ids":      {0: batch, 1: seq},
                       "attention_mask": {0: batch, 1: seq},
-                      "pixel_values":   {},
+                      "pixel_values":   {},          # static: 1296 patches
                   },
-                  opset_version=19,
-                  dynamo=False,
-                  autograd_inlining=False,
-              )
-              
+                  opset_version=18,
+              )from           
           del qwen_vision
           gc.collect()
           print(f"✓ text_encoder_edit_fp16.onnx: {os.path.getsize('dreamlite_onnx/text_encoder_edit_fp16.onnx')//1024//1024} MB")
