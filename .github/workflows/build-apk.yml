@@ -811,7 +811,7 @@ jobs:
         run: |
           mkdir -p lfm25/app/src/main/assets
           exported=0
-          for f in dreamlite_onnx/vae_decoder.onnx dreamlite_onnx/vae_encoder.onnx dreamlite_onnx/text_encoder.onnx dreamlite_onnx/text_encoder_edit.onnx dreamlite_onnx/unet.onnx dreamlite_onnx/tokenizer.json dreamlite_onnx/manifest.json; do
+          for f in dreamlite_onnx/vae_decoder.onnx dreamlite_onnx/vae_decoder.onnx.data \dreamlite_onnx/vae_encoder.onnx dreamlite_onnx/vae_encoder.onnx.data \dreamlite_onnx/text_encoder.onnx dreamlite_onnx/text_encoder.onnx.data \dreamlite_onnx/text_encoder_edit.onnx dreamlite_onnx/text_encoder_edit.onnx.data \dreamlite_onnx/unet.onnx dreamlite_onnx/tokenizer.json \dreamlite_onnx/manifest.json; do
             if [ -f "$f" ]; then
               cp "$f" lfm25/app/src/main/assets/
               echo "✓ Copied $(basename $f): $(du -sh $f | cut -f1)"
