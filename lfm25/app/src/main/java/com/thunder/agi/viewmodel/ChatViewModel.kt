@@ -133,7 +133,10 @@ data class ChatUiState(
     val crashLog:           String?           = null,
     val exportResult:       FileExporter.ExportResult? = null,
     val imageGenAvailable:  Boolean           = false,
-    val imageGenEnabled:    Boolean           = false
+    val imageGenEnabled:    Boolean           = false,
+    // FIX (new): "the current picture" / "make it brighter" with no number at all
+    // had nothing to resolve against — this is that last-shown image, per session.
+    val lastImageId:        Int?              = null
 )
 
 // ── ViewModel ─────────────────────────────────────────────────────────────────
@@ -257,7 +260,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // UI below updates immediately regardless.
         viewModelScope.launch(Dispatchers.Default) { model.resetContext() }
         _ui.update { it.copy(currentSessionId = id, messages = emptyList(),
-            showSessionDrawer = false, isGenerating = false) }
+            showSessionDrawer = false, isGenerating = false, lastImageId = null) }
         sessionJob = viewModelScope.launch {
             db.messageDao().getMessagesForSession(id).collect { rows ->
                 if (_ui.value.currentSessionId == id) {
@@ -372,8 +375,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         "(image|picture|photo)\\s(of|showing|with)"))
 
                 if (isImageRequest) {
-                    val editIdMatch = Regex("(?:image|picture) #(\\d+)").find(lowerText)
-                    val editId = editIdMatch?.groupValues?.get(1)?.toIntOrNull()
+                    // FIX: this used to only understand an exact "image #N" / "picture #N"
+                    // match and otherwise always generated fresh — "edit the original",
+                    // "make it brighter" (no number at all) and "edit the current picture"
+                    // all fell through to a brand-new, unrelated generation. Resolves
+                    // against an image attached this turn, an explicit #N, "original"
+                    // (walks the edit chain via getLineageRoot), or else falls back to
+                    // the last image shown (lastImageId) for an implied continuation.
+                    val sourceId = resolveImageReference(lowerText, imagePath)
+
+                    var workingPrompt = userText
+                        .replace(Regex("(generate|create|draw|make|paint|render|" +
+                            "show me a?n?|sketch)\\s", RegexOption.IGNORE_CASE), "")
+                        .trim().ifBlank { userText }
 
                     withContext(Dispatchers.Main) {
                         _ui.update { s -> s.copy(messages = s.messages.map {
@@ -383,30 +397,58 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                     var attempts = 0
                     var genResult: ImageGenerator.GenerationResult? = null
+                    var verdictNote: String? = null
+
+                    // FIX: the old loop retried blindly on exceptions only — never on a
+                    // successful-but-bad generation, and always with the same prompt each
+                    // time. This asks the LFM to weigh in after each attempt (judgeGeneratedImage
+                    // below — using real signals it can access, not a vision capability this
+                    // app doesn't have) and lets it supply a more specific prompt for the retry,
+                    // up to 3 attempts total either way.
                     while (attempts < 3) {
-                        genResult = if (editId != null) {
+                        attempts++
+                        genResult = if (sourceId != null) {
                             // FIX: always webEnabled=true — online fallback must not be blocked
-                            imageGenerator.editImage(editId, userText, true)
+                            imageGenerator.editImage(sourceId, workingPrompt, true,
+                                progressCallback = { step, total ->
+                                    _ui.update { s -> s.copy(messages = s.messages.map {
+                                        if (it.isLoading) it.copy(thinkingStep = "🎨 $step/$total") else it
+                                    })}
+                                })
                         } else {
-                            val cleanPrompt = userText
-                                .replace(Regex("(generate|create|draw|make|paint|render|" +
-                                    "show me a?n?|sketch)\\s", RegexOption.IGNORE_CASE), "")
-                                .trim().ifBlank { userText }
-                            imageGenerator.generate(cleanPrompt, null, true,
+                            imageGenerator.generate(workingPrompt, null, true,
                                 progressCallback = { step, total ->
                                     _ui.update { s -> s.copy(messages = s.messages.map {
                                         if (it.isLoading) it.copy(thinkingStep = "🎨 $step/$total") else it
                                     })}
                                 })
                         }
-                        if (genResult is ImageGenerator.GenerationResult.Success) break
-                        attempts++
+
+                        val success = genResult as? ImageGenerator.GenerationResult.Success
+                        if (success == null) continue // exception/failure — loop retries
+
+                        // Don't bother judging the last allowed attempt — its outcome is
+                        // accepted either way, so a judgment call would change nothing.
+                        if (attempts < 3) {
+                            val judgment = judgeGeneratedImage(workingPrompt, success)
+                            verdictNote = judgment.note
+                            if (judgment.shouldRetry && judgment.refinedPrompt != null) {
+                                workingPrompt = judgment.refinedPrompt
+                                continue
+                            }
+                        }
+                        break
                     }
 
                     when (val r = genResult) {
                         is ImageGenerator.GenerationResult.Success -> {
+                            // FIX: lastImageId tracks "the current picture" for a
+                            // follow-up with no number at all.
+                            _ui.update { it.copy(lastImageId = r.imageId) }
+                            val caption = "🎨 Image #${r.imageId}: ${r.prompt}" +
+                                (verdictNote?.let { "\n$it" } ?: "")
                             persistAndShow(ChatMessage(
-                                content   = "🎨 Image #${r.imageId}: ${r.prompt}",
+                                content   = caption,
                                 isUser    = false,
                                 mediaPath = r.imagePath,
                                 mediaType = "image"
@@ -514,6 +556,87 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** Resolves which existing image (if any) an image request should start
+     *  from, in priority order:
+     *   1. An image uploaded with THIS message (registers it so it gets a
+     *      number too, instead of being invisible to the numbering system).
+     *   2. An explicit "image #N" / "picture #N" in the text.
+     *   3. "the original picture" — walks the edit chain back to its root.
+     *   4. Text that implies continuing to work on something ("it", "this",
+     *      "modify", "change", "edit", "instead", "again"...) — defaults to
+     *      the most recent image in this session.
+     *   5. Otherwise null — a fresh text-to-image generation. */
+    private fun resolveImageReference(lowerText: String, freshlyUploadedPath: String?): Int? {
+        if (freshlyUploadedPath != null) {
+            return imageGenerator.registerUploadedImage(freshlyUploadedPath)
+        }
+        Regex("(?:image|picture) #(\\d+)").find(lowerText)?.groupValues?.get(1)?.toIntOrNull()?.let { n ->
+            if (imageGenerator.getImageRecord(n) != null) return n
+        }
+        val lastId = _ui.value.lastImageId ?: imageGenerator.getLatestImageId()
+        if (lastId == null) return null
+        if (lowerText.contains(Regex("original (image|picture|photo)"))) {
+            return imageGenerator.getLineageRoot(lastId)
+        }
+        val impliesContinuation = lowerText.contains(Regex(
+            "\\b(it|this|that|instead|again|now|more|less)\\b|" +
+            "\\b(change|modify|edit|adjust|fix|redo|update)\\b"))
+        return if (impliesContinuation) lastId else null
+    }
+
+    private data class ImageJudgment(val shouldRetry: Boolean, val refinedPrompt: String?, val note: String?)
+
+    /** Asks the LFM whether a generated image likely satisfies the request, so
+     *  retries are driven by the model's own judgment rather than only by
+     *  exceptions, per how this was asked to work. Important honesty note: the
+     *  LFM is NOT shown the image's pixels here — there's no vision tower wired
+     *  into the native inference layer for that (llama-jni.cpp has no
+     *  clip/mtmd-style component, and only the language-model GGUF is
+     *  downloaded, no mmproj), so claiming real visual judgment would be
+     *  fiction. What it DOES get is real: the prompt, how many steps actually
+     *  ran, the guidance scale used, and ImageGenerator's own automatic
+     *  degenerate-output check (pixel-variance based — catches blank/corrupt
+     *  frames). That's a genuine signal to reason over, just not vision.
+     *  model.generate() clears its own attention cache every call (see
+     *  llama-jni.cpp), but LFM2's recurrent/conv state persists across calls
+     *  for multi-turn coherence — so this one-off side query is followed by a
+     *  full resetContext() to keep it from leaking into the next real reply;
+     *  the next turn's full history is rebuilt from the DB either way (see
+     *  buildChatPrompt), so nothing conversational is lost by that reset. */
+    private suspend fun judgeGeneratedImage(
+        prompt: String,
+        result: ImageGenerator.GenerationResult.Success
+    ): ImageJudgment = withContext(Dispatchers.IO) {
+        try {
+            val judgePrompt = buildString {
+                append("<|im_start|>system\nYou are a quick quality check before an image is shown ")
+                append("to the user. You cannot see the image — judge only from the facts given. ")
+                append("Reply with exactly one line: GOOD, or RETRY: <a short, more specific prompt>.")
+                append("<|im_end|>\n")
+                append("<|im_start|>user\nRequested image: \"$prompt\"\n")
+                append("Generation report: ${result.qualityHint}; ")
+                append("${result.stepsUsed} denoising steps; guidance scale ${result.guidanceUsed}.\n")
+                append("GOOD or RETRY?<|im_end|>\n<|im_start|>assistant\n")
+            }
+            val raw = model.generate(
+                prompt = judgePrompt, temperature = 0.3f, topP = 0.9f,
+                topK = 40, repeatPenalty = 1.1f, maxTokens = 60
+            )
+            model.resetContext() // see note above — this was a side query, not a real turn
+            val line = raw.lineSequence().firstOrNull { it.isNotBlank() }?.trim() ?: "GOOD"
+            if (line.startsWith("RETRY", ignoreCase = true)) {
+                val refined = line.substringAfter(":", "").trim().take(200).ifBlank { null }
+                ImageJudgment(shouldRetry = refined != null, refinedPrompt = refined,
+                    note = "retried with a more specific prompt")
+            } else {
+                ImageJudgment(shouldRetry = false, refinedPrompt = null, note = null)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Image judgment skipped: ${e.message}")
+            ImageJudgment(shouldRetry = false, refinedPrompt = null, note = null)
+        }
+    }
+
     private suspend fun persistAndShow(msg: ChatMessage, sessionId: String) {
         withContext(Dispatchers.IO) {
             db.messageDao().insert(MessageEntity(
@@ -534,7 +657,36 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteMessage(msgId: String) {
         viewModelScope.launch {
             db.messageDao().deleteById(msgId)
+            // FIX: this used to only remove the chat row — the generated image file and
+            // its registry entry (so its number could be reused/orphaned) stuck around
+            // forever even after "Delete" on the message showing it.
+            _ui.value.messages.find { it.id == msgId }?.let { msg ->
+                extractImageId(msg.content)?.let { id ->
+                    withContext(Dispatchers.IO) { imageGenerator.deleteImage(id) }
+                }
+            }
             _ui.update { it.copy(messages = it.messages.filterNot { m -> m.id == msgId }) }
+        }
+    }
+
+    /** Pulls the "#N" back out of a "🎨 Image #N: ..." caption, for delete/share/save. */
+    private fun extractImageId(content: String): Int? =
+        Regex("Image #(\\d+)").find(content)?.groupValues?.get(1)?.toIntOrNull()
+
+    /** Builds a share Intent for a generated-image message, or null if it isn't one. */
+    fun shareImage(msg: ChatMessage): Intent? {
+        val id = extractImageId(msg.content) ?: return null
+        return imageGenerator.shareIntent(id)
+    }
+
+    /** Saves a generated-image message to the device gallery. */
+    fun saveImageToGallery(msg: ChatMessage) {
+        val id = extractImageId(msg.content) ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = imageGenerator.saveToGallery(id)
+            withContext(Dispatchers.Main) {
+                _ui.update { it.copy(snackbar = if (ok) "Saved to gallery" else "Couldn't save image") }
+            }
         }
     }
 
