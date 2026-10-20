@@ -153,6 +153,8 @@ fun ThunderAGIApp() {
         onThumbsUp           = { vm.submitFeedback(it, true) },
         onThumbsDown         = { vm.submitFeedback(it, false) },
         onDeleteMessage      = vm::deleteMessage,
+        onShareImage         = vm::shareImage,
+        onSaveImage          = vm::saveImageToGallery,
         onImportFineTune     = vm::importFineTune,
         onExportFeedback     = vm::exportFeedbackLog,
         onClearSnackbar      = vm::clearSnackbar,
