@@ -542,67 +542,8 @@ jobs:
               print(f"  {f}: {s//1024//1024} MB" if s > 1024*1024 else f"  {f}: {s} B")
           PYEOF
       
+      
       - name: Export edit-mode text encoder (isolated, non-fatal)
-        continue-on-error: true
-        run: |
-          python3 << 'PYEOF'
-          import os, gc, json, torch
-
-          def merge_manifest(extra):
-              with open("dreamlite_onnx/manifest.json") as f:
-                  m = json.load(f)
-              m["params"].update(extra)
-              files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
-              m["components"] = files
-              m["has_edit_encoder"] = "text_encoder_edit_fp16.onnx" in files or "text_encoder_edit.onnx" in files
-              with open("dreamlite_onnx/manifest.json", "w") as f:
-                  json.dump(m, f, indent=2)
-
-          from transformers import Qwen3VLForConditionalGeneration
-          from torch.export import Dim
-          
-          batch   = Dim("batch", min=1)
-          seq     = Dim("seq", min=1)
-          patches = Dim("patches", min=1)
-
-          print("[1/1] Edit-mode text encoder...")
-          qwen_vision = Qwen3VLForConditionalGeneration.from_pretrained(
-              "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float16)
-          qwen_vision.eval()
-
-          # ── Patch 1: replace vision attention forward to skip torch.split ──
-          import types
-          import torch.nn.functional as F
-          from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-              apply_rotary_pos_emb_vision,
-          )
-
-          def _patched_vision_attn_forward(self, hidden_states, cu_seqlens=None,
-                                            position_embeddings=None, **kwargs):
-              seq_length = hidden_states.shape[0]
-              q, k, v = (
-                  self.qkv(hidden_states)
-                  .reshape(seq_length, 3, self.num_heads, self.head_dim)
-                  .permute(1, 0, 2, 3)
-                  .unbind(0)
-              )
-              cos, sin = position_embeddings
-              q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
-
-              q = q.transpose(0, 1).unsqueeze(0)
-              k = k.transpose(0, 1).unsqueeze(0)
-              v = v.transpose(0, 1).unsqueeze(0)
-
-              attn_output = F.scaled_dot_product_attention(
-                  q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
-              attn_output = attn_output.transpose(1, 2).reshape(seq_length, -1).contiguous()
-              return self.proj(attn_output)
-
-          vision_tower = qwen_vision.model.visual
-          for blk in vision_tower.blocks:
-              blk.attn.forward = types.MethodType(_patched_vision_attn_forward, blk.attn)
-
-                - name: Export edit-mode text encoder (isolated, non-fatal)
         continue-on-error: true
         run: |
           python3 << 'PYEOF'
@@ -762,43 +703,75 @@ jobs:
           })
           PYEOF
           
-      - name: Quantize text encoders (separate process, clean memory)
+            - name: Quantize generate-mode text encoder
         run: |
           python3 << 'PYEOF'
-          import os, json
+          import os, gc, json
           from onnxruntime.quantization import quantize_dynamic, QuantType
 
-          def quantize_and_clean(src, dst):
-              if not os.path.exists(src):
-                  print(f"⚠ {src} not found — skipping")
-                  return False
-              size_before = os.path.getsize(src) // 1024 // 1024
-              print(f"  quantizing {src} ({size_before} MB)...")
+          src = "dreamlite_onnx/text_encoder_fp16.onnx"
+          dst = "dreamlite_onnx/text_encoder.onnx"
+
+          if not os.path.exists(src):
+              print(f"⚠ {src} not found — skipping")
+          else:
+              print(f"quantizing {src} ({os.path.getsize(src)//1024//1024} MB)...")
               quantize_dynamic(
-                  src, dst,
+                  model_input=str(src),
+                  model_output=str(dst),
+                  op_types_to_quantize=["MatMul"],
+                  per_channel=False,
                   weight_type=QuantType.QInt8,
                   use_external_data_format=True,
               )
+              gc.collect()
               os.remove(src)
               print(f"✓ {dst}: {os.path.getsize(dst)//1024//1024} MB")
-              return True
-
-          quantize_and_clean(
-              "dreamlite_onnx/text_encoder_fp16.onnx",
-              "dreamlite_onnx/text_encoder.onnx")
-          quantize_and_clean(
-              "dreamlite_onnx/text_encoder_edit_fp16.onnx",
-              "dreamlite_onnx/text_encoder_edit.onnx")
+              if os.path.exists(dst + ".data"):
+                  print(f"✓ {dst}.data: {os.path.getsize(dst + '.data')//1024//1024} MB")
 
           with open("dreamlite_onnx/manifest.json") as f:
               m = json.load(f)
           files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
           m["components"] = files
-          m["has_encoder"]      = "text_encoder.onnx" in files
+          m["has_encoder"] = "text_encoder.onnx" in files
+          with open("dreamlite_onnx/manifest.json", "w") as f:
+              json.dump(m, f, indent=2)
+          PYEOF
+
+      - name: Quantize edit-mode text encoder
+        continue-on-error: true
+        run: |
+          python3 << 'PYEOF'
+          import os, gc, json
+          from onnxruntime.quantization import quantize_dynamic, QuantType
+
+          src = "dreamlite_onnx/text_encoder_edit_fp16.onnx"
+          dst = "dreamlite_onnx/text_encoder_edit.onnx"
+
+          if not os.path.exists(src):
+              print(f"⚠ {src} not found — skipping (edit mode unavailable)")
+          else:
+              print(f"quantizing {src} ({os.path.getsize(src)//1024//1024} MB)...")
+              quantize_dynamic(
+                  model_input=str(src),
+                  model_output=str(dst),
+                  op_types_to_quantize=["MatMul"],
+                  per_channel=False,
+                  weight_type=QuantType.QInt8,
+                  use_external_data_format=True,
+              )
+              gc.collect()
+              os.remove(src)
+              print(f"✓ {dst}: {os.path.getsize(dst)//1024//1024} MB")
+
+          with open("dreamlite_onnx/manifest.json") as f:
+              m = json.load(f)
+          files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
+          m["components"] = files
           m["has_edit_encoder"] = "text_encoder_edit.onnx" in files
           with open("dreamlite_onnx/manifest.json", "w") as f:
               json.dump(m, f, indent=2)
-          print(f"\nmanifest updated: has_encoder={m['has_encoder']}, has_edit_encoder={m['has_edit_encoder']}")
           PYEOF
       # FIX: Copy ONNX files DIRECTLY into assets — no zip container.
       # Previously the workflow ran "zip -r assets/dreamlite.zip ." which caused
