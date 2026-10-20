@@ -53,6 +53,16 @@ jobs:
           pip install --no-cache-dir "huggingface-hub>=0.34.0,<1.0"
 
           python -c "import huggingface_hub; from packaging.version import Version; v=huggingface_hub.__version__; assert Version(v) < Version('1.0.0') and Version(v) >= Version('0.34.0'), f'hf-hub {v} not in [0.34.0, 1.0.0)'; print(f'hf-hub {v} OK')"      # FIX: added per the user's own debugging — diffusers-from-main (needed for
+         
+          pip install --no-cache-dir \
+            "transformers==4.57.3" \
+            accelerate \
+            onnx \
+            onnxscript \
+            "onnx-neural-compressor" \  # <-- ADD THIS LINE
+            "onnxruntime==1.18.0" \
+            "numpy<2" \
+            httpx
       # DreamLitePipeline/DreamLiteUNetModel, neither tagged in a release yet) calls
       # a few huggingface_hub APIs (resolve_revision, RevisionResolutionError,
       # get_cached_repo_tree) that the pinned huggingface-hub version above doesn't
@@ -755,33 +765,109 @@ jobs:
           
           PYEOF
           
-      - name: Quantize generate-mode text encoder
+      - name: Prepare SmoothQuant calibration data (128 samples)
         run: |
           python3 << 'PYEOF'
-          import os, gc, json
+          import os, torch
+          from datasets import load_dataset
+          from transformers import AutoProcessor
+          from PIL import Image
+          import io
+
+          os.makedirs("calibration_data", exist_ok=True)
+          processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
+
+          # Load 128 samples from Flickr30k
+          ds = load_dataset("nlphuji/flickr30k", split="test", streaming=True)
+          ds = ds.shuffle(seed=42).take(128)
+
+          for i, sample in enumerate(ds):
+              image = sample["image"]  # PIL Image
+              caption = sample["caption"][0] if isinstance(sample["caption"], list) else sample["caption"]
+
+              # Build Qwen3-VL chat template
+              messages = [{
+                  "role": "user",
+                  "content": [
+                      {"type": "image"},
+                      {"type": "text", "text": caption},
+                  ],
+              }]
+              text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+              inputs = processor(text=[text], images=[image], return_tensors="pt", padding=True)
+
+              # Save tensors
+              torch.save({
+                  "input_ids": inputs["input_ids"].squeeze(0),
+                  "attention_mask": inputs["attention_mask"].squeeze(0),
+                  "pixel_values": inputs["pixel_values"].squeeze(0),
+                  "image_grid_thw": inputs["image_grid_thw"].squeeze(0),
+              }, f"calibration_data/sample_{i:03d}.pt")
+
+          print(f"✓ Saved {len(os.listdir('calibration_data'))} calibration samples")
+          PYEOF
+          
+      - name: Quantize generate-mode text encoder with SmoothQuant
+        run: |
+          python3 << 'PYEOF'
+          import os, gc, json, torch
           from onnxruntime.quantization import quantize_dynamic, QuantType
+          from neural_compressor.quantization import fit
+          from neural_compressor.config import PostTrainingQuantConfig
+          from neural_compressor.data import DataLoader
 
           src = "dreamlite_onnx/text_encoder_fp16.onnx"
+          smoothed = "dreamlite_onnx/text_encoder_smoothed_fp32.onnx"
           dst = "dreamlite_onnx/text_encoder.onnx"
 
           if not os.path.exists(src):
               print(f"⚠ {src} not found — skipping")
-          else:
-              print(f"quantizing {src} ({os.path.getsize(src)//1024//1024} MB)...")
-              quantize_dynamic(
-                  model_input=str(src),
-                  model_output=str(dst),
-                  op_types_to_quantize=["MatMul"],
-                  per_channel=False,
-                  weight_type=QuantType.QInt8,
-                  use_external_data_format=True,
-              )
-              gc.collect()
-              os.remove(src)
-              print(f"✓ {dst}: {os.path.getsize(dst)//1024//1024} MB")
-              if os.path.exists(dst + ".data"):
-                  print(f"✓ {dst}.data: {os.path.getsize(dst + '.data')//1024//1024} MB")
+              raise SystemExit(0)
 
+          # ── Stage 1: Smooth the ONNX graph ──────────────────────────────
+          print("[1/2] Applying SmoothQuant graph rewrite (alpha=0.5)...")
+          config = PostTrainingQuantConfig(
+              approach="static",
+              quant_level=1,
+              recipes={
+                  "smooth_quant": True,
+                  "smooth_quant_args": {"alpha": 0.5},  # 0.5 balances act/weight difficulty
+              },
+          )
+
+          # Calibration dataloader from saved .pt files
+          class CalibDataset:
+              def __init__(self, folder):
+                  self.files = sorted([os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".pt")])
+              def __len__(self): return len(self.files)
+              def __getitem__(self, idx):
+                  d = torch.load(self.files[idx])
+                  return (d["input_ids"].numpy(), d["attention_mask"].numpy(), d["pixel_values"].numpy(), d["image_grid_thw"].numpy()), 0
+
+          calib_loader = DataLoader(framework="onnxruntime", dataset=CalibDataset("calibration_data"))
+
+          # Run SmoothQuant calibration and graph rewrite
+          from neural_compressor.adaptor.ox_utils.smooth_quant import ORTSmoothQuant
+          sq = ORTSmoothQuant(src, calib_loader)
+          sq.transform(alpha=0.5, percentile=99.999)
+          sq.save(smoothed)
+          print(f"✓ Smoothed graph saved: {os.path.getsize(smoothed)//1024//1024} MB")
+
+          # ── Stage 2: Standard INT8 Quantization on smoothed model ──────
+          print("[2/2] Quantizing smoothed model (INT8, per-channel)...")
+          quantize_dynamic(
+              model_input=smoothed,
+              model_output=dst,
+              op_types_to_quantize=["MatMul"],
+              per_channel=True,  # Critical: enables per-channel scaling
+              weight_type=QuantType.QInt8,
+              use_external_data_format=True,
+          )
+          os.remove(smoothed)
+          gc.collect()
+          print(f"✓ text_encoder.onnx: {os.path.getsize(dst)//1024//1024} MB")
+
+          # Update manifest
           with open("dreamlite_onnx/manifest.json") as f:
               m = json.load(f)
           files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
