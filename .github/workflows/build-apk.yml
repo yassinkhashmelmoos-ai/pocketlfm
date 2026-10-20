@@ -657,7 +657,8 @@ jobs:
                       "pixel_values":   {},          # static: 1296 patches
                   },
                   opset_version=18,
-              )from           
+              )
+            
           del qwen_vision
           gc.collect()
           print(f"✓ text_encoder_edit_fp16.onnx: {os.path.getsize('dreamlite_onnx/text_encoder_edit_fp16.onnx')//1024//1024} MB")
