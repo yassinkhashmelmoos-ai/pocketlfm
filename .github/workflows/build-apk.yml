@@ -571,6 +571,54 @@ jobs:
           qwen_vision.eval()
 
           FIXED_GRID = torch.tensor([[1, 36, 36]], dtype=torch.long)
+          seq_len = 36 * 36
+
+          def _full_vision_attn_forward(self, hidden_states, cu_seqlens=None,
+                                        rotary_pos_emb=None, position_embeddings=None, **kwargs):
+              seq_length = hidden_states.shape[0]
+              q, k, v = (self.qkv(hidden_states)
+                         .reshape(seq_length, 3, self.num_heads, -1)
+                         .permute(1, 0, 2, 3).unbind(0))
+
+              cos, sin = position_embeddings
+              cos = cos.unsqueeze(-2).float()
+              sin = sin.unsqueeze(-2).float()
+
+              def _rot(x):
+                  x1, x2 = torch.chunk(x.float(), 2, dim=-1)
+                  return torch.cat((-x2, x1), dim=-1)
+
+              q = ((q.float() * cos) + (_rot(q) * sin)).to(v.dtype)
+              k = ((k.float() * cos) + (_rot(k) * sin)).to(v.dtype)
+
+              q = q.transpose(0, 1).unsqueeze(0)
+              k = k.transpose(0, 1).unsqueeze(0)
+              v = v.transpose(0, 1).unsqueeze(0)
+
+              attn_output = torch.nn.functional.scaled_dot_product_attention(
+                  q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+              attn_output = attn_output.transpose(1, 2).reshape(seq_length, -1).contiguous()
+              return self.proj(attn_output)
+
+          import types
+          vision_tower = qwen_vision.model.visual
+          for blk in vision_tower.blocks:
+              blk.attn.forward = types.MethodType(_full_vision_attn_forward, blk.attn)
+
+          with torch.no_grad():
+              pos_embeds_fixed = vision_tower.fast_pos_embed_interpolate(FIXED_GRID)
+              rotary_fixed = vision_tower.rot_pos_emb(FIXED_GRID)
+              emb = torch.cat((rotary_fixed, rotary_fixed), dim=-1)
+              rot_cos_fixed = emb.cos()
+              rot_sin_fixed = emb.sin()
+
+          def _fixed_pos_embed(self, grid_thw):
+              return pos_embeds_fixed
+          def _fixed_rotary(self, grid_thw):
+              return rot_cos_fixed, rot_sin_fixed
+
+          vision_tower.fast_pos_embed_interpolate = _fixed_pos_embed.__get__(vision_tower)
+          vision_tower.rot_pos_emb = _fixed_rotary.__get__(vision_tower)
 
           class VisionTextEncoderWrapper(torch.nn.Module):
               def __init__(self, model):
@@ -590,23 +638,6 @@ jobs:
           dummy_vis_ids  = torch.randint(0, 1000, (1, 80), dtype=torch.long)
           dummy_vis_mask = torch.ones((1, 80), dtype=torch.long)
 
-          # Patch 1 stays: precompute pos_embeds for the fixed 36x36 grid
-          vision_tower = qwen_vision.model.visual
-          with torch.no_grad():
-              pos_embeds_fixed = vision_tower.fast_pos_embed_interpolate(FIXED_GRID)
-              rotary_fixed = vision_tower.rot_pos_emb(FIXED_GRID)
-              emb = torch.cat((rotary_fixed, rotary_fixed), dim=-1)
-              rot_cos_fixed = emb.cos()
-              rot_sin_fixed = emb.sin()
-
-          def _fixed_pos_embed(self, grid_thw):
-              return pos_embeds_fixed
-          def _fixed_rotary(self, grid_thw):
-              return rotary_fixed
-
-          vision_tower.fast_pos_embed_interpolate = _fixed_pos_embed.__get__(vision_tower)
-          vision_tower.rot_pos_emb = _fixed_rotary.__get__(vision_tower)
-
           with torch.no_grad():
               torch.onnx.export(
                   VisionTextEncoderWrapper(qwen_vision),
@@ -622,6 +653,7 @@ jobs:
                   },
                   opset_version=18,
               )
+              
           del qwen_vision
           gc.collect()
           print(f"✓ text_encoder_edit_fp16.onnx: {os.path.getsize('dreamlite_onnx/text_encoder_edit_fp16.onnx')//1024//1024} MB")
