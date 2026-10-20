@@ -569,7 +569,28 @@ jobs:
           qwen_vision = Qwen3VLForConditionalGeneration.from_pretrained(
               "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float16)
           qwen_vision.eval()
-
+          
+          # DIAGNOSTIC: capture original vision attention source
+          import inspect
+          _attn = qwen_vision.model.visual.blocks[0].attn
+          print("=== VISION ATTENTION FORWARD SOURCE ===")
+          print(inspect.getsource(_attn.forward))
+          print("=== ATTN CHILDREN ===")
+          for _n, _ in _attn.named_children():
+              print(f"  {_n}")
+          print("=== ATTN ATTRS ===")
+          for _a in ("num_heads", "head_dim", "hidden_size", "embed_dim", "qkv", "proj"):
+              _v = getattr(_attn, _a, "<missing>")
+              if hasattr(_v, "weight"):
+                  print(f"  {_a}: {type(_v).__name__}({tuple(_v.weight.shape)})")
+              else:
+                  print(f"  {_a}: {_v}")
+          _vc = qwen_vision.config.vision_config
+          print("=== VISION CONFIG ===")
+          for _a in ("num_heads", "head_dim", "hidden_size", "embed_dim", "depth", "patch_size"):
+              print(f"  {_a}: {getattr(_vc, _a, '<missing>')}")
+          print("=== END DIAGNOSTIC ===")
+          
           FIXED_GRID = torch.tensor([[1, 36, 36]], dtype=torch.long)
           seq_len = 36 * 36
 
