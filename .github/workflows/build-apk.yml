@@ -612,7 +612,7 @@ jobs:
               return pos_embeds_fixed
 
           def _fixed_rotary(self, grid_thw):
-              return rot_cos_fixed, rot_sin_fixed
+              return rotary_fixed
 
           vision_tower.fast_pos_embed_interpolate = _fixed_pos_embed.__get__(vision_tower)
           vision_tower.rot_pos_emb = _fixed_rotary.__get__(vision_tower)
