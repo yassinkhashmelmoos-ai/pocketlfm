@@ -375,6 +375,7 @@ jobs:
                       output_names=["out_sample"],
                       dynamic_axes={
                           "sample":                {0: "batch"},
+                          "timestep":              {0: "batch"},
                           "encoder_hidden_states": {0: "batch", 1: "sequence"},
                           "encoder_attention_mask":{0: "batch", 1: "sequence"},
                           "time_ids":              {0: "batch"},
