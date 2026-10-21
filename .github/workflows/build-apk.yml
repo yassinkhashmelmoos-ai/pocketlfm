@@ -11,12 +11,16 @@ jobs:
 
     steps:
       - name: Free Disk Space (Ubuntu)
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android/sdk/ndk
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # This action removes pre-installed toolchains you don't need.
+          tool-cache: false   # Keep this false; Python/Node are needed.
+          android: true       # Frees ~14 GB (Android SDK & NDK)
+          dotnet: true        # Frees ~2.7 GB
+          haskell: true       # Frees ~5 GB (GHC)
+          large-packages: true # Frees ~5.3 GB
+          docker-images: true # Frees Docker cache
+          swap-storage: true  # Frees pre-existing swap (your custom swap is separate)
       
       - name: Increase swap space (prevent OOM)
         run: |
@@ -906,7 +910,7 @@ jobs:
           from onnx_neural_compressor.quantization import quantize
           from onnx_neural_compressor.config import PostTrainingQuantConfig
           from onnx_neural_compressor.data import DataLoader
-          from onnx_neural_compressor.adaptor.ox_utils.smooth_quant import from
+          from onnx_neural_compressor.adaptor.ox_utils.smooth_quant import ORTSmoothQuant
 
           src = "dreamlite_onnx/text_encoder_fp16.onnx"
           smoothed = "dreamlite_onnx/text_encoder_smoothed_fp32.onnx"
