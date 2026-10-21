@@ -980,21 +980,67 @@ jobs:
           )
           q_model.save(dst)
           
-          print(f"✓ Smoothed graph saved: {os.path.getsize(smoothed)//1024//1024} MB")
+      - name: Quantize generate-mode text encoder with SmoothQuant
+        run: |
+          python3 << 'PYEOF'
+          import os, gc, json
+          import torch
+          from onnx_neural_compressor.quantization import quantize, config
+          from onnx_neural_compressor import data_reader
 
-          # ── Stage 2: Standard INT8 Quantization on smoothed model ──────
-          print("[2/2] Quantizing smoothed model (INT8, per-channel)...")
-          quantize_dynamic(
-              model_input=smoothed,
-              model_output=dst,
+          src = "dreamlite_onnx/text_encoder_fp16.onnx"
+          dst = "dreamlite_onnx/text_encoder.onnx"
+
+          if not os.path.exists(src):
+              print(f"⚠ {src} not found — skipping")
+              raise SystemExit(0)
+
+          # Calibration reader: v1.0 requires get_next() and rewind()
+          class CalibReader(data_reader.CalibrationDataReader):
+              def __init__(self, folder):
+                  self.files = sorted(
+                      os.path.join(folder, f)
+                      for f in os.listdir(folder)
+                      if f.endswith(".pt")
+                  )
+                  self.iter_next = iter(self.files)
+
+              def get_next(self):
+                  file = next(self.iter_next, None)
+                  if file is None:
+                      return None
+                  d = torch.load(file)
+                  return {
+                      "input_ids": d["input_ids"].numpy(),
+                      "attention_mask": d["attention_mask"].numpy(),
+                      "pixel_values": d["pixel_values"].numpy(),
+                      "image_grid_thw": d["image_grid_thw"].numpy(),
+                  }
+
+              def rewind(self):
+                  self.iter_next = iter(self.files)
+
+          print("[1/1] SmoothQuant + static INT8 quantization (alpha=0.5)...")
+
+          qconfig = config.StaticQuantConfig(
+              calibration_data_reader=CalibReader("calibration_data"),
               op_types_to_quantize=["MatMul", "Gather"],
-              per_channel=True,  # Critical: enables per-channel scaling
-              weight_type=QuantType.QInt8,
-              use_external_data_format=True,
+              per_channel=True,
+              calibration_sampling_size=128,
+              extra_options={
+                  "SmoothQuant": True,
+                  "SmoothQuantAlpha": 0.5,
+                  "SmoothQuantOpTypes": ["MatMul"],
+                  "SmoothQuantFolding": True,
+              },
           )
-          os.remove(smoothed)
+
+          quantize(src, dst, qconfig)
           gc.collect()
-          print(f"✓ text_encoder.onnx: {os.path.getsize(dst)//1024//1024} MB")
+
+          print(f"✓ {dst}: {os.path.getsize(dst)//1024//1024} MB")
+          if os.path.exists(dst + ".data"):
+              print(f"✓ {dst}.data: {os.path.getsize(dst + '.data')//1024//1024} MB")
 
           # Update manifest
           with open("dreamlite_onnx/manifest.json") as f:
