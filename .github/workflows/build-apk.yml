@@ -741,9 +741,9 @@ jobs:
                   tail_len = seq_len - num_image - 1
                   device = dummy_vis_ids.device
                   i = torch.arange(num_image, device=device)
-                  img_t = torch.zeros(num_image, dtype=torch.long, device=device)
-                  img_h = i // merged_w
-                  img_w = i % merged_w
+                  img_t = torch.ones(num_image, dtype=torch.long, device=device)   # 1, not 0
+                  img_h = i // merged_w + 1                                       # +1 offset
+                  img_w = i % merged_w + 1                                        # +1 offset
                   start = torch.zeros(1, dtype=torch.long, device=device)
                   tail = torch.arange(tail_len, device=device) + merged_h
                   pos_t = torch.cat([start, img_t, tail], dim=0).unsqueeze(0).unsqueeze(0)
@@ -841,7 +841,7 @@ jobs:
           processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
 
           # Load 128 samples from Flickr30k
-          ds = load_dataset("nlphuji/flickr30k", split="test", streaming=True)
+          ds = load_dataset("lmms-lab/flickr30k", split="test", streaming=Truei
           ds = ds.shuffle(seed=42).take(128)
 
           for i, sample in enumerate(ds):
