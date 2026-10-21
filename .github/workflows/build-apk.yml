@@ -915,10 +915,10 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import os, gc, json, torch
+          from onnxruntime.quantization import quantize_dynamic, QuantType
           from onnx_neural_compressor.quantization import quantize
-          from onnx_neural_compressor.config import PostTrainingQuantConfig
-          from onnx_neural_compressor.data import DataLoader
-          from onnx_neural_compressor.adaptor.ox_utils.smooth_quant import ORTSmoothQuant
+          from onnx_neural_compressor.quantization import config
+          from onnx_neural_compressor import data_reader
 
           src = "dreamlite_onnx/text_encoder_fp16.onnx"
           smoothed = "dreamlite_onnx/text_encoder_smoothed_fp32.onnx"
@@ -930,12 +930,13 @@ jobs:
 
           # ── Stage 1: Smooth the ONNX graph ──────────────────────────────
           print("[1/2] Applying SmoothQuant graph rewrite (alpha=0.5)...")
-          config = PostTrainingQuantConfig(
+          
+          config_obj = config.PostTrainingQuantConfig(
               approach="static",
               quant_level=1,
               recipes={
                   "smooth_quant": True,
-                  "smooth_quant_args": {"alpha": 0.5},  # 0.5 balances act/weight difficulty
+                  "smooth_quant_args": {"alpha": 0.5},
               },
           )
 
@@ -951,10 +952,34 @@ jobs:
           calib_loader = DataLoader(framework="onnxruntime", dataset=CalibDataset("calibration_data"))
 
           # Run SmoothQuant calibration and graph rewrite
-          from neural_compressor.adaptor.ox_utils.smooth_quant import ORTSmoothQuant
-          sq = ORTSmoothQuant(src, calib_loader)
-          sq.transform(alpha=0.5, percentile=99.999)
-          sq.save(smoothed)
+          class CalibDataset(data_reader.CalibrationDataReader):
+              def __init__(self, folder):
+                  self.files = sorted([os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".pt")])
+                  self.iter_next = iter(self.files)
+              def get_next(self):
+                  file = next(self.iter_next, None)
+                  if file is None:
+                      return None
+                  d = torch.load(file)
+                  return {
+                      "input_ids": d["input_ids"].numpy(),
+                      "attention_mask": d["attention_mask"].numpy(),
+                      "pixel_values": d["pixel_values"].numpy(),
+                      "image_grid_thw": d["image_grid_thw"].numpy(),
+                  }
+              def rewind(self):
+                  self.iter_next = iter(self.files)
+
+          calib_reader = CalibDataset("calibration_data")
+
+          # Apply SmoothQuant + static quantization in one call
+          q_model = quantize(
+              model_input=src,
+              quant_config=config_obj,
+              calibration_data_reader=calib_reader,
+          )
+          q_model.save(dst)
+          
           print(f"✓ Smoothed graph saved: {os.path.getsize(smoothed)//1024//1024} MB")
 
           # ── Stage 2: Standard INT8 Quantization on smoothed model ──────
