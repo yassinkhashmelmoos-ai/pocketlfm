@@ -47,6 +47,7 @@ jobs:
             "onnx-neural-compressor" \
             "onnxruntime==1.18.0" \
             "numpy<2" \
+            "datasets" \
             httpx
 
           pip uninstall -y diffusers huggingface-hub || true
@@ -719,15 +720,75 @@ jobs:
                   },
                   opset_version=18,
               )
-          # Verify ONNX matches PyTorch reference
+          
+          # ── DIAGNOSTIC: compare (a) manual pos_ids vs get_rope_index,
+          #                  (b) patched forward vs unpatched forward ──
           try:
-              import onnxruntime as ort, numpy as np
+              # (a) Does our manual position_ids formula match Qwen's real one?
               with torch.no_grad():
-                  ref = qwen_vision(
+                  ref_pos_ids, _ = Qwen3VLModel.get_rope_index(
+                      qwen_vision.model,
+                      input_ids=dummy_vis_ids,
+                      image_grid_thw=FIXED_GRID,
+                      attention_mask=dummy_vis_mask,
+                  )
+                  # Recompute manual formula using same logic as wrapper
+                  seq_len = dummy_vis_ids.shape[1]
+                  num_image = (36 // 2) * (36 // 2)
+                  merged_w = 36 // 2
+                  merged_h = 36 // 2
+                  tail_len = seq_len - num_image - 1
+                  device = dummy_vis_ids.device
+                  i = torch.arange(num_image, device=device)
+                  img_t = torch.zeros(num_image, dtype=torch.long, device=device)
+                  img_h = i // merged_w
+                  img_w = i % merged_w
+                  start = torch.zeros(1, dtype=torch.long, device=device)
+                  tail = torch.arange(tail_len, device=device) + merged_h
+                  pos_t = torch.cat([start, img_t, tail], dim=0).unsqueeze(0).unsqueeze(0)
+                  pos_h = torch.cat([start, img_h, tail], dim=0).unsqueeze(0).unsqueeze(0)
+                  pos_w = torch.cat([start, img_w, tail], dim=0).unsqueeze(0).unsqueeze(0)
+                  manual_pos_ids = torch.cat([pos_t, pos_h, pos_w], dim=0)
+
+              pos_diff = (ref_pos_ids.float() - manual_pos_ids.float()).abs()
+              print("=" * 60)
+              print("DIAG A: position_ids comparison")
+              print(f"  ref shape:    {tuple(ref_pos_ids.shape)}")
+              print(f"  manual shape: {tuple(manual_pos_ids.shape)}")
+              if ref_pos_ids.shape == manual_pos_ids.shape:
+                  print(f"  max abs diff: {pos_diff.max().item():.4f}")
+                  print(f"  mean abs diff: {pos_diff.mean().item():.4f}")
+                  # Find first mismatch
+                  nonzero = pos_diff.nonzero()
+                  if len(nonzero) > 0:
+                      first = nonzero[0].tolist()
+                      print(f"  first mismatch at [T/H/W={first[0]}, batch={first[1]}, seq={first[2]}]")
+                      idx = first[2]
+                      print(f"    ref[{first[0]},{first[1]},{idx}]  = {ref_pos_ids[first[0],first[1],idx].item()}")
+                      print(f"    manual[{first[0]},{first[1]},{idx}] = {manual_pos_ids[first[0],first[1],idx].item()}")
+                      print(f"    dummy_vis_ids at {idx}: {dummy_vis_ids[0, idx].item()}")
+              else:
+                  print(f"  ✗ shape mismatch: {ref_pos_ids.shape} vs {manual_pos_ids.shape}")
+
+              # (b) Does the patched model match the unpatched model?
+              # Restore original methods temporarily for reference
+              with torch.no_grad():
+                  patched_out = qwen_vision(
                       input_ids=dummy_vis_ids, attention_mask=dummy_vis_mask,
                       pixel_values=dummy_pixel_values, image_grid_thw=FIXED_GRID,
+                      position_ids=manual_pos_ids,
                       output_hidden_states=True, use_cache=False,
-                  ).hidden_states[-1].float().numpy()
+                  ).hidden_states[-1].float()
+
+              print("=" * 60)
+              print("DIAG B: reference output stats (patched model)")
+              print(f"  patched_out mean: {patched_out.mean().item():.4f}")
+              print(f"  patched_out std:  {patched_out.std().item():.4f}")
+              print(f"  patched_out min:  {patched_out.min().item():.4f}")
+              print(f"  patched_out max:  {patched_out.max().item():.4f}")
+
+              # ONNX output
+              import onnxruntime as ort, numpy as np
               sess = ort.InferenceSession(
                   "dreamlite_onnx/text_encoder_edit_fp16.onnx",
                   providers=["CPUExecutionProvider"])
@@ -736,11 +797,19 @@ jobs:
                   "attention_mask": dummy_vis_mask.numpy(),
                   "pixel_values": dummy_pixel_values.numpy(),
               })[0]
-              diff = float(np.abs(ref - ort_out).max())
-              print(f"  VERIFY: max abs diff = {diff:.6f}")
-              print(f"  {'✓ MATCH' if diff < 0.01 else '⚠ MISMATCH — position_ids formula wrong'}")
+
+              print("=" * 60)
+              print("DIAG C: ONNX output stats")
+              print(f"  ort_out mean: {ort_out.mean().item():.4f}")
+              print(f"  ort_out std:  {ort_out.std().item():.4f}")
+              print(f"  ort_out min:  {ort_out.min().item():.4f}")
+              print(f"  ort_out max:  {ort_out.max().item():.4f}")
+              print(f"  max abs diff (patched PyTorch vs ONNX): {np.abs(patched_out.numpy() - ort_out).max():.4f}")
+              print("=" * 60)
           except Exception as ve:
-              print(f"  (verification skipped: {ve})")
+              import traceback
+              traceback.print_exc()
+              print(f"  DIAGNOSTIC ERROR: {ve}")
               
           del qwen_vision
           gc.collect()
