@@ -580,7 +580,7 @@ jobs:
 
           print("[1/1] Edit-mode text encoder...")
           qwen_vision = Qwen3VLForConditionalGeneration.from_pretrained(
-              "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float16)
+              "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float32)
           qwen_vision.eval()
 
           import types
@@ -841,7 +841,7 @@ jobs:
           processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
 
           # Load 128 samples from Flickr30k
-          ds = load_dataset("lmms-lab/flickr30k", split="test", streaming=Truei)
+          ds = load_dataset("lmms-lab/flickr30k", split="test", streaming=True)
           ds = ds.shuffle(seed=42).take(128)
 
           for i, sample in enumerate(ds):
