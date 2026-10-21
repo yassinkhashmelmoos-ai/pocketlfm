@@ -55,6 +55,7 @@ jobs:
             "onnx-neural-compressor" \
             "onnxruntime==1.18.0" \
             "numpy<2" \
+            "onnxconverter-common" \
             "datasets>=3.2.0" \
             "pyarrow>=16,<26" \
             httpx
@@ -425,7 +426,7 @@ jobs:
               "num_inference_steps": 50,
               "guidance_scale": 7.0,
               "negative_prompt": "blurry, distorted, ugly, bad anatomy, text, watermark, pixelated, low resolution",
-              "attention_slicing": True,
+              "attention_slicing": False,
               "resolution": 1024,
               "scheduler": "flow_match_euler_discrete",
               "scheduler_shift": {"base_image_seq_len": 256, "max_image_seq_len": 4096,
@@ -439,7 +440,26 @@ jobs:
               size = os.path.getsize(f"dreamlite_onnx/{f}")
               print(f"  {f}: {size//1024//1024} MB" if size > 1024*1024 else f"  {f}: {size} B")
           PYEOF
+     
+      - name: Convert UNet to fp16 (halve size, keep I/O fp32)
+        run: |
+          python3 << 'PYEOF'
+          import os, onnx
+          from onnxconverter_common import float16
 
+          src = "dreamlite_onnx/unet.onnx"
+          if not os.path.exists(src):
+              print(f"⚠ {src} not found — skipping")
+          else:
+              size_before = os.path.getsize(src) // 1024 // 1024
+              model = onnx.load(src, load_external_data=False)
+              model_fp16 = float16.convert_float_to_float16(
+                  model, keep_io_types=True, disable_shape_infer=True)
+              onnx.save(model_fp16, src)
+              size_after = os.path.getsize(src) // 1024 // 1024
+              print(f"✓ UNet fp16: {size_before} MB → {size_after} MB")
+          PYEOF
+          
       # FIX: exit 137 (SIGKILL/OOM) — the text encoder export used to run inside
       # the same Python process as the VAE+UNet export above. Even after that
       # earlier step's own fixes (UNet-only load, no full pipeline), loading a
@@ -929,7 +949,7 @@ jobs:
           quantize_dynamic(
               model_input=smoothed,
               model_output=dst,
-              op_types_to_quantize=["MatMul"],
+              op_types_to_quantize=["MatMul", "Gather"],
               per_channel=True,  # Critical: enables per-channel scaling
               weight_type=QuantType.QInt8,
               use_external_data_format=True,
@@ -972,7 +992,7 @@ jobs:
               quantize_dynamic(
                   model_input=str(src),
                   model_output=str(dst),
-                  op_types_to_quantize=["MatMul"],
+                  op_types_to_quantize=["MatMul", "Gather"],
                   per_channel=False,
                   weight_type=QuantType.QInt8,
                   use_external_data_format=True,
