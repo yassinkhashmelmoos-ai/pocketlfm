@@ -882,10 +882,10 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import os, gc, json, torch
-          from onnxruntime.quantization import quantize_dynamic, QuantType
-          from neural_compressor.quantization import fit
-          from neural_compressor.config import PostTrainingQuantConfig
-          from neural_compressor.data import DataLoader
+          from onnx_neural_compressor.quantization import quantize
+          from onnx_neural_compressor.config import PostTrainingQuantConfig
+          from onnx_neural_compressor.data import DataLoader
+          from onnx_neural_compressor.adaptor.ox_utils.smooth_quant import from
 
           src = "dreamlite_onnx/text_encoder_fp16.onnx"
           smoothed = "dreamlite_onnx/text_encoder_smoothed_fp32.onnx"
