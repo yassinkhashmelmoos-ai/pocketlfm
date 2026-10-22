@@ -954,8 +954,6 @@ jobs:
                   return {
                       "input_ids": d["input_ids"].numpy(),
                       "attention_mask": d["attention_mask"].numpy(),
-                      "pixel_values": d["pixel_values"].numpy(),
-                      "image_grid_thw": d["image_grid_thw"].numpy(),
                   }
 
               def rewind(self):
