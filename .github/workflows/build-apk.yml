@@ -14,7 +14,7 @@ jobs:
         uses: jlumbroso/free-disk-space@main
         with:
           # This action removes pre-installed toolchains you don't need.
-          tool-cache: false   # Keep this false; Python/Node are needed.
+          tool-cache: true   # ← frees ~15-20 GB (was false)/ Python/Node are needed.
           android: true       # Frees ~14 GB (Android SDK & NDK)
           dotnet: true        # Frees ~2.7 GB
           haskell: true       # Frees ~5 GB (GHC)
@@ -24,7 +24,7 @@ jobs:
       
       - name: Increase swap space (prevent OOM)
         run: |
-          sudo fallocate -l 16G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=16384
+          sudo fallocate -l 4G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=4096
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile
           sudo swapon /mnt/swapfile
