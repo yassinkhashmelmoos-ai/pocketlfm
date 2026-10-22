@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+ (android:dataExtractionRules): same exclusions for cloud backup and phone-to-phone transfer. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="thunder_wallet_v3.xml" />
+        <exclude domain="sharedpref" path="thunder_service.xml" />
+        <exclude domain="sharedpref" path="thunder_wa_operator.xml" />
+        <exclude domain="database" path="thunder_ledger.db" />
+        <exclude domain="database" path="thunder_ledger.db-wal" />
+        <exclude domain="database" path="thunder_ledger.db-shm" />
+        <exclude domain="file" path="transfers/" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="thunder_wallet_v3.xml" />
+        <exclude domain="sharedpref" path="thunder_service.xml" />
+        <exclude domain="sharedpref" path="thunder_wa_operator.xml" />
+        <exclude domain="database" path="thunder_ledger.db" />
+        <exclude domain="database" path="thunder_ledger.db-wal" />
+        <exclude domain="database" path="thunder_ledger.db-shm" />
+        <exclude domain="file" path="transfers/" />
+    </device-transfer>
+</data-extraction-rules>

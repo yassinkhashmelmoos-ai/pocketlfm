@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and older (android:fullBackupContent).
+     The wallet's secrets are bound to this phone's hardware Keystore and CANNOT be restored elsewhere.
+     Letting Auto Backup copy the encrypted files would only create a broken wallet on a new phone. -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="thunder_wallet_v3.xml" />
+    <exclude domain="sharedpref" path="thunder_service.xml" />
+    <exclude domain="sharedpref" path="thunder_wa_operator.xml" />
+    <exclude domain="database" path="thunder_ledger.db" />
+    <exclude domain="database" path="thunder_ledger.db-wal" />
+    <exclude domain="database" path="thunder_ledger.db-shm" />
+    <exclude domain="file" path="transfers/" />
+</full-backup-content>
