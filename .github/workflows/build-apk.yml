@@ -975,25 +975,40 @@ jobs:
           )
           
           # ── Fix duplicate node names (dynamo export can emit them) ──
+          # ── Fix dead nodes + duplicate names before quantization ──
           import onnx
+
           _model = onnx.load(src, load_external_data=False)
-          _seen = set()
-          _renamed = 0
-          for _node in _model.graph.node:
-              _name = _node.name
-              if not _name or _name in _seen:
-                  _base = _name or _node.op_type
-                  _i = 0
-                  while f"{_base}_{_i}" in _seen:
-                      _i += 1
-                  _node.name = f"{_base}_{_i}"
-                  _renamed += 1
-              _seen.add(_node.name)
-          if _renamed:
-              onnx.save(_model, src)
-              print(f"  renamed {_renamed} duplicate/empty node names in {src}")
-          else:
-              print(f"  no duplicate node names in {src}")
+          _graph = _model.graph
+
+          # Step 1: Collect all tensors that are actually used
+          _used = set()
+          for _out in _graph.output:
+              _used.add(_out.name)
+
+          # Step 2: Iteratively keep only nodes whose outputs are used
+          _changed = True
+          while _changed:
+              _changed = False
+              _live = []
+              for _node in _graph.node:
+                  if any(_o in _used for _o in _node.output):
+                      _live.append(_node)
+                      for _inp in _node.input:
+                          if _inp and _inp not in _used:
+                              _used.add(_inp)
+                              _changed = True
+
+          _removed = len(_graph.node) - len(_live)
+          del _graph.node[:]
+          _graph.node.extend(_live)
+
+          # Step 3: Rename every remaining node with a unique name
+          for _idx, _node in enumerate(_graph.node):
+              _node.name = f"{_node.op_type}_{_idx}"
+
+          onnx.save(_model, src)
+          print(f"  removed {_removed} dead nodes, renamed {len(_graph.node)} nodes in {src}")
               
           quantize(src, dst, qconfig)
           gc.collect()
