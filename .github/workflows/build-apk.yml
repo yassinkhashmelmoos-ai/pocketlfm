@@ -989,6 +989,18 @@ jobs:
           #    The original implementation can miss nodes (disconnected components,
           #    constant-only subgraphs) and then fails its own assertion.
           def _safe_topological_sort(self, enable_subgraph=False):
+              # ── Ensure every node has a unique name BEFORE building dependency maps ──
+              _seen_names = set()
+              for _node in self.model.graph.node:
+                  _name = _node.name
+                  if not _name or _name in _seen_names:
+                      _base = _name or _node.op_type
+                      _i = 0
+                      while f"{_base}_{_i}" in _seen_names:
+                          _i += 1
+                      _node.name = f"{_base}_{_i}"
+                  _seen_names.add(_node.name)
+
               output_to_node = {}
               for node in self.model.graph.node:
                   for out in node.output:
@@ -1017,7 +1029,6 @@ jobs:
                       if in_degree[child_name] == 0:
                           queue.append(child_name)
 
-              # Append any remaining nodes (e.g. cycles) so no node is lost
               remaining = [n.name for n in self.model.graph.node
                            if n.name not in sorted_names]
               sorted_names.extend(remaining)
