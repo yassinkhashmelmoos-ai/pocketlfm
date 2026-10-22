@@ -952,8 +952,8 @@ jobs:
                       return None
                   d = torch.load(file)
                   return {
-                      "input_ids": d["input_ids"].numpy(),
-                      "attention_mask": d["attention_mask"].numpy(),
+                      "input_ids": d["input_ids"].numpy().reshape(1, -1),
+                      "attention_mask": d["attention_mask"].numpy().reshape(1, -1),
                   }
 
               def rewind(self):
