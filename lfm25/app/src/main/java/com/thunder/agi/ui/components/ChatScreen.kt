@@ -1076,5 +1076,12 @@ fun PeerSyncPanel(peerSync: com.thunder.agi.p2p.PeerSync) {
                 }
             }
         }
+
+        Spacer(Modifier.height(12.dp))
+        OutlinedButton(
+            onClick = { com.thunder.agi.node.ThunderNav.showWallet.value = true },
+            modifier = Modifier.fillMaxWidth(),
+            border = BorderStroke(1.dp, ThunderElectric)
+        ) { Text("⚡ المحفظة  Wallet", color = ThunderElectric) }
     }
 }
