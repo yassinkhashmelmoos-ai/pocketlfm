@@ -973,7 +973,28 @@ jobs:
                   "SmoothQuantFolding": True,
               },
           )
-
+          
+          # ── Fix duplicate node names (dynamo export can emit them) ──
+          import onnx
+          _model = onnx.load(src, load_external_data=False)
+          _seen = set()
+          _renamed = 0
+          for _node in _model.graph.node:
+              _name = _node.name
+              if not _name or _name in _seen:
+                  _base = _name or _node.op_type
+                  _i = 0
+                  while f"{_base}_{_i}" in _seen:
+                      _i += 1
+                  _node.name = f"{_base}_{_i}"
+                  _renamed += 1
+              _seen.add(_node.name)
+          if _renamed:
+              onnx.save(_model, src)
+              print(f"  renamed {_renamed} duplicate/empty node names in {src}")
+          else:
+              print(f"  no duplicate node names in {src}")
+              
           quantize(src, dst, qconfig)
           gc.collect()
 
