@@ -70,6 +70,10 @@ class UpdateNotificationListener : NotificationListenerService() {
         if (!title.contains(THUNDER_CHAT_NAME, ignoreCase = true)) return
 
         Log.i(TAG, "Thunder AGI channel message received")
+
+        // Thunder wallet: payments ("TX1:...") and bulk chunks ("⚡T:...") posted in the Thunder AGI chat
+        if (com.thunder.agi.node.NotificationText.importThunderPayments(applicationContext, extras)) return
+
         processUpdateMessage(text.trim())
     }
 
