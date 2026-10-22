@@ -128,6 +128,10 @@ dependencies {
     implementation("org.json:json:20231013")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.0")
 
+    // Thunder wallet: post-quantum KEM (Kyber-768), used only through crypto/Kem.kt
+    // (one file to change when moving to final FIPS-203 ML-KEM).
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
