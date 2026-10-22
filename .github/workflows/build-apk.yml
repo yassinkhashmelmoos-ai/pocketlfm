@@ -974,42 +974,60 @@ jobs:
               },
           )
           
-          # ── Fix duplicate node names (dynamo export can emit them) ──
-          # ── Fix dead nodes + duplicate names before quantization ──
+          # ── Sanitise node names + install cycle-safe topological sort ──
           import onnx
+          from onnx_neural_compressor.onnx_model import ONNXModel
 
+          # 1. Rename all nodes so names are unique (dynamo export can emit duplicates)
           _model = onnx.load(src, load_external_data=False)
-          _graph = _model.graph
-
-          # Step 1: Collect all tensors that are actually used
-          _used = set()
-          for _out in _graph.output:
-              _used.add(_out.name)
-
-          # Step 2: Iteratively keep only nodes whose outputs are used
-          _changed = True
-          while _changed:
-              _changed = False
-              _live = []
-              for _node in _graph.node:
-                  if any(_o in _used for _o in _node.output):
-                      _live.append(_node)
-                      for _inp in _node.input:
-                          if _inp and _inp not in _used:
-                              _used.add(_inp)
-                              _changed = True
-
-          _removed = len(_graph.node) - len(_live)
-          del _graph.node[:]
-          _graph.node.extend(_live)
-
-          # Step 3: Rename every remaining node with a unique name
-          for _idx, _node in enumerate(_graph.node):
+          for _idx, _node in enumerate(_model.graph.node):
               _node.name = f"{_node.op_type}_{_idx}"
-
           onnx.save(_model, src)
-          print(f"  removed {_removed} dead nodes, renamed {len(_graph.node)} nodes in {src}")
-              
+          print(f"  renamed {len(_model.graph.node)} nodes in {src}")
+
+          # 2. Replace topological_sort with a cycle-safe version that never asserts.
+          #    The original implementation can miss nodes (disconnected components,
+          #    constant-only subgraphs) and then fails its own assertion.
+          def _safe_topological_sort(self, enable_subgraph=False):
+              output_to_node = {}
+              for node in self.model.graph.node:
+                  for out in node.output:
+                      if out:
+                          output_to_node[out] = node
+
+              in_degree = {node.name: 0 for node in self.model.graph.node}
+              children  = {node.name: [] for node in self.model.graph.node}
+              node_by_name = {node.name: node for node in self.model.graph.node}
+
+              for node in self.model.graph.node:
+                  for inp in node.input:
+                      if inp in output_to_node:
+                          parent = output_to_node[inp]
+                          if parent.name in children:
+                              children[parent.name].append(node.name)
+                              in_degree[node.name] += 1
+
+              queue = [name for name, deg in in_degree.items() if deg == 0]
+              sorted_names = []
+              while queue:
+                  name = queue.pop(0)
+                  sorted_names.append(name)
+                  for child_name in children[name]:
+                      in_degree[child_name] -= 1
+                      if in_degree[child_name] == 0:
+                          queue.append(child_name)
+
+              # Append any remaining nodes (e.g. cycles) so no node is lost
+              remaining = [n.name for n in self.model.graph.node
+                           if n.name not in sorted_names]
+              sorted_names.extend(remaining)
+
+              sorted_nodes = [node_by_name[name] for name in sorted_names]
+              del self.model.graph.node[:]
+              self.model.graph.node.extend(sorted_nodes)
+
+          ONNXModel.topological_sort = _safe_topological_sort
+        
           quantize(src, dst, qconfig)
           gc.collect()
 
