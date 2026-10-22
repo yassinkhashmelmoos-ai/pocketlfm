@@ -13,10 +13,13 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.thunder.agi.license.LicenseValidator
+import com.thunder.agi.node.ThunderNav
+import com.thunder.agi.node.ThunderService
 import com.thunder.agi.subscription.SubscriptionManager
 import com.thunder.agi.ui.AboutScreen
 import com.thunder.agi.ui.ActivationScreen
 import com.thunder.agi.ui.PaymentScreen
+import com.thunder.agi.ui.WalletScreen
 import com.thunder.agi.ui.components.ChatScreen
 import com.thunder.agi.ui.theme.ThunderAGITheme
 import com.thunder.agi.viewmodel.ChatViewModel
@@ -137,6 +140,12 @@ fun ThunderAGIApp() {
         }
     }
 
+    // Thunder wallet: resume the opt-in background service if the user enabled it before
+    LaunchedEffect(Unit) { ThunderService.restoreIfEnabled(context) }
+
+    if (ThunderNav.showWallet.value) {
+        WalletScreen(onDismiss = { ThunderNav.showWallet.value = false })
+    } else {
     ChatScreen(
         uiState              = ui,
         onInputChanged       = vm::onInputChanged,
@@ -184,4 +193,5 @@ fun ThunderAGIApp() {
             sub.getDaysRemaining() else licenseInfo.daysRemaining,
         isAdmin              = subState == SubscriptionManager.SubscriptionState.ADMIN
     )
+    }
 }
