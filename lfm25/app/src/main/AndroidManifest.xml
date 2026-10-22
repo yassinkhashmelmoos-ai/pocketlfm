@@ -36,6 +36,14 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Thunder wallet: foreground service type + notifications (NEW) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Thunder wallet: do not hide the app from phones without these radios (NEW) -->
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+    <uses-feature android:name="android.hardware.wifi.aware" android:required="false" />
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -46,7 +54,9 @@
         android:largeHeap="true"
         android:usesCleartextTraffic="false"
         android:networkSecurityConfig="@xml/network_security_config"
-        android:hardwareAccelerated="true">
+        android:hardwareAccelerated="true"
+        android:fullBackupContent="@xml/thunder_backup_rules"
+        android:dataExtractionRules="@xml/thunder_data_extraction_rules">
 
         <activity
             android:name=".MainActivity"
@@ -80,6 +90,12 @@
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
         </service>
+
+        <!-- Thunder wallet foreground service (opt-in; NEW) -->
+        <service
+            android:name=".node.ThunderService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
 
         <!-- WorkManager provider for nightly training -->
         <provider
