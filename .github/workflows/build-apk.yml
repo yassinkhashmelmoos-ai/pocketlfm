@@ -249,6 +249,8 @@ jobs:
               cross_attention_dim = cross_attention_dim[-1]
           print(f"  UNet cross_attention_dim (expected text hidden size): {cross_attention_dim}")
           print(f"  UNet in_channels: {unet.config.in_channels}")
+          print("  DIAG:", unet.config.encoder_hid_dim, unet.config.encoder_hid_dim_type)
+          print("  DIAG:", hasattr(unet, "encoder_hid_proj"), getattr(unet, "encoder_hid_proj", None))
 
           # FIX: tokenizer loaded straight from the canonical Qwen3-VL repo rather
           # than DreamLite-base's bundled copy — it's the same tokenizer either way
@@ -398,6 +400,11 @@ jobs:
                   )
               unet_exported = True
               print(f"✓ DreamLite UNet: {os.path.getsize('dreamlite_onnx/unet.onnx')//1024//1024} MB")
+              import onnxruntime as ort
+              _sess = ort.InferenceSession("dreamlite_onnx/unet.onnx", providers=["CPUExecutionProvider"])
+              for _i in _sess.get_inputs():
+                  print("  DIAG:", _i.name, _i.shape)
+              del _sess
               del unet
           except Exception as e:
               print(f"✗ DreamLite UNet export failed: {e}")
