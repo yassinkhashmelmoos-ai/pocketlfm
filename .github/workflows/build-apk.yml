@@ -56,7 +56,7 @@ jobs:
             accelerate \
             onnx \
             onnxscript \
-            "onnx-neural-compressor @ git+https://github.com/thiswillbeyourgithub/neural-compressor-fork.git@da405cd" \
+            "onnx-neural-compressor @ git+https://github.com/thiswillbeyourgithub/neural-compressor-fork.git@93d926e" \
             "onnxruntime==1.18.0" \
             "numpy<2" \
             "onnxconverter-common" \
