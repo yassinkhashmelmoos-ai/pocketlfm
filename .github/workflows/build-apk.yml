@@ -13,7 +13,7 @@ jobs:
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
         with:
-          # This action removes pre-installed toolchains you don't need.
+          # This action removes pre-installed toolchains you don't need. yes
           tool-cache: true   # ← frees ~15-20 GB (was false)/ Python/Node are needed.
           android: true       # Frees ~14 GB (Android SDK & NDK)
           dotnet: true        # Frees ~2.7 GB
