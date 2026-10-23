@@ -928,7 +928,8 @@ jobs:
           import torch
           from onnx_neural_compressor.quantization import quantize, config
           from onnx_neural_compressor import data_reader
-
+          from onnxruntime.quantization import CalibrationMethod
+          
           src = "dreamlite_onnx/text_encoder_fp16.onnx"
           dst = "dreamlite_onnx/text_encoder.onnx"
 
@@ -963,6 +964,7 @@ jobs:
 
           qconfig = config.StaticQuantConfig(
               calibration_data_reader=CalibReader("calibration_data"),
+              calibrate_method=CalibrationMethod.Percentile,
               op_types_to_quantize=["MatMul", "Gather"],
               per_channel=True,
               calibration_sampling_size=128,
