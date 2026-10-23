@@ -1045,20 +1045,41 @@ jobs:
           # tensor is a graph output, and ONNX Runtime keeps them all resident.
           # Disabling the CPU memory arena + graph optimizations keeps peak RSS
           # within the runner's 16 GB RAM + 12 GB swap.
+          # ── Memory-conservative calibration sessions ──
           import onnxruntime as ort
           from onnxruntime import SessionOptions, GraphOptimizationLevel
 
           _orig_session_init = ort.InferenceSession.__init__
 
           def _conservative_session_init(self, *args, **kwargs):
-              opts = kwargs.get("sess_options")
+              args_list = list(args)
+              kwargs_dict = dict(kwargs)
+
+              opts = None
+              positional_idx = None
+
+              # Find existing sess_options: positional (args[1]) or keyword
+              if len(args_list) >= 2 and isinstance(args_list[1], SessionOptions):
+                  opts = args_list[1]
+                  positional_idx = 1
+              elif "sess_options" in kwargs_dict and isinstance(kwargs_dict["sess_options"], SessionOptions):
+                  opts = kwargs_dict["sess_options"]
+
               if opts is None:
                   opts = SessionOptions()
+
+              # Apply memory-conservative settings
               opts.enable_cpu_mem_arena = False
               opts.graph_optimization_level = GraphOptimizationLevel.ORT_DISABLE_ALL
               opts.intra_op_num_threads = 2
-              kwargs["sess_options"] = opts
-              return _orig_session_init(self, *args, **kwargs)
+
+              # Inject into the SAME position it was passed in
+              if positional_idx is not None:
+                  args_list[positional_idx] = opts
+              else:
+                  kwargs_dict["sess_options"] = opts
+
+              return _orig_session_init(self, *args_list, **kwargs_dict)
 
           ort.InferenceSession.__init__ = _conservative_session_init
           print("  patched InferenceSession: cpu_mem_arena=off, graph_opt=DISABLE_ALL")
