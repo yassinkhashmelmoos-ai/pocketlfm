@@ -989,7 +989,8 @@ jobs:
           #    The original implementation can miss nodes (disconnected components,
           #    constant-only subgraphs) and then fails its own assertion.
           def _safe_topological_sort(self, enable_subgraph=False):
-              # ── Ensure every node has a unique name BEFORE building dependency maps ──
+         
+          # ── Ensure every node has a unique name BEFORE building dependency maps ──
               _seen_names = set()
               for _node in self.model.graph.node:
                   _name = _node.name
@@ -1038,7 +1039,30 @@ jobs:
               self.model.graph.node.extend(sorted_nodes)
 
           ONNXModel.topological_sort = _safe_topological_sort
-        
+         
+          # ── Memory-conservative calibration sessions ──
+          # The SmoothQuant calibrator augments the graph so every calibrated
+          # tensor is a graph output, and ONNX Runtime keeps them all resident.
+          # Disabling the CPU memory arena + graph optimizations keeps peak RSS
+          # within the runner's 16 GB RAM + 12 GB swap.
+          import onnxruntime as ort
+          from onnxruntime import SessionOptions, GraphOptimizationLevel
+
+          _orig_session_init = ort.InferenceSession.__init__
+
+          def _conservative_session_init(self, *args, **kwargs):
+              opts = kwargs.get("sess_options")
+              if opts is None:
+                  opts = SessionOptions()
+              opts.enable_cpu_mem_arena = False
+              opts.graph_optimization_level = GraphOptimizationLevel.ORT_DISABLE_ALL
+              opts.intra_op_num_threads = 2
+              kwargs["sess_options"] = opts
+              return _orig_session_init(self, *args, **kwargs)
+
+          ort.InferenceSession.__init__ = _conservative_session_init
+          print("  patched InferenceSession: cpu_mem_arena=off, graph_opt=DISABLE_ALL")
+          
           quantize(src, dst, qconfig)
           gc.collect()
 
