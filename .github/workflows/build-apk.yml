@@ -975,7 +975,65 @@ jobs:
           )
 
           
-         
+          # ── Patch ONNXModel.topological_sort for duplicate node names ──
+          # The fork fixed calibration + augment, but folding creates duplicate
+          # node names, and the stock topological_sort asserts on that.
+          # This version renames every node uniquely first, then sorts.
+          from onnx_neural_compressor.onnx_model import ONNXModel
+
+          def _safe_topological_sort(self, enable_subgraph=False):
+              # Step 1: give every node a unique name
+              _seen = set()
+              for _node in self.model.graph.node:
+                  _name = _node.name
+                  if not _name or _name in _seen:
+                      _base = _name or _node.op_type
+                      _i = 0
+                      while f"{_base}_{_i}" in _seen:
+                          _i += 1
+                      _node.name = f"{_base}_{_i}"
+                  _seen.add(_node.name)
+
+              # Step 2: Kahn's algorithm on the renamed graph
+              _output_to_node = {}
+              for _node in self.model.graph.node:
+                  for _out in _node.output:
+                      if _out:
+                          _output_to_node[_out] = _node
+
+              _in_degree = {n.name: 0 for n in self.model.graph.node}
+              _children  = {n.name: [] for n in self.model.graph.node}
+              _by_name   = {n.name: n for n in self.model.graph.node}
+
+              for _node in self.model.graph.node:
+                  for _inp in _node.input:
+                      if _inp in _output_to_node:
+                          _parent = _output_to_node[_inp]
+                          if _parent.name in _children:
+                              _children[_parent.name].append(_node.name)
+                              _in_degree[_node.name] += 1
+
+              _queue = [n for n, d in _in_degree.items() if d == 0]
+              _sorted = []
+              while _queue:
+                  _name = _queue.pop(0)
+                  _sorted.append(_name)
+                  for _child in _children[_name]:
+                      _in_degree[_child] -= 1
+                      if _in_degree[_child] == 0:
+                          _queue.append(_child)
+
+              # Append any nodes that were not reached (cycles / disconnected parts)
+              _remaining = [n.name for n in self.model.graph.node
+                            if n.name not in _sorted]
+              _sorted.extend(_remaining)
+
+              _sorted_nodes = [_by_name[n] for n in _sorted]
+              del self.model.graph.node[:]
+              self.model.graph.node.extend(_sorted_nodes)
+
+          ONNXModel.topological_sort = _safe_topological_sort
+          print("  patched ONNXModel.topological_sort: unique names + cycle-safe sort")
           
           
           quantize(src, dst, qconfig)
