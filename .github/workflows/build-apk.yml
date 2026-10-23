@@ -56,7 +56,7 @@ jobs:
             accelerate \
             onnx \
             onnxscript \
-            "onnx-neural-compressor @ git+https://github.com/thiswillbeyourgithub/neural-compressor-fork.git@93d926e" \
+            "onnx-neural-compressor @ git+https://github.com/thiswillbeyourgithub/neural-compressor-fork.git@da405cd" \
             "onnxruntime==1.18.0" \
             "numpy<2" \
             "onnxconverter-common" \
@@ -974,6 +974,7 @@ jobs:
                   "SmoothQuantOpTypes": ["MatMul"],
                   "SmoothQuantFolding": True,
                   "layer_wise_quant": True,
+                  "calib_dump_batch": 32,
               },
           )
 
