@@ -932,7 +932,9 @@ jobs:
           sudo chown -R $USER:$USER /usr/local/lib/android
           
       - name: Install Android SDK command-line tools
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
         
       - name: Expand swap to 24GB before SmoothQuant
         run: |
