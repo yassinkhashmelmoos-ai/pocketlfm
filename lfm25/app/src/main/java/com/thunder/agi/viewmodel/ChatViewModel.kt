@@ -19,6 +19,7 @@ import com.thunder.agi.intelligence.NightlyTrainer
 import com.thunder.agi.intelligence.TinyRL
 import com.thunder.agi.intelligence.SelfImprover
 import com.thunder.agi.llama.ThunderModel
+import com.thunder.agi.agent.AgentLoop
 import com.thunder.agi.agent.AgentToolkit
 import com.thunder.agi.agent.CrashReporter
 import com.thunder.agi.agent.EmotionDetector
@@ -155,6 +156,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val softPromptFile = File(application.filesDir, "soft_prompt_cache.txt")
     private val agentToolkit   = AgentToolkit(application)
+    private val agentLoop      = AgentLoop(agentToolkit)
     private val imageGenerator = ImageGenerator(application)
     val fileExporter           = FileExporter(application)
     private val selfImprover   = SelfImprover(application)
@@ -467,19 +469,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
 
-                // ── Web search augmentation ───────────────────────────────────
-                var augmentedText = userText
-                if (_ui.value.webSearchEnabled) {
-                    withContext(Dispatchers.Main) {
-                        _ui.update { s -> s.copy(messages = s.messages.map {
-                            if (it.isLoading) it.copy(thinkingStep = "🔍 بحث…  Searching…") else it
-                        })}
-                    }
-                    val result = webSearch(userText)
-                    if (result.isNotBlank()) augmentedText = "$userText\n\n[Web result: $result]"
-                }
-
-                val toolContext = agentToolkit.gatherContext(userText, _ui.value.webSearchEnabled)
                 val emotionHint = EmotionDetector.getSystemHint(userText)
 
                 val sessionHistory = withContext(Dispatchers.IO) {
@@ -499,12 +488,50 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         history.dropLast(1) else history
                 }
 
+                // ── Agent loop (Muse Spark 1.0 style) ─────────────────────────
+                // The MODEL decides whether this message needs a lookup, which tool(s) and with
+                // what arguments; independent lookups run in parallel; a failed one gets a second
+                // decision. See AgentLoop.kt for exactly which Spark rules this copies. It replaces
+                // both the unconditional web search that used to run on EVERY message and the
+                // keyword dispatcher agentToolkit.gatherContext().
+                val loopResult = agentLoop.run(
+                    userMessage   = userText,
+                    recentContext = sessionHistory.takeLast(4).joinToString("\n") {
+                        (if (it.isUser) "User: " else "Assistant: ") + it.content.take(160)
+                    },
+                    webEnabled    = _ui.value.webSearchEnabled,
+                    generateFn    = { p, maxTok, temp ->
+                        // One-off side query. LFM2's recurrent state persists across calls, so
+                        // reset afterwards (same pattern judgeGeneratedImage() uses).
+                        try {
+                            model.generate(
+                                prompt        = p,
+                                temperature   = temp,
+                                topP          = 0.9f,
+                                topK          = 40,
+                                repeatPenalty = 1.1f,
+                                maxTokens     = maxTok
+                            )
+                        } finally {
+                            model.resetContext()
+                        }
+                    },
+                    onStep = { step ->
+                        withContext(Dispatchers.Main) {
+                            _ui.update { s -> s.copy(messages = s.messages.map {
+                                if (it.isLoading) it.copy(thinkingStep = step) else it
+                            })}
+                        }
+                    }
+                )
+                val toolContext = loopResult.toolContext
+
                 val softCache = if (softPromptFile.exists()) softPromptFile.readText() else ""
                 val prompt    = buildChatPrompt(
                     sessionHistory  = sessionHistory,
-                    userText        = if (toolContext.isNotBlank()) "$toolContext$augmentedText" else augmentedText,
+                    userText        = if (toolContext.isNotBlank()) "$toolContext$userText" else userText,
                     imagePath       = imagePath,
-                    systemPrompt    = systemPrompt + emotionHint,
+                    systemPrompt    = systemPrompt + emotionHint + AgentLoop.dateContext() + loopResult.note,
                     softPromptCache = softCache
                 )
 
