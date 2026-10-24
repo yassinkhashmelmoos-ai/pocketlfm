@@ -1059,6 +1059,7 @@ jobs:
                   "SmoothQuantFolding": True,
                   "calib_dump_batch": 8,
                   "TmpDir": "dreamlite_onnx",
+                  "layer_wise_quant": True,
               },
           )
 
