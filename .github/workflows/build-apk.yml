@@ -940,7 +940,7 @@ jobs:
         run: |
           sudo swapoff /mnt/swapfile || true
           sudo rm -f /mnt/swapfile
-          sudo fallocate -l 24G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=24576
+          sudo fallocate -l 32G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=32768
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile
           sudo swapon /mnt/swapfile
@@ -1057,7 +1057,7 @@ jobs:
                   "SmoothQuantAlpha": 0.5,
                   "SmoothQuantOpTypes": ["MatMul"],
                   "SmoothQuantFolding": True,
-                  "calib_dump_batch": 32,
+                  "calib_dump_batch": 8,
                   "TmpDir": "dreamlite_onnx",
               },
           )
