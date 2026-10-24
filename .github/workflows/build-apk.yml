@@ -974,7 +974,7 @@ jobs:
                   "SmoothQuantOpTypes": ["MatMul"],
                   "SmoothQuantFolding": True,
                   "layer_wise_quant": True,
-                  "calib_dump_batch": 32,
+                  "calib_dump_batch": 8,
               },
           )
 
@@ -1039,6 +1039,11 @@ jobs:
           ONNXModel.topological_sort = _safe_topological_sort
           print("  patched ONNXModel.topological_sort: unique names + cycle-safe sort")
           
+          # ── Release SmoothQuant phase memory before static calibration ──
+          import gc
+          gc.collect()
+          gc.collect()  # second pass for reference cycles
+          print("  released Python objects before static calibration")
           
           quantize(src, dst, qconfig)
           gc.collect()
