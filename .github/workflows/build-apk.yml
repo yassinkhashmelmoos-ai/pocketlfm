@@ -1128,6 +1128,33 @@ jobs:
           gc.collect()
           gc.collect()  # second pass for reference cycles
           print("  released Python objects before static calibration")
+
+          # ── Fix missing external .data in smoother temp dir ──
+          import shutil
+          from onnx_neural_compressor.algorithms.smoother import core as smoother_core
+
+          _orig_smoother_init = smoother_core.Smoother.__init__
+
+          def _patched_smoother_init(self, model, *args, **kwargs):
+              # Figure out the directory the smoother will load the model from
+              model_path = None
+              if isinstance(model, str):
+                  model_path = model
+              elif hasattr(model, "_model_path"):
+                  model_path = model._model_path
+
+              if model_path:
+                  model_dir = os.path.dirname(os.path.abspath(model_path))
+                  src_data = os.path.abspath("dreamlite_onnx/text_encoder_fp16.onnx.data")
+                  dst_data = os.path.join(model_dir, "text_encoder_fp16.onnx.data")
+                  if os.path.exists(src_data) and not os.path.exists(dst_data):
+                      shutil.copy2(src_data, dst_data)
+                      print(f"  copied external .data to {dst_data}")
+
+              return _orig_smoother_init(self, model, *args, **kwargs)
+
+          smoother_core.Smoother.__init__ = _patched_smoother_init
+          print("  patched Smoother.__init__ to copy external .data into temp dir")
           
           quantize(src, dst, qconfig)
           gc.collect()
