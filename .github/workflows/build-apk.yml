@@ -1058,6 +1058,7 @@ jobs:
                   "SmoothQuantOpTypes": ["MatMul"],
                   "SmoothQuantFolding": True,
                   "calib_dump_batch": 32,
+                  "TmpDir": "dreamlite_onnx",
               },
           )
 
