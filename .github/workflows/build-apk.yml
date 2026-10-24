@@ -1002,6 +1002,22 @@ jobs:
           df -h /
           echo "=== Memory (should still be 24 GB swap) ==="
           free -h
+
+      - name: Tune kernel to prevent premature OOM kill
+        run: |
+          # Lower swappiness to reduce thrashing
+          sudo sysctl vm.swappiness=10
+          
+          # (Optional) Be strict about memory overcommitment
+          # sudo sysctl vm.overcommit_memory=2
+          
+          # Protect the current shell's process tree (the Python script)
+          # -1000 is the lowest possible OOM score, making it nearly unkillable.
+          echo -1000 | sudo tee /proc/self/oom_score_adj
+          
+          echo "Kernel tuning applied."
+          cat /proc/sys/vm/swappiness
+          cat /proc/self/oom_score_adj
           
       - name: Quantize generate-mode text encoder with SmoothQuant
         env:
