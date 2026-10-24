@@ -940,7 +940,7 @@ jobs:
         run: |
           sudo swapoff /mnt/swapfile || true
           sudo rm -f /mnt/swapfile
-          sudo fallocate -l 40G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=40960
+          sudo fallocate -l 48G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=49152
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile
           sudo swapon /mnt/swapfile
