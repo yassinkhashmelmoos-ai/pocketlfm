@@ -917,7 +917,28 @@ jobs:
 
           print(f"✓ Saved {len(os.listdir('calibration_data'))} calibration samples")
           PYEOF
+     
+      - name: Free disk before swap expansion
+        run: |
+          pip cache purge || true
+          sudo rm -rf /tmp/* 2>/dev/null || true
+          sudo apt-get clean || true
+          echo "=== Disk after cleanup ==="
+          df -h /
 
+      - name: Expand swap to 24GB before SmoothQuant
+        run: |
+          sudo swapoff /mnt/swapfile || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 24G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=24576
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          echo "=== Memory after expansion ==="
+          free -h
+          echo "=== Disk ==="
+          df -h /
+          
       - name: Quantize edit-mode text encoder
         continue-on-error: true
         run: |
@@ -960,26 +981,17 @@ jobs:
               json.dump(m, f, indent=2)
           PYEOF
           
-      - name: Free disk before swap expansion
+      
+      - name: Free disk again before SmoothQuant
         run: |
           pip cache purge || true
           sudo rm -rf /tmp/* 2>/dev/null || true
+          sudo rm -rf /home/runner/work/_temp/* 2>/dev/null || true
           sudo apt-get clean || true
-          echo "=== Disk after cleanup ==="
+          echo "=== Disk after second cleanup ==="
           df -h /
-
-      - name: Expand swap to 24GB before SmoothQuant
-        run: |
-          sudo swapoff /mnt/swapfile || true
-          sudo rm -f /mnt/swapfile
-          sudo fallocate -l 24G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=24576
-          sudo chmod 600 /mnt/swapfile
-          sudo mkswap /mnt/swapfile
-          sudo swapon /mnt/swapfile
-          echo "=== Memory after expansion ==="
+          echo "=== Memory (should still be 24 GB swap) ==="
           free -h
-          echo "=== Disk ==="
-          df -h /
           
       - name: Quantize generate-mode text encoder with SmoothQuant
         env:
