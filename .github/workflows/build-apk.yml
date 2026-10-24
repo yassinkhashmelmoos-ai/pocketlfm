@@ -926,6 +926,9 @@ jobs:
           echo "=== Disk after cleanup ==="
           df -h /
 
+      - name: Install Android SDK command-line tools
+        uses: android-actions/setup-android@v3
+        
       - name: Expand swap to 24GB before SmoothQuant
         run: |
           sudo swapoff /mnt/swapfile || true
@@ -1047,7 +1050,6 @@ jobs:
                   "SmoothQuantAlpha": 0.5,
                   "SmoothQuantOpTypes": ["MatMul"],
                   "SmoothQuantFolding": True,
-                  "layer_wise_quant": True,
                   "calib_dump_batch": 32,
               },
           )
