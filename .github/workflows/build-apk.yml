@@ -925,7 +925,12 @@ jobs:
           sudo apt-get clean || true
           echo "=== Disk after cleanup ==="
           df -h /
-
+  
+      - name: Prepare writable Android SDK directory
+        run: |
+          sudo mkdir -p /usr/local/lib/android
+          sudo chown -R $USER:$USER /usr/local/lib/android
+          
       - name: Install Android SDK command-line tools
         uses: android-actions/setup-android@v3
         
