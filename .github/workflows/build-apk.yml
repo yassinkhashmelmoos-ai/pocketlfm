@@ -520,7 +520,7 @@ jobs:
           # Kotlin side) — only the process isolation and dtype changed here.
           print("[1/2] Text encoder (Qwen/Qwen3-VL-2B-Instruct, fp16)...")
           qwen = Qwen3VLForConditionalGeneration.from_pretrained(
-              "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float16)
+              "Qwen/Qwen3-VL-2B-Instruct", dtype=torch.float32)
           qwen.eval()
           hidden = qwen.config.text_config.hidden_size
           print(f"  Qwen3-VL-2B text hidden_size: {hidden}")
