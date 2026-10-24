@@ -41,7 +41,7 @@ android {
         // see build-apk.yml and ImageGenerator.kt) is stored uncompressed too —
         // consistent with the other bundled model files, and needed for
         // ImageGenerator's safe-copy check (assets.openFd().length) to work on it.
-        noCompress += listOf("gguf", "zip", "bin", "onnx", "tflite", "pb", "pt", "gz", "json")
+        noCompress += listOf("gguf", "zip", "bin", "onnx", "data", "tflite", "pb", "pt", "gz", "json")
     }
 
     signingConfigs {
