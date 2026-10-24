@@ -917,7 +917,69 @@ jobs:
 
           print(f"✓ Saved {len(os.listdir('calibration_data'))} calibration samples")
           PYEOF
+
+      - name: Quantize edit-mode text encoder
+        continue-on-error: true
+        run: |
+          python3 << 'PYEOF'
+          import os, gc, json
+          import onnx
+          from onnxruntime.quantization import quantize_dynamic, QuantType
+
+          src = "dreamlite_onnx/text_encoder_edit_fp16.onnx"
+          dst = "dreamlite_onnx/text_encoder_edit.onnx"
+
+          if not os.path.exists(src):
+              print(f"⚠ {src} not found — skipping (edit mode unavailable)")
+          else:
+              # ── Strip stale value_info before quantization ──
+              model = onnx.load(src, load_external_data=False)
+              del model.graph.value_info[:]
+              onnx.save(model, src)
+              print(f"  stripped value_info from {src}")
+
+              print(f"quantizing {src} ({os.path.getsize(src)//1024//1024} MB)...")
+              quantize_dynamic(
+                  model_input=str(src),
+                  model_output=str(dst),
+                  op_types_to_quantize=["MatMul", "Gather"],
+                  per_channel=False,
+                  weight_type=QuantType.QInt8,
+                  use_external_data_format=True,
+              )
+              gc.collect()
+              os.remove(src)
+              print(f"✓ {dst}: {os.path.getsize(dst)//1024//1024} MB")
+
+          with open("dreamlite_onnx/manifest.json") as f:
+              m = json.load(f)
+          files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
+          m["components"] = files
+          m["has_edit_encoder"] = "text_encoder_edit.onnx" in files
+          with open("dreamlite_onnx/manifest.json", "w") as f:
+              json.dump(m, f, indent=2)
+          PYEOF
           
+      - name: Free disk before swap expansion
+        run: |
+          pip cache purge || true
+          sudo rm -rf /tmp/* 2>/dev/null || true
+          sudo apt-get clean || true
+          echo "=== Disk after cleanup ==="
+          df -h /
+
+      - name: Expand swap to 24GB before SmoothQuant
+        run: |
+          sudo swapoff /mnt/swapfile || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 24G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=24576
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          echo "=== Memory after expansion ==="
+          free -h
+          echo "=== Disk ==="
+          df -h /
           
       - name: Quantize generate-mode text encoder with SmoothQuant
         env:
@@ -974,7 +1036,7 @@ jobs:
                   "SmoothQuantOpTypes": ["MatMul"],
                   "SmoothQuantFolding": True,
                   "layer_wise_quant": True,
-                  "calib_dump_batch": 8,
+                  "calib_dump_batch": 32,
               },
           )
 
@@ -1062,47 +1124,7 @@ jobs:
               json.dump(m, f, indent=2)
           PYEOF
 
-      - name: Quantize edit-mode text encoder
-        continue-on-error: true
-        run: |
-          python3 << 'PYEOF'
-          import os, gc, json
-          import onnx
-          from onnxruntime.quantization import quantize_dynamic, QuantType
-
-          src = "dreamlite_onnx/text_encoder_edit_fp16.onnx"
-          dst = "dreamlite_onnx/text_encoder_edit.onnx"
-
-          if not os.path.exists(src):
-              print(f"⚠ {src} not found — skipping (edit mode unavailable)")
-          else:
-              # ── Strip stale value_info before quantization ──
-              model = onnx.load(src, load_external_data=False)
-              del model.graph.value_info[:]
-              onnx.save(model, src)
-              print(f"  stripped value_info from {src}")
-
-              print(f"quantizing {src} ({os.path.getsize(src)//1024//1024} MB)...")
-              quantize_dynamic(
-                  model_input=str(src),
-                  model_output=str(dst),
-                  op_types_to_quantize=["MatMul", "Gather"],
-                  per_channel=False,
-                  weight_type=QuantType.QInt8,
-                  use_external_data_format=True,
-              )
-              gc.collect()
-              os.remove(src)
-              print(f"✓ {dst}: {os.path.getsize(dst)//1024//1024} MB")
-
-          with open("dreamlite_onnx/manifest.json") as f:
-              m = json.load(f)
-          files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
-          m["components"] = files
-          m["has_edit_encoder"] = "text_encoder_edit.onnx" in files
-          with open("dreamlite_onnx/manifest.json", "w") as f:
-              json.dump(m, f, indent=2)
-          PYEOF
+      
       # FIX: Copy ONNX files DIRECTLY into assets — no zip container.
       # Previously the workflow ran "zip -r assets/dreamlite.zip ." which caused
       # double-compression: aapt re-compressed the zip inside the APK even with
