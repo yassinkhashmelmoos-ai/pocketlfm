@@ -11,6 +11,12 @@ import java.net.URLEncoder
 private const val TAG     = "ThunderAGI_Agent"
 private const val TIMEOUT = 6000
 
+/** One tool invocation: which tool, and the argument to give it. */
+data class ToolCall(val tool: String, val arg: String) {
+    /** Identity used to stop the loop repeating a call it already made. */
+    internal fun key(): String = tool + "|" + arg.trim().lowercase()
+}
+
 class AgentToolkit(private val context: Context) {
 
     data class ToolResult(
@@ -20,6 +26,60 @@ class AgentToolkit(private val context: Context) {
         val success:  Boolean
     )
 
+    companion object {
+        const val WEB_SEARCH = "web_search"
+        const val WIKIPEDIA  = "wikipedia"
+        const val WEATHER    = "weather"
+        const val CURRENCY   = "currency"
+        const val DICTIONARY = "dictionary"
+        const val MATH       = "math"
+    }
+
+    /**
+     * Run ONE tool by name with an argument the caller already extracted.
+     * AgentLoop uses this: the model decides the tool AND its argument, so none of
+     * the keyword regexes in this file are involved.
+     */
+    suspend fun execute(tool: String, arg: String): ToolResult = when (tool) {
+        WEB_SEARCH -> webSearchTool(arg)
+        WIKIPEDIA  -> getWikipedia(arg)
+        WEATHER    -> getWeather(arg.ifBlank { "Khartoum" })
+        CURRENCY   -> getCurrency(arg)
+        DICTIONARY -> getDictionary(arg.trim().split(Regex("\\s+")).first().trim('"', '\'', '.', ',', '?'))
+        MATH       -> evalMath(arg) ?: ToolResult("Calculator", arg, "Not a valid expression.", false)
+        else       -> ToolResult(tool, arg, "Unknown tool.", false)
+    }
+
+    /**
+     * Keyword fallback with the same triggers gatherContext() always had. AgentLoop
+     * uses it only when the model's own decision is unusable. Pure arithmetic is
+     * answered here as well, since it is local and needs no model call at all.
+     * With web off, only the calculator is offered.
+     */
+    fun heuristicCalls(message: String, webEnabled: Boolean): List<ToolCall> {
+        val calls = mutableListOf<ToolCall>()
+        pureMathExpression(message)?.let { calls += ToolCall(MATH, it) }
+        if (!webEnabled) return calls
+
+        val lower = message.lowercase()
+        if (lower.contains(Regex("\\b(weather|temperature|rain|forecast|humidity|wind|climate)\\b")))
+            calls += ToolCall(WEATHER, extractLocation(message))
+        if (lower.contains(Regex("what is|who is|who was|what was|explain|define|tell me about|history of|when did|where is"))) {
+            val subject = extractSubject(message)
+            if (subject.isNotBlank()) calls += ToolCall(WIKIPEDIA, subject)
+        }
+        if (lower.contains(Regex("meaning of|definition of|what does .* mean|define "))) {
+            val word = extractWordToDefine(message)
+            if (word.isNotBlank()) calls += ToolCall(DICTIONARY, word)
+        }
+        if (lower.contains(Regex("price of|exchange rate|how much is .*(dollar|euro|btc|bitcoin|usd|gbp|sar|egp)")))
+            calls += ToolCall(CURRENCY, message.take(120))
+        if (lower.contains(Regex("search|find|look up|latest news|recent|today's|current events")))
+            calls += ToolCall(WEB_SEARCH, message.take(120))
+        return calls
+    }
+
+    /** Legacy keyword pipeline. ChatViewModel now goes through AgentLoop; kept as-is. */
     suspend fun gatherContext(userMessage: String, webEnabled: Boolean): String {
         val tools = mutableListOf<ToolResult>()
         val lower = userMessage.lowercase()
@@ -67,35 +127,58 @@ class AgentToolkit(private val context: Context) {
 
     private suspend fun webSearchTool(query: String): ToolResult = withContext(Dispatchers.IO) {
         try {
-            val encoded = URLEncoder.encode(query, "UTF-8")
-            val url     = URL("https://api.duckduckgo.com/?q=$encoded&format=json&no_html=1&skip_disambig=1")
-            val conn    = url.openConnection().apply { connectTimeout = TIMEOUT; readTimeout = TIMEOUT }
-            val json    = JSONObject(conn.getInputStream().bufferedReader().readText())
-            val answer  = json.optString("Answer",       "")
-            val abstr   = json.optString("AbstractText", "")
-            val result  = answer.ifBlank { abstr }
-            ToolResult("Web Search", query, result.ifBlank { "No result." }, result.isNotBlank())
+            val json   = JSONObject(httpGet("https://api.duckduckgo.com/?q=${enc(query)}&format=json&no_html=1&skip_disambig=1"))
+            val answer = json.optString("Answer",       "")
+            val abstr  = json.optString("AbstractText", "")
+            val result = answer.ifBlank { abstr }
+            if (result.isNotBlank()) return@withContext ToolResult("Web Search", query, result.take(600), true)
         } catch (e: Exception) {
             Log.w(TAG, "Web search: ${e.message}")
-            ToolResult("Web Search", query, "Search unavailable.", false)
         }
+        // DuckDuckGo's instant-answer API only answers entity-style questions and comes
+        // back empty for most natural-language queries. Fall back to an encyclopedia
+        // search so the agent gets *something* real instead of "No result."
+        val wiki = getWikipedia(query)
+        if (wiki.success) ToolResult("Web Search", query, wiki.result, true)
+        else ToolResult("Web Search", query, "No result.", false)
     }
 
     private suspend fun getWikipedia(subject: String): ToolResult = withContext(Dispatchers.IO) {
-        try {
-            val encoded = URLEncoder.encode(subject, "UTF-8")
-            val url     = URL("https://en.wikipedia.org/api/rest_v1/page/summary/$encoded")
-            val conn    = url.openConnection().apply {
-                connectTimeout = TIMEOUT; readTimeout = TIMEOUT
-                setRequestProperty("User-Agent", "ThunderAGI/1.0")
-            }
-            val json    = JSONObject(conn.getInputStream().bufferedReader().readText())
-            val summary = json.optString("extract", "")
-            ToolResult("Wikipedia", subject, summary.take(500).ifBlank { "Not found." }, summary.isNotBlank())
-        } catch (e: Exception) {
-            ToolResult("Wikipedia", subject, "Unavailable.", false)
+        val topic = subject.trim()
+        val lang  = if (topic.any { it in '\u0600'..'\u06FF' }) "ar" else "en"
+        // 1) exact title  2) otherwise let Wikipedia's own search pick the best article
+        var extract = wikiSummary(lang, topic)
+        if (extract.isBlank()) {
+            val title = wikiSearchTitle(lang, topic)
+            if (title.isNotBlank()) extract = wikiSummary(lang, title)
         }
+        ToolResult("Wikipedia", subject, extract.take(500).ifBlank { "Not found." }, extract.isNotBlank())
     }
+
+    // URLEncoder turns spaces into '+', which is only valid in a query string. In a URL
+    // *path* (the REST summary endpoint) that '+' is literal, so "Albert Einstein" was
+    // looked up as "Albert+Einstein" and missed. Use %20.
+    private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8").replace("+", "%20")
+
+    private fun httpGet(url: String): String {
+        val conn = URL(url).openConnection().apply {
+            connectTimeout = TIMEOUT; readTimeout = TIMEOUT
+            setRequestProperty("User-Agent", "ThunderAGI/1.0")
+        }
+        return conn.getInputStream().bufferedReader().readText()
+    }
+
+    private fun wikiSummary(lang: String, title: String): String = try {
+        JSONObject(httpGet("https://$lang.wikipedia.org/api/rest_v1/page/summary/${enc(title.replace(' ', '_'))}"))
+            .optString("extract", "")
+    } catch (e: Exception) { "" }
+
+    private fun wikiSearchTitle(lang: String, query: String): String = try {
+        val hits = JSONObject(httpGet(
+            "https://$lang.wikipedia.org/w/api.php?action=query&list=search&srsearch=${enc(query)}&srlimit=1&format=json&utf8=1"))
+            .getJSONObject("query").getJSONArray("search")
+        if (hits.length() > 0) hits.getJSONObject(0).optString("title", "") else ""
+    } catch (e: Exception) { "" }
 
     private suspend fun getWeather(location: String): ToolResult = withContext(Dispatchers.IO) {
         try {
@@ -140,14 +223,12 @@ class AgentToolkit(private val context: Context) {
 
     private suspend fun getCurrency(query: String): ToolResult = withContext(Dispatchers.IO) {
         try {
-            val rates = JSONObject(
-                URL("https://api.exchangerate-api.com/v4/latest/USD")
-                    .openConnection().apply { connectTimeout = TIMEOUT; readTimeout = TIMEOUT }
-                    .getInputStream().bufferedReader().readText()).getJSONObject("rates")
+            val rates = JSONObject(httpGet("https://api.exchangerate-api.com/v4/latest/USD")).getJSONObject("rates")
+            val wanted = LinkedHashSet<String>()
+            Regex("\\b[A-Z]{3}\\b").findAll(query).forEach { wanted.add(it.value) }   // codes asked for
+            wanted.addAll(listOf("EUR", "GBP", "SAR", "EGP", "AED", "SDG", "JPY"))
             val sb = StringBuilder("Exchange rates (vs USD): ")
-            listOf("EUR","GBP","SAR","EGP","AED","JPY").forEach { c ->
-                if (rates.has(c)) sb.append("$c=${rates.getDouble(c)} ")
-            }
+            wanted.forEach { c -> if (c != "USD" && rates.has(c)) sb.append("$c=${rates.getDouble(c)} ") }
             ToolResult("Currency", query, sb.toString().trim(), true)
         } catch (e: Exception) {
             ToolResult("Currency", query, "Rates unavailable.", false)
@@ -160,35 +241,97 @@ class AgentToolkit(private val context: Context) {
         return ToolResult("DateTime", "current", "Current date/time: ${fmt.format(java.util.Date())}", true)
     }
 
-    private fun checkMath(input: String): ToolResult? {
-        val cleaned = input.trim().removeSuffix("?").removeSuffix("=").trim()
-        if (!Regex("""^\s*[\d\s\+\-\*\/\^\(\)\.]+\s*$""").matches(cleaned) || cleaned.length > 50) return null
+    // Arabic-Indic / Persian digits, × ÷ − and ** → plain ASCII so "٣ × ٤" works too.
+    private fun normalizeMath(input: String): String = buildString(input.length) {
+        for (ch in input) append(when (ch) {
+            in '\u0660'..'\u0669' -> '0' + (ch - '\u0660')
+            in '\u06F0'..'\u06F9' -> '0' + (ch - '\u06F0')
+            '\u066B'              -> '.'
+            '\u066C'              -> ' '
+            '\u00D7'              -> '*'
+            '\u00F7'              -> '/'
+            '\u2212', '\u2013'    -> '-'
+            else                  -> ch
+        })
+    }.replace("**", "^")
+
+    /** The message itself, if it is nothing but an arithmetic expression; else null. */
+    private fun pureMathExpression(input: String): String? {
+        val cleaned = normalizeMath(input).trim()
+            .removeSuffix("?").removeSuffix("\u061F").removeSuffix("=").trim()
+        if (cleaned.length > 50) return null
+        if (!Regex("""^\s*[\d\s\+\-\*\/\^\(\)\.]+\s*$""").matches(cleaned)) return null
+        if (cleaned.drop(1).none { it in "+-*/^" }) return null   // a bare "42" is not a calculation
+        return cleaned
+    }
+
+    private fun checkMath(input: String): ToolResult? = pureMathExpression(input)?.let { evalMath(it) }
+
+    /** Null when [expr] is not a well-formed expression (never a silently wrong number). */
+    private fun evalMath(expr: String): ToolResult? {
+        val cleaned = normalizeMath(expr).trim()
+            .removeSuffix("?").removeSuffix("\u061F").removeSuffix("=").trim()
+        val compact = cleaned.replace(" ", "")
+        if (compact.isEmpty() || compact.length > 80) return null
         return try {
-            val result = MathEval(cleaned.replace(" ","")).parse()
-            val display = if (result == result.toLong().toDouble()) result.toLong().toString()
-                          else "%.4f".format(result)
-            ToolResult("Calculator", cleaned, "$cleaned = $display", true)
+            val v = MathEval(compact).parseAll()
+            val shown = if (v.isNaN() || v.isInfinite()) "undefined" else formatNumber(v)
+            ToolResult("Calculator", cleaned, "$cleaned = $shown", true)
         } catch (e: Exception) { null }
     }
 
+    // Locale.US: String.format() with the default locale can emit Arabic-Indic digits or a
+    // comma decimal separator on Arabic-locale phones.
+    private fun formatNumber(v: Double): String {
+        if (Math.floor(v) == v && Math.abs(v) < 1e15) return v.toLong().toString()
+        return String.format(java.util.Locale.US, "%.6f", v).trimEnd('0').trimEnd('.')
+    }
+
+    // Precedence: + -  <  * /  <  unary -  <  ^ (right-assoc)  <  atom.
+    // Old version had no '^' (so "2^3" silently returned 2) and ignored trailing junk.
     private inner class MathEval(private val s: String) {
         private var p = 0
-        fun parse(): Double = addSub()
+        fun parseAll(): Double {
+            val v = addSub()
+            require(p == s.length) { "unexpected '${s[p]}' at $p" }
+            return v
+        }
         private fun addSub(): Double {
             var v = mulDiv()
-            while (p < s.length && (s[p] == '+' || s[p] == '-')) { val op = s[p++]; v = if (op=='+') v+mulDiv() else v-mulDiv() }
+            while (p < s.length && (s[p] == '+' || s[p] == '-')) {
+                val op = s[p++]; val r = mulDiv(); v = if (op == '+') v + r else v - r
+            }
             return v
         }
         private fun mulDiv(): Double {
             var v = unary()
-            while (p < s.length && (s[p] == '*' || s[p] == '/')) { val op = s[p++]; v = if (op=='*') v*unary() else v/unary() }
+            while (p < s.length && (s[p] == '*' || s[p] == '/')) {
+                val op = s[p++]; val r = unary(); v = if (op == '*') v * r else v / r
+            }
             return v
         }
-        private fun unary(): Double { if (p<s.length && s[p]=='-') { p++; return -atom() }; return atom() }
+        private fun unary(): Double {
+            if (p < s.length && s[p] == '-') { p++; return -unary() }
+            if (p < s.length && s[p] == '+') { p++; return unary() }
+            return power()
+        }
+        private fun power(): Double {
+            val base = atom()
+            if (p < s.length && s[p] == '^') { p++; return Math.pow(base, unary()) }
+            return base
+        }
         private fun atom(): Double {
-            if (p<s.length && s[p]=='(') { p++; val v=addSub(); if (p<s.length && s[p]==')') p++; return v }
-            val start=p; while (p<s.length && (s[p].isDigit() || s[p]=='.')) p++
-            return s.substring(start,p).ifEmpty{"0"}.toDouble()
+            if (p < s.length && s[p] == '(') {
+                p++
+                val v = addSub()
+                require(p < s.length && s[p] == ')') { "missing )" }
+                p++
+                return v
+            }
+            val start = p
+            while (p < s.length && (s[p] in '0'..'9' || s[p] == '.')) p++
+            require(p > start) { "number expected at $start" }
+            return s.substring(start, p).toDouble()
         }
     }
 
