@@ -1176,6 +1176,31 @@ jobs:
           quantize(src, dst, qconfig)
           gc.collect()
 
+          
+          # ── Neural-compressor writes external data as <name>.onnx_data
+          #    (underscore), but ONNX Runtime / Kotlin expects
+          #    <name>.onnx.data (dot). Re-save so the companion file uses
+          #    the correct extension.
+          import onnx
+          legacy_data = dst + "_data"
+          if os.path.exists(legacy_data):
+              print(f"  re-saving external data: {legacy_data} → {dst}.data")
+              m = onnx.load(dst, load_external_data=False)
+              onnx.external_data_helper.load_external_data_for_model(
+                  m, os.path.dirname(os.path.abspath(dst)))
+              onnx.save_model(
+                  m, dst,
+                  save_as_external_data=True,
+                  all_tensors_to_one_file=True,
+                  location=os.path.basename(dst) + ".data",
+                  size_threshold=1024,
+                  convert_attribute=False,
+              )
+              os.remove(legacy_data)
+              print(f"✓ re-saved with {dst}.data")
+          else:
+              print(f"  no legacy _data file found; checking {dst}.data")
+              
           print(f"✓ {dst}: {os.path.getsize(dst)//1024//1024} MB")
           if os.path.exists(dst + ".data"):
               print(f"✓ {dst}.data: {os.path.getsize(dst + '.data')//1024//1024} MB")
