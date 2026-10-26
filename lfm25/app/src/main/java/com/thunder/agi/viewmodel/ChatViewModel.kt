@@ -21,6 +21,7 @@ import com.thunder.agi.intelligence.SelfImprover
 import com.thunder.agi.llama.ThunderModel
 import com.thunder.agi.agent.AgentLoop
 import com.thunder.agi.agent.AgentToolkit
+import com.thunder.agi.subscription.AccessGate
 import com.thunder.agi.agent.CrashReporter
 import com.thunder.agi.agent.EmotionDetector
 import com.thunder.agi.agent.FileExporter
@@ -137,7 +138,10 @@ data class ChatUiState(
     val imageGenEnabled:    Boolean           = false,
     // FIX (new): "the current picture" / "make it brighter" with no number at all
     // had nothing to resolve against — this is that last-shown image, per session.
-    val lastImageId:        Int?              = null
+    val lastImageId:        Int?              = null,
+    // NEW: set when the user presses send without access; MainActivity then shows the activation
+    // pop-up. The chat itself (and its history) is always visible.
+    val paywallRequested:   Boolean           = false
 )
 
 // ── ViewModel ─────────────────────────────────────────────────────────────────
@@ -301,10 +305,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun onInputChanged(text: String) = _ui.update { it.copy(inputText = text) }
     fun setPendingImage(uri: Uri?)   = _ui.update { it.copy(pendingImageUri = uri) }
 
+    // ── Access gate ───────────────────────────────────────────────────────────
+    // The app opens for everyone and the history is always readable; only RUNNING the model needs access.
+    // sendMessage() and editAndResend() are the only ways generation can start (voice only fills the input
+    // box), and both ask here BEFORE changing any state, so a blocked message simply stays in the input box.
+    private fun isAccessAllowed(): Boolean = AccessGate.isUnlocked(getApplication<Application>())
+    fun requestPaywall()        = _ui.update { it.copy(paywallRequested = true) }
+    fun dismissPaywall()        = _ui.update { it.copy(paywallRequested = false) }
+    fun showSnackbar(message: String) = _ui.update { it.copy(snackbar = message) }
+
     // FIX: editAndResend — truncates history after the edited message and re-generates
     fun editAndResend(messageId: String, newContent: String) {
         val sid = _ui.value.currentSessionId ?: return
         if (_ui.value.isGenerating) return
+        if (!isAccessAllowed()) { requestPaywall(); return }       // before anything is deleted from the history
         viewModelScope.launch {
             val msgs = _ui.value.messages.toMutableList()
             val idx  = msgs.indexOfFirst { it.id == messageId }
@@ -332,8 +346,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun sendMessage() {
         val text     = _ui.value.inputText.trim()
         val imageUri = _ui.value.pendingImageUri
-        if (text.isBlank() && imageUri == null) return
+        if (text.isBlank() && imageUri == null) return            // nothing typed: no pop-up
         if (_ui.value.isGenerating) return
+        if (!isAccessAllowed()) { requestPaywall(); return }       // typed text and attachment stay where they are
         val sid = _ui.value.currentSessionId ?: return
 
         _ui.update { it.copy(inputText = "", pendingImageUri = null) }
@@ -354,6 +369,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun generateResponse(userText: String, imagePath: String?, sessionId: String) {
+        if (!isAccessAllowed()) { requestPaywall(); return }       // safety net: never start the model without access
         // FIX: removed SupervisorJob() which detached coroutine from viewModelScope,
         // causing generation to leak even after ViewModel is cleared (memory+CPU waste).
         viewModelScope.launch(Dispatchers.IO) {
