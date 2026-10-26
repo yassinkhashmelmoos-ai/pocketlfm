@@ -1,9 +1,12 @@
 package com.thunder.agi
 
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -15,6 +18,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.thunder.agi.license.LicenseValidator
 import com.thunder.agi.node.ThunderNav
 import com.thunder.agi.node.ThunderService
+import com.thunder.agi.subscription.AccessGate
 import com.thunder.agi.subscription.SubscriptionManager
 import com.thunder.agi.ui.AboutScreen
 import com.thunder.agi.ui.ActivationScreen
@@ -23,6 +27,8 @@ import com.thunder.agi.ui.WalletScreen
 import com.thunder.agi.ui.components.ChatScreen
 import com.thunder.agi.ui.theme.ThunderAGITheme
 import com.thunder.agi.viewmodel.ChatViewModel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -42,82 +48,32 @@ class MainActivity : ComponentActivity() {
 fun ThunderAGIApp() {
     val context = LocalContext.current
 
+    val scope   = rememberCoroutineScope()
+
     // NOTE: no auto-granted trial, by design — access is always manual: either a
     // username+key issued through LicenseValidator (the same path whether someone
     // pays or is comped — "paid" is just whatever expiry date the key was signed
-    // with), or a verified Bankak receipt below. registerUser() / the 30-day
-    // trial it starts is intentionally never called from here.
+    // with), or a verified Bankak receipt. registerUser() / the 30-day trial it
+    // starts is intentionally never called from here.
+    //
+    // The app now OPENS FOR EVERYONE (first launch, an ended month, never activated) and the chat
+    // history is always readable. Access is only asked for when the user presses send: ChatViewModel
+    // then raises ui.paywallRequested and the activation pop-up at the bottom of this function
+    // appears, with a "Not now" button that simply returns to the chat.
     val sub         = remember { SubscriptionManager(context) }
     var licenseInfo by remember { mutableStateOf(LicenseValidator.check(context)) }
     var subState    by remember { mutableStateOf(sub.getState()) }
-
-    // FIX: use derivedStateOf so UI reacts immediately when subState changes after payment.
-    // TRIAL_ACTIVE stays in this check (not a free trial — see note above): applying a
-    // reset key on PaymentScreen below sets TRIAL_START without touching PAID_UNTIL, so
-    // that's the state a reset-key user is in for their next 30 days.
-    val isActivated by remember {
-        derivedStateOf {
-            licenseInfo.status == LicenseValidator.Status.VALID ||
-            subState == SubscriptionManager.SubscriptionState.PAID_ACTIVE  ||
-            subState == SubscriptionManager.SubscriptionState.ADMIN        ||
-            subState == SubscriptionManager.SubscriptionState.TRIAL_ACTIVE
-        }
-    }
 
     var showAbout     by remember { mutableStateOf(false) }
     var verifyMessage by remember { mutableStateOf("") }
     var isVerifying   by remember { mutableStateOf(false) }
 
+    // LicenseValidator.check() is a slow Keystore call, so it runs here, and only its RESULT is
+    // handed to AccessGate, which the ViewModel asks at the moment the user presses send.
+    LaunchedEffect(licenseInfo) { AccessGate.updateLicense(licenseInfo) }
+
     if (showAbout) {
         AboutScreen(onDismiss = { showAbout = false })
-        return
-    }
-
-    if (!isActivated) {
-        // FIX: PaymentScreen existed but nothing ever showed it. TRIAL_EXPIRED is
-        // reached by a receipt-paid or reset-key user whose 30 days ran out — they
-        // used to fall through to ActivationScreen, which has no "access ended"
-        // message and no reset-key option. Every other non-activated state still
-        // goes to ActivationScreen below.
-        if (subState == SubscriptionManager.SubscriptionState.TRIAL_EXPIRED) {
-            PaymentScreen(
-                username = sub.getUsername(),
-                onVerifyReceipt = { uri, process, date ->
-                    isVerifying   = true
-                    val result    = sub.verifyReceipt(uri, process, date)
-                    verifyMessage = result.reason
-                    isVerifying   = false
-                    if (result.valid) subState = sub.getState()
-                },
-                onResetKey = { key ->
-                    verifyMessage = if (sub.applyResetKey(key)) {
-                        subState = sub.getState()
-                        "✅ تم إعادة التفعيل! Reactivated!"
-                    } else {
-                        "مفتاح غير صحيح — Invalid reset key"
-                    }
-                },
-                verificationMessage = verifyMessage,
-                isVerifying         = isVerifying
-            )
-            return
-        }
-        ActivationScreen(
-            onActivateLicense = { username, key ->
-                val ok = LicenseValidator.activate(context, username, key)
-                if (ok) licenseInfo = LicenseValidator.check(context)
-                ok
-            },
-            onVerifyReceipt = { uri, process, date ->
-                isVerifying   = true
-                val result    = sub.verifyReceipt(uri, process, date)
-                verifyMessage = result.reason
-                isVerifying   = false
-                if (result.valid) subState = sub.getState()
-            },
-            receiptVerificationMessage = verifyMessage,
-            isVerifyingReceipt         = isVerifying
-        )
         return
     }
 
@@ -143,6 +99,49 @@ fun ThunderAGIApp() {
     // Thunder wallet: resume the opt-in background service if the user enabled it before
     LaunchedEffect(Unit) { ThunderService.restoreIfEnabled(context) }
 
+    // ── activation pop-up wiring ─────────────────────────────────────────────
+    LaunchedEffect(ui.paywallRequested) {
+        // the month may have ended while the app was open: pick the right variant, drop stale text
+        if (ui.paywallRequested) { subState = sub.getState(); verifyMessage = "" }
+    }
+
+    val verifyReceipt: (Uri, String) -> Unit = { uri, process ->
+        if (!isVerifying) {
+            isVerifying   = true
+            verifyMessage = ""
+            scope.launch {
+                val result = sub.verifyReceipt(uri, process)     // decoding + OCR run off the main thread
+                verifyMessage = result.reason
+                isVerifying   = false
+                if (result.valid) {
+                    subState = sub.getState()
+                    delay(2500)                                  // let the user read what was verified
+                    vm.dismissPaywall()
+                }
+            }
+        }
+    }
+    val activateLicense: (String, String) -> Boolean = { username, key ->
+        val ok = LicenseValidator.activate(context, username, key)
+        if (ok) {
+            licenseInfo = LicenseValidator.check(context)
+            AccessGate.updateLicense(licenseInfo)
+            vm.dismissPaywall()
+            vm.showSnackbar("✅ تم التفعيل — Activated")
+        }
+        ok
+    }
+    val applyResetKey: (String) -> Unit = { key ->
+        if (sub.applyResetKey(key)) {
+            subState = sub.getState()
+            vm.dismissPaywall()
+            vm.showSnackbar("✅ تم إعادة التفعيل! Reactivated!")
+        } else {
+            verifyMessage = "مفتاح غير صحيح — Invalid reset key"
+        }
+    }
+
+    Box(Modifier.fillMaxSize()) {
     if (ThunderNav.showWallet.value) {
         WalletScreen(onDismiss = { ThunderNav.showWallet.value = false })
     } else {
@@ -193,5 +192,33 @@ fun ThunderAGIApp() {
             sub.getDaysRemaining() else licenseInfo.daysRemaining,
         isAdmin              = subState == SubscriptionManager.SubscriptionState.ADMIN
     )
+    }
+
+    // The two activation options you already built, shown ON TOP of the chat only after the user
+    // presses send without access. Back or "Not now" returns to the chat history; the unsent text
+    // is still in the input box.
+    if (ui.paywallRequested) {
+        BackHandler { vm.dismissPaywall() }
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+            if (subState == SubscriptionManager.SubscriptionState.TRIAL_EXPIRED) {
+                PaymentScreen(
+                    username            = sub.getUsername(),
+                    onVerifyReceipt     = verifyReceipt,
+                    onResetKey          = applyResetKey,
+                    verificationMessage = verifyMessage,
+                    isVerifying         = isVerifying,
+                    onSkip              = vm::dismissPaywall
+                )
+            } else {
+                ActivationScreen(
+                    onActivateLicense          = activateLicense,
+                    onVerifyReceipt            = verifyReceipt,
+                    receiptVerificationMessage = verifyMessage,
+                    isVerifyingReceipt         = isVerifying,
+                    onSkip                     = vm::dismissPaywall
+                )
+            }
+        }
+    }
     }
 }
