@@ -127,6 +127,11 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.json:json:20231013")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.0")
+    // Offline OCR (Tesseract 5.5.1) that reads the payment receipt. Language models ship in
+    // app/src/main/assets/tessdata/ (ara + eng). If the build ever complains about a duplicate
+    // lib/arm64-v8a/libc++_shared.so, add to android { }:
+    //     packaging { jniLibs { pickFirsts += "**/libc++_shared.so" } }
+    implementation("cz.adaptech.tesseract4android:tesseract4android:4.9.0")
 
     // Thunder wallet: post-quantum KEM (Kyber-768), used only through crypto/Kem.kt
     // (one file to change when moving to final FIPS-203 ML-KEM).
