@@ -29,10 +29,12 @@ import com.thunder.agi.ui.theme.*
 @Composable
 fun ActivationScreen(
     onActivateLicense:          (username: String, key: String) -> Boolean,
-    onVerifyReceipt:            (Uri, String, String) -> Unit,
+    onVerifyReceipt:            (Uri, String) -> Unit,
     receiptVerificationMessage: String,
     isVerifyingReceipt:         Boolean,
-    statusMessage:              String = ""
+    statusMessage:              String = "",
+    // when non-null the screen is a pop-up that can be dismissed ("Not now") back to the chat
+    onSkip:                     (() -> Unit)? = null
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
 
@@ -43,7 +45,7 @@ fun ActivationScreen(
             .verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Spacer(Modifier.height(48.dp))
+        if (onSkip != null) SkipRow(onSkip) else Spacer(Modifier.height(48.dp))
 
         Image(
             painter = painterResource(R.mipmap.ic_launcher_round),
@@ -175,12 +177,11 @@ private fun LicenseKeyTab(
 
 @Composable
 private fun BankReceiptTab(
-    onVerifyReceipt:     (Uri, String, String) -> Unit,
+    onVerifyReceipt:     (Uri, String) -> Unit,
     verificationMessage: String,
     isVerifying:         Boolean
 ) {
     var processNumber by remember { mutableStateOf("") }
-    var receiptDate   by remember { mutableStateOf("") }
     var receiptUri    by remember { mutableStateOf<Uri?>(null) }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -194,7 +195,7 @@ private fun BankReceiptTab(
         Text("ارفع إيصال بنك الخرطوم",
             style = MaterialTheme.typography.titleSmall, color = ThunderWhite)
         Spacer(Modifier.height(4.dp))
-        Text("يتم مراجعة الإيصال تلقائياً بالذكاء الاصطناعي",
+        Text("تُقرأ بيانات الإيصال تلقائياً: الحساب والاسم والمبلغ والتاريخ. ارفع لقطة شاشة كاملة وواضحة.",
             style = MaterialTheme.typography.bodySmall, color = ThunderGray,
             textAlign = TextAlign.Center)
 
@@ -273,18 +274,11 @@ private fun BankReceiptTab(
         val fColors = fieldColors()
         OutlinedTextField(value = processNumber, onValueChange = { processNumber = it },
             modifier = Modifier.fillMaxWidth(),
-            label = { Text("رقم العملية (من الإيصال)", color = ThunderGray) },
+            label = { Text("رقم العملية (اختياري — يُقرأ من الإيصال)", color = ThunderGray) },
             placeholder = { Text("مثال: 20229627131", color = ThunderGray) },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             colors = fColors, shape = RoundedCornerShape(12.dp))
-
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(value = receiptDate, onValueChange = { receiptDate = it },
-            modifier = Modifier.fillMaxWidth(),
-            label = { Text("تاريخ الإيصال (YYYY-MM-DD)", color = ThunderGray) },
-            placeholder = { Text("مثال: 2026-10-11", color = ThunderGray) },
-            singleLine = true, colors = fColors, shape = RoundedCornerShape(12.dp))
 
         if (verificationMessage.isNotBlank()) {
             Spacer(Modifier.height(8.dp))
@@ -296,11 +290,10 @@ private fun BankReceiptTab(
 
         Spacer(Modifier.height(16.dp))
         Button(onClick = {
-            receiptUri?.let { uri -> onVerifyReceipt(uri, processNumber, receiptDate) }
+            receiptUri?.let { uri -> onVerifyReceipt(uri, processNumber) }
         },
             modifier = Modifier.fillMaxWidth().height(52.dp),
-            enabled = receiptUri != null && processNumber.isNotBlank() &&
-                      receiptDate.isNotBlank() && !isVerifying,
+            enabled = receiptUri != null && !isVerifying,
             colors = ButtonDefaults.buttonColors(containerColor = ThunderElectric),
             shape = RoundedCornerShape(12.dp)
         ) {
@@ -319,13 +312,14 @@ private fun BankReceiptTab(
 @Composable
 fun PaymentScreen(
     username:            String,
-    onVerifyReceipt:     (Uri, String, String) -> Unit,
+    onVerifyReceipt:     (Uri, String) -> Unit,
     onResetKey:          (String) -> Unit,
     verificationMessage: String,
-    isVerifying:         Boolean
+    isVerifying:         Boolean,
+    // when non-null the screen is a pop-up that can be dismissed ("Not now") back to the chat
+    onSkip:              (() -> Unit)? = null
 ) {
     var processNumber by remember { mutableStateOf("") }
-    var receiptDate   by remember { mutableStateOf("") }
     var receiptUri    by remember { mutableStateOf<Uri?>(null) }
     var showResetKey  by remember { mutableStateOf(false) }
     var resetKey      by remember { mutableStateOf("") }
@@ -339,7 +333,7 @@ fun PaymentScreen(
             .verticalScroll(rememberScrollState()).padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Spacer(Modifier.height(32.dp))
+        if (onSkip != null) SkipRow(onSkip) else Spacer(Modifier.height(32.dp))
         Image(painter = painterResource(R.mipmap.ic_launcher_round),
             contentDescription = "Thunder AGI", modifier = Modifier.size(72.dp))
         Spacer(Modifier.height(8.dp))
@@ -400,25 +394,17 @@ fun PaymentScreen(
         val pColors = paymentFieldColors()
         OutlinedTextField(value = processNumber, onValueChange = { processNumber = it },
             modifier = Modifier.fillMaxWidth(),
-            label = { Text("رقم العملية (من الإيصال)", color = ThunderGray) },
+            label = { Text("رقم العملية (اختياري — يُقرأ من الإيصال)", color = ThunderGray) },
             placeholder = { Text("مثال: 20379363859", color = ThunderGray) },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             colors = pColors)
 
-        Spacer(Modifier.height(12.dp))
-        OutlinedTextField(value = receiptDate, onValueChange = { receiptDate = it },
-            modifier = Modifier.fillMaxWidth(),
-            label = { Text("تاريخ الإيصال", color = ThunderGray) },
-            placeholder = { Text("مثال: 2026-10-11", color = ThunderGray) },
-            singleLine = true, colors = pColors)
-
         Spacer(Modifier.height(16.dp))
         Button(onClick = {
-            receiptUri?.let { uri -> onVerifyReceipt(uri, processNumber, receiptDate) }
+            receiptUri?.let { uri -> onVerifyReceipt(uri, processNumber) }
         },
-            enabled = receiptUri != null && processNumber.isNotBlank() &&
-                      receiptDate.isNotBlank() && !isVerifying,
+            enabled = receiptUri != null && !isVerifying,
             modifier = Modifier.fillMaxWidth().height(52.dp),
             colors = ButtonDefaults.buttonColors(containerColor = ThunderElectric),
             shape = RoundedCornerShape(12.dp)
@@ -559,6 +545,21 @@ fun AboutScreen(onDismiss: () -> Unit) {
             Text("23/6/2026\n© 2026 ياسين خشيلموس — جميع الحقوق محفوظة",
                 color = ThunderGray, style = MaterialTheme.typography.labelSmall,
                 textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+        }
+    }
+}
+
+/** "Not now": returns from the activation pop-up to the chat and its history. */
+@Composable
+private fun SkipRow(onSkip: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 4.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.End
+    ) {
+        TextButton(onClick = onSkip) {
+            Icon(Icons.Default.Close, contentDescription = null, tint = ThunderGray, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("ليس الآن • Not now", color = ThunderGray)
         }
     }
 }
