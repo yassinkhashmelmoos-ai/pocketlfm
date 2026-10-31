@@ -1,15 +1,42 @@
 name: Build Thunder AGI APK
 
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+#  Quantized on-device image stack.  Everything shipped is executable by onnxruntime-android 1.17.0
+#  (the version in app/build.gradle.kts) and every model is ONE self-contained file < 2 GB, because
+#  the app's asset-copy list names only <model>.onnx files (it never copies *.onnx.data).
+#
+#   UNet    Chameleon-style per-tensor weight formats (SQNR-selected): Conv INT8 | Linear INT4-g32/INT8
+#   VAE     PassionSR-flavoured: INT8 per-channel weights with MSE-optimal clip search, first/last conv FP32
+#   Gen enc Q4_K_M-class mix: INT4-g32 (HQQ-refined) + INT8 for v/down on llama.cpp's "more bits" layers
+#   Edit    same LM recipe; vision tower + merger INT8 (never INT4)
+#   +       Basis Sharing (whitened, error-budgeted) and optional LM-weight sharing between the encoders
+#  Every stage is judged against FP32 outputs on REAL inputs, run on an ORT 1.17.0 sandbox, and falls
+#  back to the next-safer recipe (finally the original FP16/FP32 model) if its fidelity gate fails.
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+
 on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      basis_sharing:
+        description: "Try Basis Sharing on the text encoders (applied only where it passes the activation-space error budget)"
+        type: boolean
+        default: true
+      share_lm_weights:
+        description: "Store the Qwen LM weights once for BOTH encoders (about -1.2 GB). CI patches the app's asset copy-list; no repo change"
+        type: boolean
+        default: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ENABLE_BS: ${{ (github.event_name != 'workflow_dispatch' || inputs.basis_sharing) && '1' || '0' }}
+      SHARE_LM: ${{ (github.event_name == 'workflow_dispatch' && inputs.share_lm_weights) && '1' || '0' }}
 
     steps:
+
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
         with:
@@ -22,6 +49,7 @@ jobs:
           docker-images: true # Frees Docker cache
           swap-storage: true  # Frees pre-existing swap (your custom swap is separate)
       
+
       - name: Increase swap space (prevent OOM)
         run: |
           sudo fallocate -l 12G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=12288
@@ -30,6 +58,7 @@ jobs:
           sudo swapon /mnt/swapfile
           free -h
           
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -56,7 +85,6 @@ jobs:
             accelerate \
             onnx \
             onnxscript \
-            "onnx-neural-compressor @ git+https://github.com/thiswillbeyourgithub/neural-compressor-fork.git@da405cd" \
             "onnxruntime==1.18.0" \
             "numpy<2" \
             "onnxconverter-common" \
@@ -86,6 +114,7 @@ jobs:
       # stubs for exactly those, plus broad __getattr__ fallbacks for anything else
       # missing, so pipeline loading doesn't hard-fail on an AttributeError before
       # ever reaching the actual export code.
+
       - name: Patch diffusers for huggingface_hub compatibility
         run: |
           SHIM=/tmp/hub_compat_shim.py
@@ -162,6 +191,1281 @@ jobs:
           print("Patched " + path)
           '
 
+      - name: "Create on-device-equivalent ONNX Runtime sandbox (same version as the app's onnxruntime-android)"
+        run: |
+          ORT_APP=$(grep -oP 'onnxruntime-android:\K[0-9]+\.[0-9]+\.[0-9]+' lfm25/app/build.gradle.kts | head -1)
+          ORT_APP=${ORT_APP:-1.17.0}
+          echo "App ships onnxruntime-android $ORT_APP -> building a matching python sandbox"
+          python3 -m venv "$HOME/ort_device"
+          "$HOME/ort_device/bin/pip" install --no-cache-dir "numpy<2" "onnxruntime==$ORT_APP"
+          "$HOME/ort_device/bin/python" -c "import onnxruntime as o; print('device-equivalent runtime: ORT', o.__version__)"
+          python3 -c "import onnxruntime as o; print('build-side runtime (quantizers, FP32 references): ORT', o.__version__)"
+          echo "ORT117_PY=$HOME/ort_device/bin/python" >> "$GITHUB_ENV"
+
+      - name: "Write quantization toolkit — quantlib.py (part 1/3)"
+        run: |
+          mkdir -p quant
+          cat > quant/quantlib.py << 'PYEOF_QUANTLIB_0'
+          """
+          quantlib.py -- Thunder AGI on-device quantization toolkit.
+
+          Everything produced here is executable by onnxruntime-android 1.17.0 (the version the app ships):
+            * INT8 weight-only per-channel via DequantizeLinear (no activation quantization, not constant-folded)
+            * INT4 block-wise (g=32, asymmetric) via com.microsoft MatMulNBits  (+ NumPy half-quadratic refinement)
+            * row-wise INT8 embedding tables (Gather + Cast + Mul)
+            * FP16 weight storage via Cast
+            * single-file output (< 2 GiB, no external data) with IR version capped for ORT 1.17
+          Nothing here needs INT4-QDQ, opset 21, FP8 or MX kernels (all of which ORT 1.17 cannot run).
+          """
+          import os, gc, json, math, copy, time, subprocess, sys, hashlib
+          import numpy as np
+          import onnx
+          from onnx import numpy_helper, helper, TensorProto
+
+          MS = "com.microsoft"
+          F32, F16 = TensorProto.FLOAT, TensorProto.FLOAT16
+          MAX_PROTO = 2_000_000_000          # stay safely below the 2 GiB protobuf limit
+
+
+          def log(*a):
+              print(*a, flush=True)
+
+
+          # ───────────────────────────── manifest helpers ─────────────────────────────
+          def read_manifest(d):
+              p = os.path.join(d, "manifest.json")
+              return json.load(open(p)) if os.path.exists(p) else {"params": {}}
+
+
+          def write_manifest(d, m):
+              with open(os.path.join(d, "manifest.json"), "w") as f:
+                  json.dump(m, f, indent=2)
+
+
+          def update_manifest(d, **kv):
+              m = read_manifest(d)
+              m.update(kv)
+              write_manifest(d, m)
+              return m
+
+
+          # ───────────────────────────── numeric helpers ──────────────────────────────
+          def sqnr_db(w, wq):
+              num = float((w.astype(np.float64) ** 2).mean())
+              den = float(((w.astype(np.float64) - wq.astype(np.float64)) ** 2).mean())
+              return 99.0 if den <= 0 else 10.0 * math.log10(max(num, 1e-30) / den)
+
+
+          def cos_sim(a, b):
+              a = a.reshape(-1).astype(np.float64); b = b.reshape(-1).astype(np.float64)
+              d = np.linalg.norm(a) * np.linalg.norm(b)
+              return 1.0 if d == 0 else float(a @ b / d)
+
+
+          # ───────────────────────────── lazy weight access ───────────────────────────
+          class Source:
+              """Reads initializers lazily (inline or external-data) so a 7 GB FP32 model never sits in RAM."""
+
+              def __init__(self, model, base_dir):
+                  self.model, self.dir = model, base_dir
+                  self.map = {t.name: t for t in model.graph.initializer}
+
+              def has(self, n): return n in self.map
+              def shape(self, n): return tuple(self.map[n].dims)
+              def dtype(self, n): return self.map[n].data_type
+
+              def array(self, n):
+                  a = numpy_helper.to_array(self.map[n], self.dir)
+                  return a.astype(np.float32) if a.dtype == np.float16 else a
+
+
+          # ───────────────────────────── graph utilities ──────────────────────────────
+          def normalize_names(model):
+              seen = set()
+              for i, n in enumerate(model.graph.node):
+                  nm = n.name
+                  if not nm or nm in seen:
+                      base = nm or n.op_type
+                      k = 0
+                      while f"{base}__{i}_{k}" in seen:
+                          k += 1
+                      nm = f"{base}__{i}_{k}"
+                      n.name = nm
+                  seen.add(nm)
+
+
+          def _node_deps(n):
+              deps = set(i for i in n.input if i)
+              for a in n.attribute:
+                  subs = [a.g] if a.type == onnx.AttributeProto.GRAPH else list(a.graphs) if a.type == onnx.AttributeProto.GRAPHS else []
+                  for g in subs:
+                      for m in g.node:
+                          deps |= _node_deps(m)
+              return deps
+
+
+          def prune_unreachable(model):
+              """Dead-code elimination from the graph outputs; also drops unreferenced initializers (e.g. an unused tied lm_head copy)."""
+              g = model.graph
+              producer = {}
+              for n in g.node:
+                  for o in n.output:
+                      producer[o] = n
+              keep, stack = set(), [o.name for o in g.output]
+              while stack:
+                  t = stack.pop()
+                  n = producer.get(t)
+                  if n is None or id(n) in keep:
+                      continue
+                  keep.add(id(n))
+                  stack.extend(_node_deps(n))
+              kept_nodes = [n for n in g.node if id(n) in keep]
+              removed = len(g.node) - len(kept_nodes)
+              used = set()
+              for n in kept_nodes:
+                  used |= _node_deps(n)
+              used |= {o.name for o in g.output}
+              kept_inits = [t for t in g.initializer if t.name in used]
+              dropped_bytes = sum(int(np.prod(t.dims or [1])) * 4 for t in g.initializer if t.name not in used)
+              del g.node[:]; g.node.extend(kept_nodes)
+              del g.initializer[:]; g.initializer.extend(kept_inits)
+              return removed, dropped_bytes
+
+
+          def ensure_opset(model, domain, version):
+              for o in model.opset_import:
+                  if o.domain == domain:
+                      o.version = max(o.version, version) if domain != "" else o.version
+                      return
+              model.opset_import.append(helper.make_opsetid(domain, version))
+
+
+          def default_opset(model):
+              for o in model.opset_import:
+                  if o.domain in ("", "ai.onnx"):
+                      return o.version
+              return 0
+
+
+          # ───────────────────────────── block-INT4 quantizers ────────────────────────
+          def _rtn_blocks(b):
+              mn, mx = b.min(-1, keepdims=True), b.max(-1, keepdims=True)
+              s = (mx - mn) / 15.0
+              s = np.where(s <= 1e-12, 1.0, s)
+              z = np.clip(np.round(-mn / s), 0, 15)
+              q = np.clip(np.round(b / s + z), 0, 15)
+              return q, s, z
+
+
+          def _hqq_blocks(b, iters=12, p=0.7, beta=10.0, kappa=1.01):
+              """Half-quadratic (HQQ) refinement of the zero point with an lp (p<1) loss, then integer-zero + LS scale refit.
+              Falls back to plain RTN per block whenever RTN has lower L2 error, so it is never worse than RTN in L2."""
+              q0, s0, z0 = _rtn_blocks(b)
+              mn = b.min(-1, keepdims=True)
+              s = s0
+              z = -mn / s
+              best = None
+              for _ in range(iters):
+                  q = np.clip(np.round(b / s + z), 0, 15)
+                  wr = (q - z) * s
+                  e = b - wr
+                  a = np.abs(e)
+                  e = np.sign(e) * np.maximum(a - (1.0 / beta) * np.power(a + 1e-8, p - 1.0), 0.0)
+                  z = np.mean(q - (b - e) / s, axis=-1, keepdims=True)
+                  beta *= kappa
+                  cur = float(np.abs(b - wr).mean())
+                  if best is not None and cur >= best:
+                      break
+                  best = cur
+              zi = np.clip(np.round(z), 0, 15)
+              q = np.clip(np.round(b / s + zi), 0, 15)
+              d = q - zi
+              num, den = (d * b).sum(-1, keepdims=True), (d * d).sum(-1, keepdims=True)
+              s2 = np.where(den > 0, num / np.maximum(den, 1e-12), s)
+              s2 = np.where(s2 <= 1e-12, s, s2)
+              q = np.clip(np.round(b / s2 + zi), 0, 15)
+              e_h = ((q - zi) * s2 - b) ** 2
+              e_r = ((q0 - z0) * s0 - b) ** 2
+              use_h = (e_h.sum(-1, keepdims=True) <= e_r.sum(-1, keepdims=True))
+              return np.where(use_h, q, q0), np.where(use_h, s2, s0), np.where(use_h, zi, z0)
+
+
+          def quant_nbits(w2d, block=32, algo="hqq"):
+              """w2d: [K,N] float32 (ONNX MatMul layout).  Returns packed MatMulNBits tensors + the dequantized weight for SQNR."""
+              K, N = w2d.shape
+              kb = (K + block - 1) // block
+              wp = np.pad(w2d, ((0, kb * block - K), (0, 0))) if kb * block > K else w2d
+              b = np.ascontiguousarray(wp.T).reshape(N, kb, block).astype(np.float32)        # every block comes from ONE output column
+              q, s, z = (_hqq_blocks(b) if algo == "hqq" else _rtn_blocks(b))
+              deq = ((q - z) * s).reshape(N, kb * block)[:, :K].T
+              q8 = q.astype(np.uint8)
+              packed = (q8[..., 0::2] | (q8[..., 1::2] << 4)).astype(np.uint8)               # [N, kb, block/2]
+              zz = z.astype(np.uint8).reshape(N, kb)
+              if kb % 2:
+                  zz = np.pad(zz, ((0, 0), (0, 1)))
+              zpacked = (zz[:, 0::2] | (zz[:, 1::2] << 4)).astype(np.uint8).reshape(-1)      # [N * ceil(kb/2)]
+              return packed, s.reshape(-1).astype(np.float32), zpacked, deq, sqnr_db(w2d, deq)
+
+
+          def quant_int8_perchannel(w, axis, clips=(1.0, 0.999, 0.995, 0.99, 0.98, 0.96), chunk=16384):
+              """Per-output-channel symmetric INT8 with an MSE-optimal clip search per channel (a PTQ stand-in for a learned boundary)."""
+              wm_all = np.moveaxis(w, axis, 0)
+              C = wm_all.shape[0]
+              wm_all = wm_all.reshape(C, -1)
+              q_all = np.empty(wm_all.shape, np.int8)
+              s_all = np.empty(C, np.float32)
+              err_tot = 0.0
+              for c0 in range(0, C, chunk):
+                  wm = wm_all[c0:c0 + chunk].astype(np.float32)
+                  amax = np.abs(wm).max(axis=1)
+                  best_e, best_s = None, None
+                  for r in clips:
+                      s = np.maximum(amax * r / 127.0, 1e-12).astype(np.float32)
+                      q = np.clip(np.round(wm / s[:, None]), -127, 127)
+                      e = ((q * s[:, None] - wm) ** 2).sum(axis=1)
+                      if best_e is None:
+                          best_e, best_s = e, s
+                      else:
+                          m = e < best_e
+                          best_e, best_s = np.where(m, e, best_e), np.where(m, s, best_s)
+                  q_all[c0:c0 + chunk] = np.clip(np.round(wm / best_s[:, None]), -127, 127).astype(np.int8)
+                  s_all[c0:c0 + chunk] = best_s
+                  err_tot += float(best_e.sum())
+              power = float((w.astype(np.float64) ** 2).sum())
+              sq = 99.0 if err_tot <= 0 else 10 * math.log10(max(power, 1e-30) / err_tot)
+              q = np.moveaxis(q_all.reshape(wm_all.shape[0:1] + np.moveaxis(w, axis, 0).shape[1:]), 0, axis)
+              return np.ascontiguousarray(q), s_all, sq
+
+
+          # ───────────────────────────── the rewriter ─────────────────────────────────
+          _NB_CACHE = {}
+
+
+          class Rewriter:
+              """Builds a quantized copy of a graph, streaming FP32 weights one tensor at a time."""
+
+              def __init__(self, model, base_dir):
+                  self.m = copy.deepcopy(model)                    # graph-only copy (external-data references stay references)
+                  self.src = Source(self.m, base_dir)
+                  normalize_names(self.m)
+                  self.removed_inits, self.added_inits = set(), []
+                  self.before = {}                                  # node.name -> [nodes emitted right before it]
+                  self.replace = {}                                 # node.name -> [replacement nodes]
+                  self.stats = {}                                   # fmt -> params
+                  self.log = []                                     # (node, weight, fmt, sqnr)
+                  self.n_uses = {}
+                  for n in self.m.graph.node:
+                      for i in n.input:
+                          self.n_uses[i] = self.n_uses.get(i, 0) + 1
+
+              # -- bookkeeping --
+              def _count(self, fmt, params, bytes_):
+                  d = self.stats.setdefault(fmt, {"params": 0, "bytes": 0, "tensors": 0})
+                  d["params"] += int(params); d["bytes"] += int(bytes_); d["tensors"] += 1
+
+              def _release(self, wname):
+                  self.n_uses[wname] = self.n_uses.get(wname, 1) - 1
+                  if self.n_uses[wname] <= 0 and self.src.has(wname):
+                      self.removed_inits.add(wname)
+
+              def _add(self, name, arr):
+                  self.added_inits.append(numpy_helper.from_array(arr, name))
+
+              # -- formats --
+              def int8_dq(self, node, in_idx, axis, tag=None):
+                  """Weight-only INT8 (per-channel) -> DequantizeLinear feeding `node.input[in_idx]`."""
+                  wname = node.input[in_idx]
+                  w = self.src.array(wname)
+                  q, s, sq = quant_int8_perchannel(w, axis)
+                  base = f"{wname}::{node.name}"
+                  self._add(base + "::q8", q)
+                  self._add(base + "::s8", s)
+                  dq = helper.make_node("DequantizeLinear", [base + "::q8", base + "::s8"], [base + "::dq"], name=base + "::DQ", axis=axis)
+                  self.before.setdefault(node.name, []).append(dq)
+                  node.input[in_idx] = base + "::dq"
+                  self._release(wname)
+                  self._count("int8", w.size, q.nbytes + s.nbytes)
+                  self.log.append((node.name, wname, "int8", sq))
+                  return sq
+
+              def nbits4(self, node, algo="hqq", block=32, min_sqnr=None):
+                  """MatMul(A, W[K,N]) -> MatMulNBits (4-bit, g=block, asym).  Returns (applied, sqnr)."""
+                  wname = node.input[1]
+                  w = self.src.array(wname)
+                  key = (wname, w.shape, algo, block)
+                  if key in _NB_CACHE:
+                      packed, scales, zp, sq = _NB_CACHE[key]                     # same tensor, same recipe in an earlier ladder rung
+                  else:
+                      packed, scales, zp, _, sq = quant_nbits(w, block, algo)
+                      if os.environ.get("QUANT_NO_CACHE") != "1":
+                          _NB_CACHE[key] = (packed, scales, zp, sq)
+                  if min_sqnr is not None and sq < min_sqnr:
+                      return False, sq
+                  K, N = w.shape
+                  base = f"{wname}::{node.name}"
+                  self._add(base + "::Q4", packed); self._add(base + "::scales", scales); self._add(base + "::zp", zp)
+                  new = helper.make_node("MatMulNBits", [node.input[0], base + "::Q4", base + "::scales", base + "::zp"], [node.output[0]],
+                                         name=node.name + "::Q4", domain=MS, K=int(K), N=int(N), bits=4, block_size=int(block))
+                  self.replace[node.name] = [new]
+                  self._release(wname)
+                  self._count("int4", w.size, packed.nbytes + scales.nbytes + zp.nbytes)
+                  self.log.append((node.name, wname, "int4", sq))
+                  return True, sq
+
+              def fp16_weight(self, node, in_idx):
+                  wname = node.input[in_idx]
+                  w = self.src.array(wname)
+                  base = f"{wname}::{node.name}"
+                  self._add(base + "::f16", w.astype(np.float16))
+                  c = helper.make_node("Cast", [base + "::f16"], [base + "::f32"], name=base + "::Cast", to=F32)
+                  self.before.setdefault(node.name, []).append(c)
+                  node.input[in_idx] = base + "::f32"
+                  self._release(wname)
+                  self._count("fp16", w.size, w.size * 2)
+
+              def embedding_int8(self, node):
+                  """Gather(E[V,D], ids) -> row-wise INT8 table; dequantization happens on the gathered rows only."""
+                  wname = node.input[0]
+                  E = self.src.array(wname)
+                  V, D = E.shape
+                  amax = np.abs(E).max(axis=1)
+                  s = np.maximum(amax / 127.0, 1e-12).astype(np.float32)
+                  q = np.empty(E.shape, np.int8)
+                  for r0 in range(0, V, 32768):
+                      q[r0:r0 + 32768] = np.clip(np.round(E[r0:r0 + 32768] / s[r0:r0 + 32768, None]), -127, 127).astype(np.int8)
+                  base = f"{wname}::emb"
+                  self._add(base + "::q8", q); self._add(base + "::s", s)
+                  self._add(base + "::axes", np.array([-1], dtype=np.int64))
+                  ids = node.input[1]
+                  axis = next((a.i for a in node.attribute if a.name == "axis"), 0)
+                  nodes = [
+                      helper.make_node("Gather", [base + "::q8", ids], [base + "::rows"], name=base + "::G1", axis=axis),
+                      helper.make_node("Gather", [base + "::s", ids], [base + "::sc"], name=base + "::G2", axis=axis),
+                      helper.make_node("Cast", [base + "::rows"], [base + "::rowsf"], name=base + "::C", to=F32),
+                      helper.make_node("Unsqueeze", [base + "::sc", base + "::axes"], [base + "::scu"], name=base + "::U"),
+                      helper.make_node("Mul", [base + "::rowsf", base + "::scu"], [node.output[0]], name=base + "::M"),
+                  ]
+                  self.replace[node.name] = nodes
+                  self._release(wname)
+                  deq = q.astype(np.float32) * s[:, None] if V * D < 5_000_000 else None
+                  self._count("int8_embed", E.size, q.nbytes + s.nbytes)
+                  self.log.append((node.name, wname, "int8_embed", sqnr_db(E, deq) if deq is not None else 50.0))
+
+              def catch_all_int8(self, min_params=1_000_000):
+                  """Safety net: any large float weight still feeding a MatMul/Gemm/Conv is stored INT8 (per-channel), whatever the op pattern."""
+                  k = 0
+                  for n in list(self.m.graph.node):
+                      if n.name in self.replace or n.op_type not in ("MatMul", "Gemm", "Conv") or len(n.input) < 2:
+                          continue
+                      w = n.input[1]
+                      if not self.src.has(w) or w in self.removed_inits or self.src.dtype(w) not in (F32, F16):
+                          continue
+                      if int(np.prod(self.src.shape(w))) < min_params or len(self.src.shape(w)) < 2:
+                          continue
+                      self.int8_dq(n, 1, axis=w_axis(n)); k += 1
+                  return k
+
+              # -- assemble --
+              def finish(self):
+                  g = self.m.graph
+                  out_nodes = []
+                  for n in g.node:
+                      out_nodes.extend(self.before.get(n.name, []))
+                      out_nodes.extend(self.replace.get(n.name, [n]))
+                  # survivors: read every remaining initializer inline (small ones; big ones were replaced)
+                  keep = []
+                  referenced = set()
+                  for n in out_nodes:
+                      referenced |= _node_deps(n)
+                  referenced |= {o.name for o in g.output}
+                  for t in g.initializer:
+                      if t.name in self.removed_inits and t.name not in referenced:
+                          continue
+                      if t.name not in referenced:
+                          continue
+                      arr = self.src.array(t.name) if t.data_type == F16 else numpy_helper.to_array(t, self.src.dir)
+                      keep.append(numpy_helper.from_array(arr, t.name) if t.data_type != F16 else numpy_helper.from_array(arr.astype(np.float16), t.name))
+                  del g.node[:]; g.node.extend(out_nodes)
+                  del g.initializer[:]; g.initializer.extend(keep); g.initializer.extend(self.added_inits)
+                  produced = {o for n in out_nodes for o in n.output} | {i.name for i in g.input} | {t.name for t in g.initializer}
+                  vi = [v for v in g.value_info if v.name in produced]          # drop stale shape info of removed tensors (a known ORT load hazard)
+                  del g.value_info[:]; g.value_info.extend(vi)
+                  if any(n.domain == MS for n in out_nodes):
+                      ensure_opset(self.m, MS, 1)
+                  return self.m
+          PYEOF_QUANTLIB_0
+
+      - name: "Write quantization toolkit — quantlib.py (part 2/3)"
+        run: |
+          mkdir -p quant
+          cat >> quant/quantlib.py << 'PYEOF_QUANTLIB_1'
+
+              def summary(self):
+                  tot = sum(d["bytes"] for d in self.stats.values())
+                  return {k: {**v, "mb": round(v["bytes"] / 1e6, 1)} for k, v in self.stats.items()}, round(tot / 1e6, 1)
+
+
+          # ───────────────────────────── output packaging ─────────────────────────────
+          def finalize_single_file(model, path):
+              """IR cap for ORT 1.17, contrib opset import, single self-contained file below the protobuf limit."""
+              if default_opset(model) > 20:
+                  raise RuntimeError(f"opset {default_opset(model)} is newer than ORT 1.17 supports (<=20)")
+              model.ir_version = min(model.ir_version, 9)
+              size = model.ByteSize()
+              if size > MAX_PROTO:
+                  raise RuntimeError(f"model is {size/1e9:.2f} GB; single-file ONNX is limited to 2 GB (app copies no .data files)")
+              tmp = path + ".tmp"
+              onnx.save_model(model, tmp, save_as_external_data=False)
+              os.replace(tmp, path)
+              return os.path.getsize(path)
+
+
+          def model_nbytes(path):
+              s = os.path.getsize(path)
+              d = path + ".data"
+              return s + (os.path.getsize(d) if os.path.exists(d) else 0)
+
+
+          # ───────────────────────────── role classification ──────────────────────────
+          def _attr_i(n, name):
+              return next((a.i for a in n.attribute if a.name == name), 0)
+
+
+          def const_matmuls(model, src):
+              """MatMul / Gemm nodes whose weight (input[1]) is a constant float 2-D initializer.  ViT linears are usually exported as Gemm(transB=1)."""
+              out = []
+              for n in model.graph.node:
+                  if n.op_type in ("MatMul", "Gemm") and len(n.input) >= 2 and src.has(n.input[1]) and len(src.shape(n.input[1])) == 2 and src.dtype(n.input[1]) in (F32, F16):
+                      if n.op_type == "Gemm" and _attr_i(n, "transA"):
+                          continue
+                      out.append(n)
+              return out
+
+
+          def eff_shape(src, n):
+              """(K, N) of the linear map regardless of how the weight is stored."""
+              s = src.shape(n.input[1])
+              return (s[1], s[0]) if (n.op_type == "Gemm" and _attr_i(n, "transB")) else s
+
+
+          def w_axis(n):
+              """Output-channel axis of the weight tensor as stored (for per-channel INT8)."""
+              if n.op_type == "Gemm":
+                  return 0 if _attr_i(n, "transB") else 1
+              return 1 if n.op_type == "MatMul" else 0
+
+
+          def classify_lm(model, src, ta, va=None):
+              """Name-free role detection for the Qwen3-VL LM + vision tower, using the model dims written to the manifest.
+              (dynamo exports give anonymous node names, so shapes + graph order are the only reliable signals.)"""
+              D, I = ta["hidden"], ta["intermediate"]
+              QO, KV = ta["heads"] * ta["head_dim"], ta["kv_heads"] * ta["head_dim"]
+              vs = set()
+              if va:
+                  Vh, Vi, Vo, mg = va["hidden"], va["intermediate"], va["out_hidden"], va.get("merge", 2)
+                  M = Vh * mg * mg
+                  vs = {(Vh, 3 * Vh), (Vh, Vh), (Vh, Vi), (Vi, Vh), (M, M), (M, Vo)}
+              lm_shapes = {(I, D), (D, I), (D, KV), (D, QO)}
+              info, order = {}, []
+              for n in const_matmuls(model, src):
+                  K, N = eff_shape(src, n)
+                  if (K, N) in vs and (K, N) not in lm_shapes:
+                      role = "vision"
+                  elif (K, N) == (I, D): role = "down"
+                  elif (K, N) == (D, I): role = "gateup"
+                  elif (K, N) == (D, KV): role = "kv"
+                  elif (K, N) == (D, QO): role = "qo"
+                  else: role = "other"
+                  info[n.name] = dict(node=n, K=K, N=N, role=role, layer=None)
+                  order.append(n.name)
+              by_in = {}
+              for nm in order:
+                  by_in.setdefault(info[nm]["node"].input[0], []).append(nm)
+              for inp, grp in by_in.items():                    # q/k/v and gate/up share one input tensor; call order is q,k,v / gate,up
+                  kv = [g for g in grp if info[g]["role"] == "kv"]
+                  qo = [g for g in grp if info[g]["role"] == "qo"]
+                  gu = [g for g in grp if info[g]["role"] == "gateup"]
+                  if len(kv) == 2 and len(qo) >= 1:
+                      info[kv[0]]["role"], info[kv[1]]["role"] = "k", "v"
+                      for q in qo: info[q]["role"] = "q"
+                  if len(gu) == 2:
+                      info[gu[0]]["role"], info[gu[1]]["role"] = "gate", "up"
+              for nm in order:
+                  if info[nm]["role"] == "qo": info[nm]["role"] = "o"       # a qo-shaped matmul outside any q/k/v group is the output projection
+              cnt = {}
+              for nm in order:                                  # layer index = n-th occurrence of the role in graph order
+                  r = info[nm]["role"]
+                  info[nm]["layer"] = cnt.get(r, 0); cnt[r] = cnt.get(r, 0) + 1
+              n_layers = max(cnt.get("v", 0), cnt.get("down", 0)) or ta.get("layers", 0)
+              return info, n_layers
+
+
+          def use_more_bits(i, n):
+              """llama.cpp's Q4_K_M rule: which layers get the higher-precision type for attn_v / ffn_down."""
+              return i < n // 8 or i >= 7 * n // 8 or (i - n // 8) % 3 == 2
+
+
+          def lm_policy(role, layer, n_layers, recipe):
+              if recipe == "int8" or role == "other":           # unknown shapes are never gambled on: INT8
+                  return "int8"
+              if recipe == "arm":                               # Arm/llama.cpp Q4_K_M analogue
+                  lay = (layer // 2) if (role == "kv" and layer is not None) else layer          # unresolved k/v pair: two nodes per layer
+                  return "int8" if (role in ("v", "down", "kv") and lay is not None and use_more_bits(lay, n_layers)) else "int4"
+              if recipe == "protect":                           # every v/k/o/down kept at 8-bit (also when q/k/v grouping could not be resolved)
+                  return "int8" if role in ("v", "k", "o", "down", "kv", "qo", "other") else "int4"
+              raise ValueError(recipe)
+
+
+          def unet_role(node):
+              nm = node.name.lower()
+              if node.op_type == "Conv":
+                  return "stem" if "conv_in" in nm else "head" if "conv_out" in nm else "conv"
+              if any(k in nm for k in ("to_q", "to_k", "to_v")): return "qkv"
+              if "to_out" in nm: return "attn_out"
+              if "/ff/" in nm or "net.0" in nm or "net.2" in nm or "geglu" in nm: return "ffn"
+              if "proj_in" in nm or "proj_out" in nm: return "proj"
+              return "linear"
+
+
+          # ───────────────────────────── recipes → rewritten models ───────────────────
+          def apply_lm_recipe(rw, ta, va, recipe, min_sqnr=17.5, algo="hqq", bs=None):
+              """Q4_K_M-style mixed precision on an exported Qwen3-VL graph, in formats ORT 1.17 can execute.
+              bs = dict(cov=..., max_err=..., rho_max=...) additionally factorizes shareable pairs BEFORE quantization (Basis Sharing)."""
+              info, n_layers = classify_lm(rw.m, rw.src, ta, va)
+              cnt = {}
+              if bs:
+                  a, sk, saved = apply_basis_sharing(rw, info, n_layers, bs["cov"], bs["max_err"], bs["rho_max"], algo)
+                  cnt["basis-sharing groups"] = a; cnt["basis-sharing skipped"] = sk; cnt["basis-sharing params saved(M)"] = round(saved / 1e6, 1)
+              for nm, d in info.items():
+                  n, role = d["node"], d["role"]
+                  if d.get("done"):
+                      continue
+                  if role == "vision":
+                      rw.int8_dq(n, 1, axis=w_axis(n)); fmt = "vision-int8"
+                  else:
+                      want = lm_policy(role, d["layer"], n_layers, recipe)
+                      fmt = want if n.op_type == "MatMul" else "int8"
+                      if want == "int4" and n.op_type == "MatMul":
+                          ok, sq = rw.nbits4(n, algo, 32, min_sqnr=min_sqnr)        # Chameleon-style: format chosen by reconstruction error
+                          if not ok:
+                              rw.int8_dq(n, 1, axis=1); fmt = "int8(sqnr-upgrade)"
+                      else:
+                          rw.int8_dq(n, 1, axis=w_axis(n))
+                  cnt[fmt] = cnt.get(fmt, 0) + 1
+              for n in list(rw.m.graph.node):                   # patch-embed Conv3d etc. in the vision tower -> INT8
+                  if n.op_type == "Conv" and len(n.input) > 1 and rw.src.has(n.input[1]) and rw.src.array(n.input[1]).size > 100_000:
+                      rw.int8_dq(n, 1, axis=0); cnt["conv-int8"] = cnt.get("conv-int8", 0) + 1
+              vocab = ta.get("vocab", 50_000)
+              for n in list(rw.m.graph.node):
+                  if n.op_type == "Gather" and rw.src.has(n.input[0]) and len(rw.src.shape(n.input[0])) == 2 and rw.src.shape(n.input[0])[0] >= min(vocab, 50_000):
+                      rw.embedding_int8(n); cnt["embed-int8"] = cnt.get("embed-int8", 0) + 1
+              k = rw.catch_all_int8()
+              if k: cnt["catch-all-int8"] = k
+              return cnt, n_layers, info
+
+
+          def apply_unet_recipe(rw, recipe, min_sqnr=17.5):
+              """Chameleon-style weight formats for a diffusion UNet: Conv -> INT8 per-channel, Linear -> INT4(g32) when its SQNR allows, else INT8.
+              Paper keeps conv_in/conv_out and (in its evaluation) attention Q/K/V in FP16: reproduced by the 'paper' recipe."""
+              cnt = {}
+              for n in list(rw.m.graph.node):
+                  if n.op_type == "Conv" and len(n.input) > 1 and rw.src.has(n.input[1]):
+                      role = unet_role(n)
+                      if role in ("stem", "head"):
+                          rw.fp16_weight(n, 1); cnt["conv-fp16"] = cnt.get("conv-fp16", 0) + 1
+                      elif rw.src.array(n.input[1]).size >= 2048:
+                          rw.int8_dq(n, 1, axis=0); cnt["conv-int8"] = cnt.get("conv-int8", 0) + 1
+                  elif n.op_type == "MatMul" and len(n.input) == 2 and rw.src.has(n.input[1]) and len(rw.src.shape(n.input[1])) == 2:
+                      role = unet_role(n)
+                      K, N = rw.src.shape(n.input[1])
+                      if K * N < 4096:
+                          continue
+                      if recipe == "all8" or (recipe == "int8qkv" and role == "qkv"):
+                          rw.int8_dq(n, 1, axis=1); cnt["lin-int8"] = cnt.get("lin-int8", 0) + 1
+                      elif recipe == "paper" and role == "qkv":
+                          rw.fp16_weight(n, 1); cnt["lin-fp16"] = cnt.get("lin-fp16", 0) + 1
+                      else:
+                          ok, sq = rw.nbits4(n, "hqq", 32, min_sqnr=min_sqnr)
+                          if ok: cnt["lin-int4"] = cnt.get("lin-int4", 0) + 1
+                          else:
+                              rw.int8_dq(n, 1, axis=1); cnt["lin-int8(sqnr-upgrade)"] = cnt.get("lin-int8(sqnr-upgrade)", 0) + 1
+              k = rw.catch_all_int8(100_000)                    # e.g. Gemm time-embedding MLPs
+              if k: cnt["catch-all-int8"] = k
+              return cnt
+
+
+          def apply_vae_recipe(rw):
+              """PassionSR-flavoured VAE: weights only (INT8 per-channel + MSE-optimal boundary), first/last convs kept FP32."""
+              cnt = {}
+              convs = [n for n in rw.m.graph.node if n.op_type == "Conv" and len(n.input) > 1 and rw.src.has(n.input[1])]
+              first_last = {convs[0].name, convs[-1].name} if convs else set()
+              for n in convs:
+                  if n.name in first_last or "conv_in" in n.name.lower() or "conv_out" in n.name.lower():
+                      continue
+                  if rw.src.array(n.input[1]).size >= 2048:
+                      rw.int8_dq(n, 1, axis=0); cnt["conv-int8"] = cnt.get("conv-int8", 0) + 1
+              for n in [n for n in rw.m.graph.node if n.op_type == "MatMul" and len(n.input) == 2 and rw.src.has(n.input[1]) and len(rw.src.shape(n.input[1])) == 2]:
+                  rw.int8_dq(n, 1, axis=1); cnt["lin-int8"] = cnt.get("lin-int8", 0) + 1
+              k = rw.catch_all_int8(100_000)
+              if k: cnt["catch-all-int8"] = k
+              return cnt
+
+
+          # ───────────────────────────── evaluation (on-device-equivalent runtime) ────
+          RUNNER = r'''
+          import sys, numpy as np, onnxruntime as ort
+          model, inp, out, threads = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+          so = ort.SessionOptions(); so.intra_op_num_threads = threads
+          s = ort.InferenceSession(model, so, providers=["CPUExecutionProvider"])
+          names = [i.name for i in s.get_inputs()]
+          data = np.load(inp)
+          idxs = sorted({k.split("/")[0] for k in data.files}, key=lambda x: int(x))
+          res = {}
+          for i in idxs:
+              outs = s.run(None, {n: data[f"{i}/{n}"] for n in names})
+              for o, arr in zip(s.get_outputs(), outs):
+                  res[f"{i}/{o.name}"] = arr
+          np.savez(out, **res)
+          print("ort", ort.__version__, "ran", len(idxs), "samples")
+          '''
+
+
+          def run_model(py, model_path, inputs_npz, out_npz, threads=4, timeout=3 * 3600):
+              runner = os.path.join(os.path.dirname(os.path.abspath(out_npz)) or ".", "_ort_runner.py")
+              with open(runner, "w") as f:
+                  f.write(RUNNER)
+              r = subprocess.run([py, runner, model_path, inputs_npz, out_npz, str(threads)], capture_output=True, text=True, timeout=timeout)
+              if r.returncode != 0:
+                  return False, (r.stderr or r.stdout).strip().splitlines()[-1][:300] if (r.stderr or r.stdout).strip() else "unknown error"
+              return True, r.stdout.strip()
+
+
+          def tok_cos(ref, got, drop=0):
+              r = ref[:, drop:, :].reshape(-1, ref.shape[-1]).astype(np.float64)
+              g = got[:, drop:, :].reshape(-1, got.shape[-1]).astype(np.float64)
+              cs = (r * g).sum(-1) / (np.linalg.norm(r, axis=-1) * np.linalg.norm(g, axis=-1) + 1e-12)
+              rel = float(np.linalg.norm(r - g) / (np.linalg.norm(r) + 1e-12))
+              return dict(cos_mean=float(cs.mean()), cos_p5=float(np.percentile(cs, 5)), cos_min=float(cs.min()), rel_l2=rel)
+
+
+          def sample_cos(ref, got):
+              cs = [cos_sim(ref[k], got[k]) for k in ref.files if k in got.files]
+              rl = [float(np.linalg.norm(ref[k] - got[k]) / (np.linalg.norm(ref[k]) + 1e-12)) for k in ref.files if k in got.files]
+              return dict(cos_mean=float(np.mean(cs)), cos_min=float(np.min(cs)), rel_l2=float(np.mean(rl)), n=len(cs))
+
+
+          def psnr_images(ref, got, peak=2.0):
+              ps = []
+              for k in ref.files:
+                  mse = float(((ref[k].astype(np.float64) - got[k].astype(np.float64)) ** 2).mean())
+                  ps.append(99.0 if mse <= 0 else 10 * math.log10(peak * peak / mse))
+              return dict(psnr_mean=float(np.mean(ps)), psnr_min=float(np.min(ps)))
+
+
+          def run_ladder(name, rungs, build, evaluate, accept, out_path, work_dir):
+              """Try recipes from smallest to largest; ship the first that builds, loads on ORT 1.17 AND passes the fidelity gate.
+              If none passes, the safest candidate that still ran is shipped and flagged (never leave the APK without a model)."""
+              results, shipped, runnable = [], None, None
+              for tag, recipe in rungs:
+                  rec = dict(rung=tag, recipe=recipe)
+                  t0 = time.time()
+                  cand = os.path.join(work_dir, f"{name}__{''.join(c if c.isalnum() or c in '-_.' else '_' for c in tag)}.onnx")
+                  try:
+                      model, info = build(recipe)
+                      rec["bytes"] = finalize_single_file(model, cand)
+                      rec["info"] = info
+                      del model; gc.collect()
+                      ok, metrics = evaluate(cand)
+                      rec["metrics"] = metrics
+                      rec["ran_ok"] = bool(ok)
+                      rec["accepted"] = bool(ok and accept(metrics))
+                  except Exception as e:                       # noqa
+                      rec["error"] = f"{type(e).__name__}: {str(e)[:300]}"; rec["accepted"] = False; rec["ran_ok"] = False
+                  rec["seconds"] = round(time.time() - t0, 1)
+                  results.append(rec)
+                  log(f"[{name}] rung {tag}: " + (f"{rec.get('bytes', 0)/1e6:.0f} MB " if "bytes" in rec else "") + f"metrics={rec.get('metrics')} error={rec.get('error')} -> {'ACCEPTED' if rec['accepted'] else 'rejected'}")
+                  if rec["accepted"]:
+                      os.replace(cand, out_path); shipped = tag; break
+                  if rec.get("ran_ok") and os.path.exists(cand):
+                      if runnable and os.path.exists(runnable[1]): os.remove(runnable[1])
+                      runnable = (tag, cand)                   # keep the most conservative runnable candidate seen so far
+                  elif os.path.exists(cand):
+                      os.remove(cand)
+              if shipped is None and runnable is not None:
+                  os.replace(runnable[1], out_path); shipped = runnable[0] + " (GATE NOT PASSED - safest runnable shipped)"
+                  log(f"[{name}] WARNING: no rung passed the fidelity gate; shipping {shipped}")
+              elif runnable is not None and os.path.exists(runnable[1]):
+                  os.remove(runnable[1])
+              return shipped, results
+
+
+
+          # ───────────────────────────── LM weight sharing across the two encoders ────
+          def dedupe_models(paths, out_dir, shared_name="lm_shared.bin", min_bytes=1 << 20):
+              """Store every large initializer that is byte-identical across the given single-file models ONCE, in `shared_name`
+              (ONNX external-data, 4 KiB aligned).  Lossless.  The app must copy `shared_name` next to the models."""
+              from onnx.external_data_helper import set_external_data
+              shared_path = os.path.join(out_dir, shared_name)
+              index, before, after = {}, 0, 0
+              with open(shared_path, "wb") as f:
+                  for p in paths:
+                      before += os.path.getsize(p)
+                      m = onnx.load(p)
+                      for t in m.graph.initializer:
+                          raw = t.raw_data
+                          if len(raw) < min_bytes:
+                              continue
+                          key = hashlib.sha1(raw).digest() + len(raw).to_bytes(8, "little")
+                          if key not in index:
+                              f.write(b"\0" * ((-f.tell()) % 4096)); off = f.tell(); f.write(raw); index[key] = (off, len(raw))
+                          off, ln = index[key]
+                          set_external_data(t, location=shared_name, offset=off, length=ln)      # needs raw_data present ...
+                          t.ClearField("raw_data")                                               # ... then drop the inline copy
+                      onnx.save_model(m, p + ".tmp", save_as_external_data=False)
+                      os.replace(p + ".tmp", p)
+                      after += os.path.getsize(p)
+                      del m; gc.collect()
+              shared_sz = os.path.getsize(shared_path)
+              if not index:                                    # nothing big enough to share -> do not ship an empty asset
+                  os.remove(shared_path)
+                  return dict(shared_mb=0.0, saved_mb=0.0, tensors=0)
+              return dict(shared_mb=round(shared_sz / 1e6, 1), saved_mb=round((before - after - shared_sz) / 1e6, 1), tensors=len(index))
+          PYEOF_QUANTLIB_1
+
+      - name: "Write quantization toolkit — quantlib.py (part 3/3)"
+        run: |
+          mkdir -p quant
+          cat >> quant/quantlib.py << 'PYEOF_QUANTLIB_2'
+
+
+          # ───────────────────────────── Basis Sharing (Wang et al., ICLR 2025) ───────
+          # Faithful to the paper's recipe: SVD-LLM style activation whitening, a basis shared across consecutive layers for
+          # Wq/Wk/Wv/Wup/Wgate only (Wo and Wdown are NOT shared), per-layer coefficients.  ONNX layout y = x @ W, W:[K,N]:
+          #   W_l ~= A_l @ B   with A_l:[K,r] per layer and B:[r,N] shared.  Error is measured in ACTIVATION space (||X (W - A B)||).
+          BS_TYPES = ("q", "k", "v", "gate", "up")
+
+
+          def bs_chol(G, eps=1e-3):
+              G = np.asarray(G, np.float64); K = G.shape[0]
+              return np.linalg.cholesky(G + eps * (np.trace(G) / K) * np.eye(K))
+
+
+          def bs_group_plan(Ws, Ls, max_err, rho_max=0.9, step=32):
+              """Whitened stacked SVD.  Returns dict(ok, rank, ratio, err, ...) and (if ok) the factors needed to apply it."""
+              n, (K, N) = len(Ws), Ws[0].shape
+              M = np.concatenate([L.T @ W.astype(np.float64) for L, W in zip(Ls, Ws)], axis=0).astype(np.float32)      # [(n K), N]
+              U, S, Vt = np.linalg.svd(M, full_matrices=False)
+              S2 = S.astype(np.float64) ** 2
+              tail = np.append(np.cumsum(S2[::-1])[::-1], 0.0)                                                          # tail[j] = sum_{i>=j} S_i^2
+              ranks = np.arange(step, len(S) + 1, step)
+              errs = np.sqrt(tail[ranks] / tail[0])                                                                    # error if `rank` components kept
+              ratios = (n * K * ranks + ranks * N) / float(n * K * N)
+              good = np.where((errs <= max_err) & (ratios <= rho_max))[0]
+              best = int(np.argmin(errs + 10 * np.maximum(ratios - rho_max, 0)))
+              if len(good) == 0:
+                  return dict(ok=False, err_at_rho=float(errs[np.searchsorted(ratios, rho_max)] if np.any(ratios >= rho_max) else errs[-1]), best_err=float(errs[best]), best_ratio=float(ratios[best]))
+              j = int(good[np.argmin(ratios[good])]); r = int(ranks[j])
+              B = (S[:r, None] * Vt[:r]).astype(np.float32)
+              A = [np.linalg.solve(L.T, U[i * K:(i + 1) * K, :r].astype(np.float64)).astype(np.float32) for i, L in enumerate(Ls)]
+              return dict(ok=True, rank=r, ratio=float(ratios[j]), err=float(errs[j]), A=A, B=B)
+
+
+          def bs_groups(info, n_layers):
+              """Pairs of consecutive layers per shareable type -> list of (type, [info entries])."""
+              by = {}
+              for nm, d in info.items():
+                  if d["role"] in BS_TYPES and d.get("layer") is not None:
+                      by.setdefault((d["role"], d["layer"]), d)
+              out = []
+              for t in BS_TYPES:
+                  for l in range(0, n_layers - 1, 2):
+                      if (t, l) in by and (t, l + 1) in by and by[(t, l)]["K"] == by[(t, l + 1)]["K"] and by[(t, l)]["N"] == by[(t, l + 1)]["N"]:
+                          out.append((t, [by[(t, l)], by[(t, l + 1)]]))
+              return out
+
+
+          def bs_cov_for(d, cov, role_layer_input):
+              key = ("attn" if d["role"] in ("q", "k", "v") else "mlp", d["layer"])
+              return cov.get(key)
+
+
+          def bs_probe(rw, info, n_layers, cov, max_err, rho_max, n_probe=3):
+              """Cheap feasibility test on a few mid-network groups: is a >=(1-rho_max) saving available within the error budget?"""
+              groups = [g for g in bs_groups(info, n_layers)]
+              mid = [g for g in groups if g[1][0]["layer"] in (n_layers // 2 - (n_layers // 2) % 2,)] or groups[:n_probe]
+              picks = ([g for g in mid if g[0] == "gate"][:1] + [g for g in mid if g[0] == "q"][:1] + [g for g in mid if g[0] == "k"][:1]) or mid[:n_probe]
+              rep = []
+              for t, ds in picks:
+                  Gs = [bs_cov_for(d, cov, None) for d in ds]
+                  if any(g is None for g in Gs):
+                      continue
+                  Ws = [rw.src.array(d["node"].input[1]) for d in ds]
+                  plan = bs_group_plan(Ws, [bs_chol(G) for G in Gs], max_err, rho_max)
+                  rep.append(dict(type=t, layers=[d["layer"] for d in ds], ok=plan["ok"], ratio=plan.get("ratio", plan.get("best_ratio")), err=plan.get("err", plan.get("best_err"))))
+              return (any(r["ok"] for r in rep)), rep
+
+
+          def apply_basis_sharing(rw, info, n_layers, cov, max_err, rho_max, algo="hqq"):
+              """Replace shareable pairs by (A_l, shared B) 4-bit factor pairs.  Returns (applied_groups, skipped_groups, saved_params)."""
+              applied = skipped = saved = 0
+              for t, ds in bs_groups(info, n_layers):
+                  Gs = [bs_cov_for(d, cov, None) for d in ds]
+                  if any(g is None for g in Gs):
+                      skipped += 1; continue
+                  Ws = [rw.src.array(d["node"].input[1]) for d in ds]
+                  plan = bs_group_plan(Ws, [bs_chol(G) for G in Gs], max_err, rho_max)
+                  if not plan["ok"]:
+                      skipped += 1; continue
+                  rw.bs_pair([d["node"] for d in ds], plan["A"], plan["B"], algo)
+                  for d in ds: d["done"] = True
+                  K, N = Ws[0].shape; applied += 1; saved += len(ds) * K * N - (len(ds) * K * plan["rank"] + plan["rank"] * N)
+                  log(f"  basis-sharing {t} layers {[d['layer'] for d in ds]}: rank {plan['rank']} ratio {plan['ratio']:.3f} act-err {plan['err']:.3f}")
+              return applied, skipped, saved
+
+
+          def _rewriter_bs_pair(self, nodes, As, B, algo="hqq"):
+              r, N = B.shape
+              pB, sB, zB, _, sqB = quant_nbits(B, 32, algo)
+              base = f"{nodes[0].name}::bsB"
+              self._add(base + "::Q4", pB); self._add(base + "::scales", sB); self._add(base + "::zp", zB)
+              self._count("int4_bs", B.size, pB.nbytes + sB.nbytes + zB.nbytes)
+              for node, A in zip(nodes, As):
+                  K = A.shape[0]
+                  pA, sA, zA, _, sqA = quant_nbits(A, 32, algo)
+                  b = f"{node.name}::bsA"
+                  self._add(b + "::Q4", pA); self._add(b + "::scales", sA); self._add(b + "::zp", zA)
+                  mid = f"{node.output[0]}::bs_mid"
+                  n1 = helper.make_node("MatMulNBits", [node.input[0], b + "::Q4", b + "::scales", b + "::zp"], [mid], name=node.name + "::BS_A", domain=MS, K=int(K), N=int(r), bits=4, block_size=32)
+                  n2 = helper.make_node("MatMulNBits", [mid, base + "::Q4", base + "::scales", base + "::zp"], [node.output[0]], name=node.name + "::BS_B", domain=MS, K=int(r), N=int(N), bits=4, block_size=32)
+                  self.replace[node.name] = [n1, n2]
+                  self._release(node.input[1])
+                  self._count("int4_bs", A.size, pA.nbytes + sA.nbytes + zA.nbytes)
+                  self.log.append((node.name, node.input[1], "int4_bs", min(sqA, sqB)))
+
+
+          Rewriter.bs_pair = _rewriter_bs_pair
+
+
+          def residual_report(model, top=4):
+              """What is still FP32/FP16 in the final graph (a big residual means some op pattern was not covered)."""
+              items = []
+              for t in model.graph.initializer:
+                  if t.data_type in (F32, F16):
+                      n = int(np.prod(t.dims)) if len(t.dims) else 1
+                      items.append((n * (4 if t.data_type == F32 else 2), t.name))
+              items.sort(reverse=True)
+              return dict(residual_float_mb=round(sum(b for b, _ in items) / 1e6, 1), largest=[(nm[:70], round(b / 1e6, 1)) for b, nm in items[:top]])
+          PYEOF_QUANTLIB_2
+          python3 -m py_compile quant/quantlib.py && echo 'quant/quantlib.py: 837 lines written, compiles OK'
+
+      - name: "Write quantization toolkit — quant_pipeline.py (part 1/2)"
+        run: |
+          mkdir -p quant
+          cat > quant/quant_pipeline.py << 'PYEOF_QUANTPIPELINE_0'
+          #!/usr/bin/env python3
+          """quant_pipeline.py <prep|vae|unet|gen|edit|pack>  --  see the workflow for how each stage is used."""
+          import os, sys, json, math, time, shutil, gc
+          import numpy as np
+          sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+          import quantlib as ql
+          import onnx
+          from onnx import TensorProto as T
+
+          DL = os.environ.get("DL_DIR", "dreamlite_onnx")
+          EV, WK, OUT = (os.path.join(DL, d) for d in ("eval", "work", "out"))
+          for _d in (EV, WK, OUT):
+              os.makedirs(_d, exist_ok=True)
+          CI_PY = sys.executable                                                     # ORT 1.18.0 (build-side)
+          DEV_PY = os.environ.get("ORT117_PY") or os.path.expanduser("~/ort117/bin/python")   # ORT 1.17.0 == onnxruntime-android in the app
+          TEST = os.environ.get("QUANT_TEST") == "1"
+          THREADS = int(os.environ.get("QUANT_THREADS", "4"))
+          SRC = dict(vae_dec=f"{DL}/vae_decoder.onnx", vae_enc=f"{DL}/vae_encoder.onnx", unet=f"{DL}/unet.onnx",
+                     gen=f"{DL}/text_encoder_fp16.onnx", edit=f"{DL}/text_encoder_edit_fp16.onnx")        # FP32 weights, legacy file names
+          FINAL = dict(vae_dec="vae_decoder.onnx", vae_enc="vae_encoder.onnx", unet="unet.onnx", gen="text_encoder.onnx", edit="text_encoder_edit.onnx")
+          REPORT = os.path.join(DL, "quant_report.json")
+          log = ql.log
+
+
+          def ef(k, d): return float(os.environ.get(k, d))
+          def load_report(): return json.load(open(REPORT)) if os.path.exists(REPORT) else {}
+          def save_report(r): json.dump(r, open(REPORT, "w"), indent=2, default=str)
+          def have(p): return os.path.exists(p)
+
+
+          def io_info(path):
+              m = onnx.load(path, load_external_data=False)
+              inits = {t.name for t in m.graph.initializer}
+              dims = lambda v: [d.dim_value if d.HasField("dim_value") and d.dim_value > 0 else None for d in v.type.tensor_type.shape.dim]
+              return {i.name: (i.type.tensor_type.elem_type, dims(i)) for i in m.graph.input if i.name not in inits}
+
+
+          def synthetic_npz(path, out_npz, seed=0, n=2):
+              rng = np.random.default_rng(seed); feeds = {}
+              for i in range(n):
+                  for name, (et, dims) in io_info(path).items():
+                      shp = [d if d else (1 if k == 0 else 12) for k, d in enumerate(dims)]
+                      if et == T.INT64: a = np.ones(shp, np.int64) if "mask" in name else rng.integers(0, 100, shp).astype(np.int64)
+                      else: a = rng.standard_normal(shp).astype(np.float32)
+                      feeds[f"{i}/{name}"] = a
+              np.savez(out_npz, **feeds)
+
+
+          # ───────────────────────────── evaluation data (REAL data, not random noise) ──
+          BUILTIN = ["a red fox standing in fresh snow at sunrise, detailed fur", "a bowl of ramen with a soft egg, steam rising, wooden table",
+                     "an old lighthouse on a rocky cliff during a storm, dramatic clouds", "a cyclist riding along a coastal road at golden hour",
+                     "a vintage typewriter on a desk next to a cup of coffee and a handwritten letter", "two children building a sandcastle on a sunny beach",
+                     "a busy night market with colorful lanterns and people eating street food", "a snowy mountain village with smoke rising from wooden chimneys",
+                     "a close-up portrait of an elderly fisherman with a weathered face and a woolen hat", "a modern glass building reflecting the sunset sky",
+                     "a green parrot perched on a branch of a flowering tree", "a small boat on a calm lake surrounded by misty pine forests",
+                     "a street musician playing the violin in front of an old stone church", "a plate of fresh fruit with strawberries, kiwi and orange slices",
+                     "a futuristic city skyline with flying vehicles at dusk", "a golden retriever puppy running through a field of tall grass",
+                     "a cozy reading nook with a large window, a blanket and a stack of books", "a desert caravan of camels crossing dunes under a starry sky",
+                     "a chef flipping vegetables in a hot wok with flames", "an astronaut floating above the earth with the sun rising behind",
+                     "a rainy city street with neon signs reflected in puddles", "a farmer holding a basket of freshly harvested tomatoes",
+                     "a hot air balloon festival over rolling green hills", "a watercolor painting of a quiet harbor with sailboats"]
+
+
+          def synth_image(i, size=128):
+              from PIL import Image, ImageDraw
+              rng = np.random.default_rng(100 + i)
+              y, x = np.mgrid[0:size, 0:size] / size
+              base = np.stack([0.5 + 0.4 * np.sin(3 * x + i), 0.5 + 0.4 * np.cos(2 * y + i), 0.3 + 0.5 * x * y], -1)
+              img = Image.fromarray((np.clip(base + rng.normal(0, 0.03, base.shape), 0, 1) * 255).astype(np.uint8))
+              d = ImageDraw.Draw(img)
+              for _ in range(5):
+                  x0, y0 = rng.integers(0, size - 20, 2); d.rectangle([x0, y0, x0 + rng.integers(10, 40), y0 + rng.integers(10, 40)], fill=tuple(int(v) for v in rng.integers(0, 255, 3)))
+              return img
+
+
+          def fetch_flickr(n):
+              from datasets import load_dataset
+              ds = load_dataset("lmms-lab/flickr30k", split="test", streaming=True).shuffle(seed=11, buffer_size=256).take(n)
+              out = []
+              for s in ds:
+                  cap = s["caption"][0] if isinstance(s["caption"], list) else s["caption"]
+                  out.append((cap, s["image"].convert("RGB")))
+              return out
+
+
+          def patchify(img, grid, patch, temporal, merge, mean, std):
+              a = np.asarray(img.convert("RGB").resize((grid * patch, grid * patch)), np.float32) / 255.0
+              a = ((a - np.array(mean, np.float32)) / np.array(std, np.float32)).transpose(2, 0, 1)
+              f = np.stack([a] * temporal, 0).reshape(1, temporal, 3, grid // merge, merge, patch, grid // merge, merge, patch)
+              return np.ascontiguousarray(f.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8).reshape(grid * grid, 3 * temporal * patch * patch)).astype(np.float32)
+
+
+          def capture_cov(P, prompts_ids, drop):
+              """Activation second moments X^T X at every q-input ('attn') and gate-input ('mlp') of the FP32 LM, over calibration prompts
+              (needed to whiten Basis Sharing exactly like SVD-LLM).  Runs the FP32 graph in-process; weights stay memory-mapped."""
+              import onnxruntime as ort
+              ta = P["text_arch"]
+              m = onnx.load(SRC["gen"], load_external_data=False); ql.prune_unreachable(m)
+              info, nl = ql.classify_lm(m, ql.Source(m, DL), ta, None)
+              taps = {}
+              for nm, d in info.items():
+                  if d["role"] == "q": taps[("attn", d["layer"])] = d["node"].input[0]
+                  if d["role"] == "gate": taps[("mlp", d["layer"])] = d["node"].input[0]
+              for name in sorted(set(taps.values())):
+                  m.graph.output.append(onnx.helper.make_tensor_value_info(name, T.FLOAT, None))
+              tmp = f"{DL}/text_encoder_fp16_cov.onnx"; onnx.save(m, tmp)                  # graph only; external-data reference stays valid (same dir)
+              so = ort.SessionOptions(); so.intra_op_num_threads = THREADS
+              sess = ort.InferenceSession(tmp, so, providers=["CPUExecutionProvider"]); outs = [o.name for o in sess.get_outputs()]
+              G = {}
+              for ids in prompts_ids:
+                  res = dict(zip(outs, sess.run(None, {"input_ids": ids, "attention_mask": np.ones_like(ids)})))
+                  for key, name in taps.items():
+                      x = res[name][0, drop:, :].astype(np.float32)
+                      G[key] = G.get(key, 0) + x.T @ x
+              np.savez(f"{EV}/cov.npz", **{f"{k[0]}_{k[1]}": v for k, v in G.items()})
+              os.remove(tmp); return len(taps), sum(len(i[0]) for i in prompts_ids)
+
+
+          def encode_images(images, ph, pw, tag):
+              """FP32 VAE-encode real images at an explicit pixel size -> latents (the encoder has dynamic H/W)."""
+              feeds = {}
+              for i, im in enumerate(images):
+                  a = np.asarray(im.convert("RGB").resize((pw, ph)), np.float32) / 127.5 - 1.0
+                  feeds[f"{i}/pixel_values"] = a.transpose(2, 0, 1)[None].copy()
+              np.savez(f"{EV}/{tag}_in.npz", **feeds)
+              ok, msg = ql.run_model(CI_PY, SRC["vae_enc"], f"{EV}/{tag}_in.npz", f"{EV}/{tag}_ref.npz", THREADS)
+              log(f"prep {tag} (FP32 encode at {ph}x{pw}px):", ok, msg)
+              if not ok:
+                  raise RuntimeError(msg)
+              E = np.load(f"{EV}/{tag}_ref.npz")
+              return [E[f"{i}/latent_sample"] for i in range(len(images))]
+
+
+          def cmd_prep():
+              P = ql.read_manifest(DL)["params"]; rng = np.random.default_rng(2026); status = {}
+              n_img = int(os.environ.get("QUANT_EVAL_IMAGES", "2")); n_txt = int(os.environ.get("QUANT_EVAL_PROMPTS", "12"))
+              pairs = []
+              use_bs = os.environ.get("ENABLE_BS", "1") == "1"; n_cov = int(os.environ.get("QUANT_COV_PROMPTS", "128")) if use_bs else 0
+              if not TEST:
+                  try:
+                      pairs = fetch_flickr(max(n_txt, n_img) + n_cov); log(f"prep: {len(pairs)} real flickr30k samples")
+                  except Exception as e:
+                      log(f"prep: flickr30k unavailable ({type(e).__name__}); using built-in prompts + synthetic images")
+              allp = [c for c, _ in pairs] or BUILTIN
+              prompts = allp[:n_txt]; cov_prompts = allp[n_txt:n_txt + n_cov] if n_cov else []        # calibration prompts are disjoint from eval prompts
+              images = [im for _, im in pairs][:n_img] or [synth_image(i) for i in range(n_img)]
+              tk = None
+              if not TEST:
+                  from tokenizers import Tokenizer
+                  tk = Tokenizer.from_file(f"{DL}/tokenizer.json")
+              drop = int(P.get("prompt_template_drop_idx", 34)); tmpl = P.get("prompt_template", "{}")
+              ta, va = P.get("text_arch", {}), P.get("vision_arch", {})
+              gen_embeds = []
+              # ---- generate-mode encoder ----
+              try:
+                  if not have(SRC["gen"]): raise FileNotFoundError(SRC["gen"])
+                  feeds = {}
+                  for i, pr in enumerate(prompts):
+                      ids = np.array([tk.encode(tmpl.format(pr)).ids[:160]], np.int64) if tk else rng.integers(0, ta.get("vocab", 500), (1, drop + 12 + i % 5)).astype(np.int64)
+                      feeds[f"{i}/input_ids"], feeds[f"{i}/attention_mask"] = ids, np.ones_like(ids)
+                  np.savez(f"{EV}/gen_in.npz", **feeds)
+                  ok, msg = ql.run_model(CI_PY, SRC["gen"], f"{EV}/gen_in.npz", f"{EV}/gen_ref.npz", THREADS); log("prep gen ref:", ok, msg)
+                  status["gen"] = ok
+                  if ok:
+                      R = np.load(f"{EV}/gen_ref.npz"); gen_embeds = [R[f"{i}/last_hidden_state"][:, drop:, :] for i in range(len(prompts))]
+              except Exception as e:
+                  log("prep gen FAILED:", repr(e)); status["gen"] = False
+              if use_bs and status.get("gen") and cov_prompts:
+                  try:
+                      cid = [np.array([tk.encode(tmpl.format(pr)).ids[:160]], np.int64) if tk else rng.integers(0, ta.get("vocab", 500), (1, drop + 12 + i % 5)).astype(np.int64) for i, pr in enumerate(cov_prompts)]
+                      ntap, ntok = capture_cov(P, cid, drop); log(f"prep: activation covariances for {ntap} taps over {len(cid)} prompts ({ntok} tokens)")
+                  except Exception as e:
+                      log("prep covariance capture FAILED (Basis Sharing will be skipped):", repr(e))
+              # ---- edit-mode encoder ----
+              try:
+                  if not have(SRC["edit"]): raise FileNotFoundError(SRC["edit"])
+                  info = io_info(SRC["edit"]); pshape = info["pixel_values"][1]; feeds = {}
+                  for i, im in enumerate(images):
+                      cap = (pairs[i][0] if pairs else prompts[i])
+                      if tk:
+                          g = int(P.get("vision_grid_h", 36)); nim = (g // 2) * (g // 2)
+                          ids = [tk.token_to_id("<|vision_start|>")] + [tk.token_to_id("<|image_pad|>")] * nim + [tk.token_to_id("<|vision_end|>")] + tk.encode(cap).ids[:60]
+                          pix = patchify(im, g, int(P.get("vision_patch_size", 16)), int(P.get("vision_temporal_patch_size", 2)), int(P.get("vision_merge_size", 2)),
+                                         P.get("vision_image_mean", [0.5] * 3), P.get("vision_image_std", [0.5] * 3))
+                      else:
+                          ids = list(rng.integers(0, ta.get("vocab", 500), 20)); pix = rng.standard_normal(pshape).astype(np.float32)
+                      feeds[f"{i}/input_ids"] = np.array([ids], np.int64); feeds[f"{i}/attention_mask"] = np.ones((1, len(ids)), np.int64); feeds[f"{i}/pixel_values"] = pix.astype(np.float32)
+                  np.savez(f"{EV}/edit_in.npz", **feeds)
+                  ok, msg = ql.run_model(CI_PY, SRC["edit"], f"{EV}/edit_in.npz", f"{EV}/edit_ref.npz", THREADS); log("prep edit ref:", ok, msg); status["edit"] = ok
+              except Exception as e:
+                  log("prep edit FAILED:", repr(e)); status["edit"] = False
+              # ---- VAE (encode real images -> latents -> decode).  Decoder size is read from the model: it may be fixed (64x64) or dynamic ----
+              lat = []; px = 4 if TEST else 8
+              try:
+                  dec_in = io_info(SRC["vae_dec"])["latent_sample"][1]; H = dec_in[2] or 128; Wd = dec_in[3] or H
+                  lat = encode_images(images, H * px, Wd * px, "vae_enc"); status["vae_enc"] = True
+                  np.savez(f"{EV}/vae_dec_in.npz", **{f"{i}/latent_sample": l.astype(np.float32) for i, l in enumerate(lat)})
+                  ok, msg = ql.run_model(CI_PY, SRC["vae_dec"], f"{EV}/vae_dec_in.npz", f"{EV}/vae_dec_ref.npz", THREADS); log("prep vae dec ref:", ok, msg); status["vae_dec"] = ok
+              except Exception as e:
+                  log("prep vae FAILED:", repr(e)); status.setdefault("vae_enc", False); status.setdefault("vae_dec", False)
+              # ---- UNet along the denoising path: real latents + real text embeddings, several noise levels ----
+              try:
+                  if not have(SRC["unet"]): raise FileNotFoundError(SRC["unet"])
+                  info = io_info(SRC["unet"]); sh = info["sample"][1]; Hs, Ws = sh[2], sh[3]; cad = info["encoder_hidden_states"][1][-1]
+                  sc, shf = float(P.get("vae_scaling_factor", 0.13025)), float(P.get("vae_shift_factor", 0.0)); feeds, k = {}, 0
+                  lat_u = lat
+                  if Ws == 2 * Hs and not (lat and lat[0].shape[-2] == Hs):       # the UNet works at its own latent size: encode real images at that size
+                      try: lat_u = encode_images(images, Hs * px, Hs * px, "vae_enc_unet")
+                      except Exception as e: log("prep: could not build real UNet latents:", repr(e)); lat_u = []
+                  for ii in range(n_img):
+                      if lat_u and lat_u[ii].shape[-2] == Hs and Ws == 2 * Hs: x0 = (lat_u[ii] - shf) * sc; cond = (lat_u[(ii + 1) % len(lat_u)] - shf) * sc if ii % 2 else np.zeros_like(x0)
+                      else: x0 = rng.standard_normal((1, 4, Hs, Ws // 2 if Ws == 2 * Hs else Ws)).astype(np.float32) * 0.8; cond = np.zeros_like(x0)
+                      for sg in (0.9, 0.6, 0.3, 0.1):
+                          eps = rng.standard_normal(x0.shape).astype(np.float32)
+                          xt = (1 - sg) * x0 + sg * eps
+                          sample = np.concatenate([xt, cond], -1).astype(np.float32) if Ws == 2 * Hs and xt.shape[-1] * 2 == Ws else xt
+                          emb = gen_embeds[k % len(gen_embeds)] if gen_embeds and gen_embeds[0].shape[-1] == cad else rng.standard_normal((1, 16, cad)).astype(np.float32)
+                          feeds[f"{k}/sample"] = sample; feeds[f"{k}/timestep"] = np.array([sg * 1000.0], np.float32); feeds[f"{k}/encoder_hidden_states"] = emb.astype(np.float32)
+                          feeds[f"{k}/encoder_attention_mask"] = np.ones((1, emb.shape[1]), np.int64); feeds[f"{k}/time_ids"] = np.array([[1024.0, 1024.0]], np.float32); k += 1
+                  np.savez(f"{EV}/unet_in.npz", **feeds)
+                  ok, msg = ql.run_model(CI_PY, SRC["unet"], f"{EV}/unet_in.npz", f"{EV}/unet_ref.npz", THREADS); log("prep unet ref:", ok, msg); status["unet"] = ok
+              except Exception as e:
+                  log("prep unet FAILED:", repr(e)); status["unet"] = False
+              json.dump(status, open(f"{EV}/status.json", "w")); log("prep status:", status)
+
+
+          # ───────────────────────────── gates & evaluation ───────────────────────────
+          def tok_metrics(R, G, drop):
+              rs, gs = [], []
+              for k in R.files:
+                  rs.append(R[k][:, drop:, :].reshape(-1, R[k].shape[-1])); gs.append(G[k][:, drop:, :].reshape(-1, G[k].shape[-1]))
+              return ql.tok_cos(np.concatenate(rs)[None], np.concatenate(gs)[None], 0)
+
+
+          def make_eval(key, kind, drop=0):
+              inp, ref = f"{EV}/{key}_in.npz", f"{EV}/{key}_ref.npz"
+              has_ref = have(inp) and have(ref)
+          PYEOF_QUANTPIPELINE_0
+
+      - name: "Write quantization toolkit — quant_pipeline.py (part 2/2)"
+        run: |
+          mkdir -p quant
+          cat >> quant/quant_pipeline.py << 'PYEOF_QUANTPIPELINE_1'
+
+              def ev(path):
+                  if not has_ref:                                   # no reference -> can only prove the model loads+runs on the device runtime
+                      feed = f"{WK}/{key}_syn.npz"; synthetic_npz(path, feed)
+                      ok, msg = ql.run_model(DEV_PY, path, feed, f"{WK}/{key}_syn_out.npz", THREADS)
+                      return ok, {"no_reference": True, "run": msg}
+                  outp = f"{WK}/{key}_out.npz"
+                  ok, msg = ql.run_model(DEV_PY, path, inp, outp, THREADS)
+                  if not ok:
+                      return False, {"run_error": msg}
+                  R, G = np.load(ref), np.load(outp)
+                  mt = tok_metrics(R, G, drop) if kind == "tok" else ql.psnr_images(R, G) if kind == "psnr" else ql.sample_cos(R, G)
+                  return True, {k: (round(v, 5) if isinstance(v, float) else v) for k, v in mt.items()}
+              return ev
+
+
+          def gate_vae_dec(m): return (not m.get("no_reference")) and m["psnr_mean"] >= ef("GATE_VAE_PSNR", 38)
+          def gate_vae_enc(m): return (not m.get("no_reference")) and m["cos_mean"] >= ef("GATE_VAE_ENC_COS", 0.999)
+          def gate_unet(m): return (not m.get("no_reference")) and m["cos_mean"] >= ef("GATE_UNET_COS", 0.990) and m["cos_min"] >= ef("GATE_UNET_COS_MIN", 0.97)
+          def gate_enc(m): return (not m.get("no_reference")) and m["cos_mean"] >= ef("GATE_ENC_COS", 0.985) and m["cos_p5"] >= ef("GATE_ENC_P5", 0.96) and m["rel_l2"] <= ef("GATE_ENC_REL", 0.20)
+
+
+          def copy_model(src, dst):
+              shutil.copyfile(src, dst)
+              if have(src + ".data"): shutil.copyfile(src + ".data", dst + ".data")
+
+
+          def record(rep, key, shipped, results, src):
+              out = f"{OUT}/{FINAL[key]}"
+              rep[key] = dict(shipped=shipped, src_mb=round(ql.model_nbytes(src) / 1e6, 1) if have(src) else None,
+                              out_mb=round(os.path.getsize(out) / 1e6, 1) if have(out) else None, results=results)
+              save_report(rep)
+
+
+          # ───────────────────────────── components ───────────────────────────────────
+          def cmd_vae():
+              rep = load_report()
+              for key, kind, gate in (("vae_dec", "psnr", gate_vae_dec), ("vae_enc", "cos", gate_vae_enc)):
+                  src = SRC[key]
+                  if not have(src): log(f"{key}: source missing, skipped"); continue
+                  out = f"{OUT}/{FINAL[key]}"
+
+                  def build(recipe, src=src):
+                      rw = ql.Rewriter(onnx.load(src, load_external_data=False), DL); cnt = ql.apply_vae_recipe(rw)
+                      m = rw.finish(); return m, {"counts": cnt, "stats": rw.summary()[0], "residual": ql.residual_report(m)}
+                  shipped, results = ql.run_ladder(key, [("V1-int8-weight-only", "vae")], build, make_eval(key, kind), gate, out, WK)
+                  if shipped is None or "GATE" in shipped:
+                      copy_model(src, out); shipped = "FP32 original (fallback: quantized VAE did not pass the fidelity gate)"
+                  record(rep, key, shipped, results, src)
+
+
+          def cmd_unet():
+              rep = load_report(); src = SRC["unet"]; out = f"{OUT}/{FINAL['unet']}"
+              if not have(src): log("unet: source missing"); return
+              rungs = [("U1-conv8+lin4", "int4"), ("U2-qkv8", "int8qkv"), ("U3-qkv-fp16(paper)", "paper"), ("U4-all8", "all8")]
+
+              def build(recipe):
+                  rw = ql.Rewriter(onnx.load(src, load_external_data=False), DL); cnt = ql.apply_unet_recipe(rw, recipe, ef("MIN_SQNR_INT4", 17.5))
+                  m = rw.finish(); return m, {"counts": cnt, "stats": rw.summary()[0], "residual": ql.residual_report(m)}
+              shipped, results = ql.run_ladder("unet", rungs, build, make_eval("unet", "cos"), gate_unet, out, WK)
+              if shipped is None or "GATE" in shipped:
+                  fb = f"{DL}/unet_fp16.onnx"
+                  copy_model(fb if have(fb) else src, out); shipped = ("FP16 original" if have(fb) else "FP32 original") + " (fallback: no quantized rung passed the gate)"
+              record(rep, "unet", shipped, results, src)
+
+
+          def infer_text_arch(model, src):
+              """Fallback when the manifest has no text_arch: Qwen-style LM -> embedding [vocab,hidden]; matmuls with K==hidden give N in {kv, q/o, intermediate}."""
+              tabs = [src.shape(n.input[0]) for n in model.graph.node if n.op_type == "Gather" and src.has(n.input[0]) and len(src.shape(n.input[0])) == 2]
+              if not tabs: return {}
+              vocab, hidden = max(tabs)
+              Ns = sorted({src.shape(n.input[1])[1] for n in ql.const_matmuls(model, src) if src.shape(n.input[1])[0] == hidden})
+              if len(Ns) < 3: return {}
+              return dict(hidden=hidden, intermediate=Ns[-1], heads=Ns[-2], kv_heads=Ns[0], head_dim=1, layers=0, vocab=vocab)
+
+
+          def cmd_enc(which):
+              rep = load_report(); src = SRC[which]; out = f"{OUT}/{FINAL[which]}"
+              if not have(src): log(f"{which}: source missing -> mode unavailable"); return
+              P = ql.read_manifest(DL)["params"]; ta = P.get("text_arch") or {}; va = (P.get("vision_arch") or None) if which == "edit" else None
+              if not ta.get("hidden"):
+                  m_ = onnx.load(src, load_external_data=False); ql.prune_unreachable(m_); ta = infer_text_arch(m_, ql.Source(m_, DL)); del m_
+                  log(f"[{which}] manifest has no text_arch; inferred {ta}")
+                  if not ta: log(f"[{which}] WARNING: architecture unknown -> every matmul is treated as sensitive (INT8)"); ta = dict(hidden=0, intermediate=0, heads=0, kv_heads=0, head_dim=1, layers=0, vocab=50_000)
+              drop = int(P.get("prompt_template_drop_idx", 34)) if which == "gen" else 0
+              rungs = [("Q1-arm-q4km-like", ("arm", False)), ("Q2-protect-v/k/o/down", ("protect", False)), ("Q3-all-int8", ("int8", False))]
+              bs_cfg = None
+              cov_path = f"{EV}/cov.npz"
+              if os.environ.get("ENABLE_BS", "1") == "1" and have(cov_path):
+                  try:
+                      z = np.load(cov_path); cov = {(k.rsplit("_", 1)[0], int(k.rsplit("_", 1)[1])): z[k] for k in z.files}
+                      m0 = onnx.load(src, load_external_data=False); ql.prune_unreachable(m0); rw0 = ql.Rewriter(m0, DL)
+                      info0, nl0 = ql.classify_lm(rw0.m, rw0.src, ta, va)
+                      cfg = dict(cov=cov, max_err=ef("BS_MAX_ERR", 0.08), rho_max=ef("BS_RHO_MAX", 0.90))
+                      ok, probe = ql.bs_probe(rw0, info0, nl0, cov, cfg["max_err"], cfg["rho_max"])
+                      rep[f"{which}_basis_sharing_probe"] = dict(feasible=ok, groups=probe, max_act_err=cfg["max_err"], rho_max=cfg["rho_max"])
+                      log(f"[{which}] Basis Sharing probe: feasible={ok} {probe}")
+                      if ok: bs_cfg = cfg; rungs.insert(0, ("Q0-arm+basis-sharing", ("arm", True)))
+                      del rw0, m0; gc.collect()
+                  except Exception as e:
+                      log(f"[{which}] Basis Sharing probe failed ({type(e).__name__}: {e}); skipping")
+
+              def build(recipe):
+                  rec, use_bs = recipe
+                  m = onnx.load(src, load_external_data=False); removed, dropped = ql.prune_unreachable(m)
+                  rw = ql.Rewriter(m, DL); cnt, nl, _ = ql.apply_lm_recipe(rw, ta, va, rec, min_sqnr=ef("MIN_SQNR_INT4", 17.5), bs=bs_cfg if use_bs else None)
+                  mm = rw.finish(); return mm, {"counts": cnt, "layers": nl, "pruned_dead_nodes": removed, "stats": rw.summary()[0], "residual": ql.residual_report(mm)}
+              shipped, results = ql.run_ladder(which, rungs, build, make_eval(which, "tok", drop), gate_enc, out, WK)
+              record(rep, which, shipped, results, src)
+
+
+          def cmd_pack():
+              rep = load_report(); P = ql.read_manifest(DL)
+              for key in ("vae_dec", "vae_enc", "unet"):                       # components with a proven original: always ship *something*
+                  out = f"{OUT}/{FINAL[key]}"
+                  if not have(out) and have(SRC[key]):
+                      fb = f"{DL}/unet_fp16.onnx" if key == "unet" and have(f"{DL}/unet_fp16.onnx") else SRC[key]
+                      copy_model(fb, out); rep.setdefault(key, {})["shipped"] = "original (quantization stage did not produce a file)"
+              for fn in os.listdir(OUT):                                       # nothing in OUT may need an external-data sidecar (the app copies none)
+                  if fn.endswith(".onnx.data"): log(f"WARNING: {fn} would be ignored by the app"); 
+              shared = None
+              if os.environ.get("SHARE_LM", "0") == "1":
+                  a, b = f"{OUT}/{FINAL['gen']}", f"{OUT}/{FINAL['edit']}"
+                  if have(a) and have(b):
+                      shared = ql.dedupe_models([a, b], OUT, "lm_shared.bin", min_bytes=int(os.environ.get("DEDUPE_MIN_BYTES", 1 << 20))); log("LM weight sharing:", shared)
+                      if not shared["tensors"]: shared = None
+              files = sorted(f for f in os.listdir(OUT) if f.endswith(".onnx"))
+              for f in ("tokenizer.json",):
+                  if have(f"{DL}/{f}"): shutil.copyfile(f"{DL}/{f}", f"{OUT}/{f}")
+              P.update(version="6.0", components=files, has_vae_decoder="vae_decoder.onnx" in files, has_vae_encoder="vae_encoder.onnx" in files, has_unet="unet.onnx" in files,
+                       has_encoder="text_encoder.onnx" in files, has_edit_encoder="text_encoder_edit.onnx" in files, has_tokenizer=have(f"{OUT}/tokenizer.json"),
+                       quantization={k: {"shipped": v.get("shipped"), "mb": v.get("out_mb")} for k, v in rep.items() if isinstance(v, dict)}, shared_lm_weights=bool(shared))
+              ql.write_manifest(OUT, P)
+              rep["_shared_lm"] = shared; save_report(rep)
+              # ---- human-readable summary ----
+              rows, tot = [], 0
+              for fn in sorted(os.listdir(OUT)):
+                  p = f"{OUT}/{fn}"; sz = os.path.getsize(p); tot += sz
+                  if sz > 1_000_000: rows.append((fn, sz / 1e6))
+              L = ["## Quantization report", "", "| component | shipped | MB | metrics of the shipped rung |", "|---|---|---:|---|"]
+              for k in ("unet", "vae_dec", "vae_enc", "gen", "edit"):
+                  v = rep.get(k)
+                  if not v: L.append(f"| {k} | _not produced_ | - | - |"); continue
+                  mt = next((r.get("metrics") for r in v.get("results", []) if r.get("accepted") or str(v.get("shipped", "")).startswith(r.get("rung", "~"))), None)
+                  L.append(f"| {k} | {v.get('shipped')} | {v.get('out_mb')} | `{mt}` |")
+              L += ["", "| file | MB |", "|---|---:|"] + [f"| {n} | {m:.0f} |" for n, m in rows]
+              gguf = os.path.join(os.environ.get("ASSETS_DIR", "lfm25/app/src/main/assets"), "model.gguf"); g_mb = os.path.getsize(gguf) / 1e6 if have(gguf) else 219
+              L += ["", f"**ONNX total: {tot/1e6:.0f} MB; with LFM GGUF ({g_mb:.0f} MB): {(tot/1e6)+g_mb:.0f} MB**  (plan target: 2800-2900 MB)"]
+              if shared: L.append(f"LM weights shared between both encoders: saved {shared['saved_mb']:.0f} MB")
+              txt = "\n".join(L); print(txt)
+              if os.environ.get("GITHUB_STEP_SUMMARY"): open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(txt + "\n")
+              if not have(f"{OUT}/{FINAL['gen']}") and os.environ.get("ALLOW_MISSING_GEN") != "1":
+                  print("::error::the generate-mode text encoder was not produced (see the quantization report above)"); sys.exit(1)
+
+
+          if __name__ == "__main__":
+              cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+              {"prep": cmd_prep, "vae": cmd_vae, "unet": cmd_unet, "gen": lambda: cmd_enc("gen"), "edit": lambda: cmd_enc("edit"), "pack": cmd_pack}[cmd]()
+          PYEOF_QUANTPIPELINE_1
+          python3 -m py_compile quant/quant_pipeline.py && echo 'quant/quant_pipeline.py: 395 lines written, compiles OK'
+
       - name: Generate mipmap icon sizes
         run: |
           python3 << 'PYEOF'
@@ -207,6 +1511,7 @@ jobs:
       # get bundled, and ImageGenerator.kt's existing per-session loading guard
       # (see FIX comments there) degrades to the online fallback rather than
       # crashing if text_encoder.onnx ends up missing.
+
       - name: Export ONNX models for offline image generation
         run: |
           python3 << 'PYEOF'
@@ -287,14 +1592,29 @@ jobs:
           manifest["params"]["latent_channels"] = int(vae.config.latent_channels)
           try:
               dummy = torch.randn(1, 4, 64, 64)
-              torch.onnx.export(
-                  vae.decoder,
-                  dummy,
-                  "dreamlite_onnx/vae_decoder.onnx",
-                  input_names=["latent_sample"],
-                  output_names=["image"],
-                  dynamic_axes={"latent_sample": {0: "batch"}},
-                  opset_version=14)  # opset 14 avoids scaled_dot_product issues
+              # FIX: the app feeds the decoder 128x128 latents (LATENT_DIM) but only the batch axis was dynamic, which bakes a
+              # fixed 64x64 input signature into the graph (ORT rejects any other size).  Height/width are dynamic now; the old
+              # signature is only used as a fallback should the dynamic trace ever fail.
+              _dec_variants = (
+                  {"latent_sample": {0: "batch", 2: "height", 3: "width"}, "image": {0: "batch", 2: "out_height", 3: "out_width"}},
+                  {"latent_sample": {0: "batch"}},
+              )
+              for _vi, _axes in enumerate(_dec_variants):
+                  try:
+                      torch.onnx.export(
+                          vae.decoder,
+                          dummy,
+                          "dreamlite_onnx/vae_decoder.onnx",
+                          input_names=["latent_sample"],
+                          output_names=["image"],
+                          dynamic_axes=_axes,
+                          opset_version=14)  # opset 14 avoids scaled_dot_product issues
+                      print(f"  VAE decoder exported with dynamic-axes variant {_vi} ({'dynamic H/W' if _vi == 0 else 'fixed 64x64 fallback'})")
+                      break
+                  except Exception as _e:
+                      print(f"  VAE decoder export variant {_vi} failed: {_e}")
+                      if _vi == len(_dec_variants) - 1:
+                          raise
               print(f"✓ VAE decoder: {os.path.getsize('dreamlite_onnx/vae_decoder.onnx')//1024//1024} MB")
           except Exception as e:
               print(f"✗ VAE decoder export failed: {e}")
@@ -461,7 +1781,8 @@ jobs:
               print(f"  {f}: {size//1024//1024} MB" if size > 1024*1024 else f"  {f}: {size} B")
           PYEOF
      
-      - name: Convert UNet to fp16 (halve size, keep I/O fp32)
+
+      - name: Convert UNet to fp16 (safe fallback copy only — the FP32 UNet stays as the quantization source)
         run: |
           python3 << 'PYEOF'
           import os, onnx
@@ -475,8 +1796,9 @@ jobs:
               model = onnx.load(src, load_external_data=False)
               model_fp16 = float16.convert_float_to_float16(
                   model, keep_io_types=True, disable_shape_infer=True)
-              onnx.save(model_fp16, src)
-              size_after = os.path.getsize(src) // 1024 // 1024
+              dst = "dreamlite_onnx/unet_fp16.onnx"
+              onnx.save(model_fp16, dst)
+              size_after = os.path.getsize(dst) // 1024 // 1024
               print(f"✓ UNet fp16: {size_before} MB → {size_after} MB")
           PYEOF
           
@@ -495,6 +1817,7 @@ jobs:
       # whole model in memory twice — original and quantized copy; streaming
       # from disk avoids that, and is close to mandatory for a model near
       # ONNX's 2GB protobuf message limit either way).
+
       - name: Export text encoder + quantize (isolated process)
         run: |
           python3 << 'PYEOF'
@@ -524,6 +1847,16 @@ jobs:
           qwen.eval()
           hidden = qwen.config.text_config.hidden_size
           print(f"  Qwen3-VL-2B text hidden_size: {hidden}")
+          try:   # architecture dims for the quantizer (dynamo exports have anonymous node names -> roles are found by shape)
+              _tc, _vc = qwen.config.text_config, qwen.config.vision_config
+              text_arch = dict(hidden=int(_tc.hidden_size), intermediate=int(_tc.intermediate_size), heads=int(_tc.num_attention_heads),
+                               kv_heads=int(_tc.num_key_value_heads), head_dim=int(getattr(_tc, "head_dim", _tc.hidden_size // _tc.num_attention_heads)),
+                               layers=int(_tc.num_hidden_layers), vocab=int(_tc.vocab_size))
+              vision_arch = dict(hidden=int(_vc.hidden_size), intermediate=int(_vc.intermediate_size), out_hidden=int(_vc.out_hidden_size),
+                                 depth=int(_vc.depth), merge=int(_vc.spatial_merge_size))
+              print("  architecture:", text_arch, vision_arch)
+          except Exception as _e:
+              print("  architecture capture failed (quantizer will infer it):", _e); text_arch, vision_arch = {}, {}
 
           class TextEncoderWrapper(torch.nn.Module):
               def __init__(self, model):
@@ -572,7 +1905,7 @@ jobs:
           print(f"  fp16 export: {os.path.getsize('dreamlite_onnx/text_encoder_fp16.onnx')//1024//1024} MB")
 
           
-          merge_manifest({"text_hidden_size": int(hidden)})
+          merge_manifest({"text_hidden_size": int(hidden), "text_arch": text_arch, "vision_arch": vision_arch})
 
           # ── [2/2] Edit-mode (vision) encoder ────────────────────────────────
           # HONEST FLAG (unchanged from the previous pass — this step's fix is
@@ -608,6 +1941,7 @@ jobs:
           PYEOF
       
       
+
       - name: Export edit-mode text encoder (isolated, non-fatal)
         continue-on-error: true
         run: |
@@ -876,48 +2210,7 @@ jobs:
           
           PYEOF
           
-      - name: Prepare SmoothQuant calibration data (128 samples)
-        run: |
-          python3 << 'PYEOF'
-          import os, torch
-          from datasets import load_dataset
-          from transformers import AutoProcessor
-          from PIL import Image
-          import io
 
-          os.makedirs("calibration_data", exist_ok=True)
-          processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
-
-          # Load 128 samples from Flickr30k
-          ds = load_dataset("lmms-lab/flickr30k", split="test", streaming=True)
-          ds = ds.shuffle(seed=42).take(128)
-
-          for i, sample in enumerate(ds):
-              image = sample["image"]  # PIL Image
-              caption = sample["caption"][0] if isinstance(sample["caption"], list) else sample["caption"]
-
-              # Build Qwen3-VL chat template
-              messages = [{
-                  "role": "user",
-                  "content": [
-                      {"type": "image"},
-                      {"type": "text", "text": caption},
-                  ],
-              }]
-              text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-              inputs = processor(text=[text], images=[image], return_tensors="pt", padding=True)
-
-              # Save tensors
-              torch.save({
-                  "input_ids": inputs["input_ids"].squeeze(0),
-                  "attention_mask": inputs["attention_mask"].squeeze(0),
-                  "pixel_values": inputs["pixel_values"].squeeze(0),
-                  "image_grid_thw": inputs["image_grid_thw"].squeeze(0),
-              }, f"calibration_data/sample_{i:03d}.pt")
-
-          print(f"✓ Saved {len(os.listdir('calibration_data'))} calibration samples")
-          PYEOF
-     
       - name: Free disk before swap expansion
         run: |
           pip cache purge || true
@@ -926,16 +2219,19 @@ jobs:
           echo "=== Disk after cleanup ==="
           df -h /
   
+
       - name: Prepare writable Android SDK directory
         run: |
           sudo mkdir -p /usr/local/lib/android
           sudo chown -R $USER:$USER /usr/local/lib/android
           
+
       - name: Install Android SDK command-line tools
         uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools'
         
+
       - name: Expand swap to 24GB before SmoothQuant
         run: |
           sudo swapoff /mnt/swapfile || true
@@ -949,49 +2245,7 @@ jobs:
           echo "=== Disk ==="
           df -h /
           
-      - name: Quantize edit-mode text encoder
-        continue-on-error: true
-        run: |
-          python3 << 'PYEOF'
-          import os, gc, json
-          import onnx
-          from onnxruntime.quantization import quantize_dynamic, QuantType
 
-          src = "dreamlite_onnx/text_encoder_edit_fp16.onnx"
-          dst = "dreamlite_onnx/text_encoder_edit.onnx"
-
-          if not os.path.exists(src):
-              print(f"⚠ {src} not found — skipping (edit mode unavailable)")
-          else:
-              # ── Strip stale value_info before quantization ──
-              model = onnx.load(src, load_external_data=False)
-              del model.graph.value_info[:]
-              onnx.save(model, src)
-              print(f"  stripped value_info from {src}")
-
-              print(f"quantizing {src} ({os.path.getsize(src)//1024//1024} MB)...")
-              quantize_dynamic(
-                  model_input=str(src),
-                  model_output=str(dst),
-                  op_types_to_quantize=["MatMul", "Gather"],
-                  per_channel=False,
-                  weight_type=QuantType.QInt8,
-                  use_external_data_format=True,
-              )
-              gc.collect()
-              os.remove(src)
-              print(f"✓ {dst}: {os.path.getsize(dst)//1024//1024} MB")
-
-          with open("dreamlite_onnx/manifest.json") as f:
-              m = json.load(f)
-          files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
-          m["components"] = files
-          m["has_edit_encoder"] = "text_encoder_edit.onnx" in files
-          with open("dreamlite_onnx/manifest.json", "w") as f:
-              json.dump(m, f, indent=2)
-          PYEOF
-          
-      
       - name: Free disk again before SmoothQuant
         run: |
           pip cache purge || true
@@ -1019,231 +2273,99 @@ jobs:
           cat /proc/sys/vm/swappiness
           cat /proc/self/oom_score_adj
           
-      - name: Quantize generate-mode text encoder with SmoothQuant
+
+      - name: "Quantization 1/6 — real evaluation data + FP32 references (flickr30k, 128 calibration prompts for Basis Sharing)"
+        timeout-minutes: 90
         env:
-          TMPDIR: /home/runner/work/_temp  # ← Redirect temp files to real disk
+          TMPDIR: /home/runner/work/_temp
         run: |
-          python3 << 'PYEOF'
-          import os, gc, json
-          import torch
-          from onnx_neural_compressor.quantization import quantize, config
-          from onnx_neural_compressor import data_reader
-          from onnxruntime.quantization import CalibrationMethod
-          
-          src = "dreamlite_onnx/text_encoder_fp16.onnx"
-          dst = "dreamlite_onnx/text_encoder.onnx"
+          python3 quant/quant_pipeline.py prep
 
-          if not os.path.exists(src):
-              print(f"⚠ {src} not found — skipping")
-              raise SystemExit(0)
+      - name: "Quantization 2/6 — VAE (PassionSR-style weights, gated on PSNR)"
+        continue-on-error: true
+        timeout-minutes: 30
+        env:
+          TMPDIR: /home/runner/work/_temp
+        run: |
+          python3 quant/quant_pipeline.py vae
 
-          # Calibration reader: v1.0 requires get_next() and rewind()
-          class CalibReader(data_reader.CalibrationDataReader):
-              def __init__(self, folder):
-                  self.files = sorted(
-                      os.path.join(folder, f)
-                      for f in os.listdir(folder)
-                      if f.endswith(".pt")
-                  )
-                  self.iter_next = iter(self.files)
+      - name: "Quantization 3/6 — UNet (Chameleon-style weight formats, gated on denoiser cosine)"
+        continue-on-error: true
+        timeout-minutes: 90
+        env:
+          TMPDIR: /home/runner/work/_temp
+        run: |
+          python3 quant/quant_pipeline.py unet
 
-              def get_next(self):
-                  file = next(self.iter_next, None)
-                  if file is None:
-                      return None
-                  d = torch.load(file)
-                  return {
-                      "input_ids": d["input_ids"].numpy().reshape(1, -1),
-                      "attention_mask": d["attention_mask"].numpy().reshape(1, -1),
-                  }
+      - name: "Quantization 4/6 — generate-mode text encoder (Q4_K_M-class mix + Basis Sharing probe, gated)"
+        timeout-minutes: 100
+        env:
+          TMPDIR: /home/runner/work/_temp
+        run: |
+          python3 quant/quant_pipeline.py gen
 
-              def rewind(self):
-                  self.iter_next = iter(self.files)
+      - name: "Quantization 5/6 — edit-mode text encoder (vision tower INT8, non-fatal)"
+        continue-on-error: true
+        timeout-minutes: 100
+        env:
+          TMPDIR: /home/runner/work/_temp
+        run: |
+          python3 quant/quant_pipeline.py edit
 
-          print("[1/1] SmoothQuant + static INT8 quantization (alpha=0.5)...")
+      - name: "Decide LM-weight sharing (needs the app's asset copy-list to be patchable)"
+        run: |
+          F=lfm25/app/src/main/java/com/thunder/agi/imaging/ImageGenerator.kt
+          if [ "$SHARE_LM" = "1" ]; then
+            if grep -qF '"text_encoder_edit.onnx", "unet.onnx", "tokenizer.json")' "$F"; then
+              echo "copy-list found -> LM weights will be shared between both encoders"
+            else
+              echo "::warning::app copy-list not found in $F -> NOT sharing (models stay self-contained single files)"
+              echo "SHARE_LM=0" >> "$GITHUB_ENV"
+            fi
+          else
+            echo "LM-weight sharing disabled (workflow input share_lm_weights=false): each encoder is a self-contained file"
+          fi
 
-          qconfig = config.StaticQuantConfig(
-              calibration_data_reader=CalibReader("calibration_data"),
-              calibrate_method=CalibrationMethod.Percentile,
-              op_types_to_quantize=["MatMul", "Gather"],
-              per_channel=True,
-              calibration_sampling_size=128,
-              extra_options={
-                  "SmoothQuant": True,
-                  "SmoothQuantAlpha": 0.5,
-                  "SmoothQuantOpTypes": ["MatMul"],
-                  "SmoothQuantFolding": True,
-                  "calib_dump_batch": 8,
-                  "TmpDir": "dreamlite_onnx",
-                  "layer_wise_quant": True,
-              },
-          )
+      - name: "Quantization 6/6 — pack, verify on the device-equivalent runtime, report sizes"
+        timeout-minutes: 40
+        env:
+          TMPDIR: /home/runner/work/_temp
+        run: |
+          python3 quant/quant_pipeline.py pack
 
-          
-          # ── Patch ONNXModel.topological_sort for duplicate node names ──
-          # The fork fixed calibration + augment, but folding creates duplicate
-          # node names, and the stock topological_sort asserts on that.
-          # This version renames every node uniquely first, then sorts.
-          from onnx_neural_compressor.onnx_model import ONNXModel
+      - name: "Remove FP32 sources and work files (free disk for the APK build)"
+        run: |
+          rm -rf dreamlite_onnx/work dreamlite_onnx/eval
+          rm -f dreamlite_onnx/text_encoder_fp16.onnx dreamlite_onnx/text_encoder_fp16.onnx.data dreamlite_onnx/text_encoder_edit_fp16.onnx dreamlite_onnx/text_encoder_edit_fp16.onnx.data
+          rm -f dreamlite_onnx/unet.onnx dreamlite_onnx/unet_fp16.onnx dreamlite_onnx/vae_decoder.onnx dreamlite_onnx/vae_decoder.onnx.data dreamlite_onnx/vae_encoder.onnx dreamlite_onnx/vae_encoder.onnx.data
+          echo "=== shipped models (dreamlite_onnx/out) ==="; ls -lh dreamlite_onnx/out; df -h / | tail -1
 
-          def _safe_topological_sort(self, enable_subgraph=False):
-              # Step 1: give every node a unique name
-              _seen = set()
-              for _node in self.model.graph.node:
-                  _name = _node.name
-                  if not _name or _name in _seen:
-                      _base = _name or _node.op_type
-                      _i = 0
-                      while f"{_base}_{_i}" in _seen:
-                          _i += 1
-                      _node.name = f"{_base}_{_i}"
-                  _seen.add(_node.name)
+      - name: "Patch the app's asset copy-list for the shared LM-weights file (CI-only, not committed)"
+        if: env.SHARE_LM == '1'
+        run: |
+          if [ -f dreamlite_onnx/out/lm_shared.bin ]; then
+            F=lfm25/app/src/main/java/com/thunder/agi/imaging/ImageGenerator.kt
+            sed -i 's/"text_encoder_edit.onnx", "unet.onnx", "tokenizer.json")/"text_encoder_edit.onnx", "unet.onnx", "tokenizer.json", "lm_shared.bin")/' "$F"
+            grep -n 'lm_shared.bin' "$F" || { echo "::error::copy-list patch did not apply"; exit 1; }
+          else
+            echo "no lm_shared.bin produced -> app source untouched"
+          fi
 
-              # Step 2: Kahn's algorithm on the renamed graph
-              _output_to_node = {}
-              for _node in self.model.graph.node:
-                  for _out in _node.output:
-                      if _out:
-                          _output_to_node[_out] = _node
-
-              _in_degree = {n.name: 0 for n in self.model.graph.node}
-              _children  = {n.name: [] for n in self.model.graph.node}
-              _by_name   = {n.name: n for n in self.model.graph.node}
-
-              for _node in self.model.graph.node:
-                  for _inp in _node.input:
-                      if _inp in _output_to_node:
-                          _parent = _output_to_node[_inp]
-                          if _parent.name in _children:
-                              _children[_parent.name].append(_node.name)
-                              _in_degree[_node.name] += 1
-
-              _queue = [n for n, d in _in_degree.items() if d == 0]
-              _sorted = []
-              while _queue:
-                  _name = _queue.pop(0)
-                  _sorted.append(_name)
-                  for _child in _children[_name]:
-                      _in_degree[_child] -= 1
-                      if _in_degree[_child] == 0:
-                          _queue.append(_child)
-
-              # Append any nodes that were not reached (cycles / disconnected parts)
-              _remaining = [n.name for n in self.model.graph.node
-                            if n.name not in _sorted]
-              _sorted.extend(_remaining)
-
-              _sorted_nodes = [_by_name[n] for n in _sorted]
-              del self.model.graph.node[:]
-              self.model.graph.node.extend(_sorted_nodes)
-
-          ONNXModel.topological_sort = _safe_topological_sort
-          print("  patched ONNXModel.topological_sort: unique names + cycle-safe sort")
-          
-          # ── Release SmoothQuant phase memory before static calibration ──
-          import gc
-          gc.collect()
-          gc.collect()  # second pass for reference cycles
-          print("  released Python objects before static calibration")
-
-          # ── Fix missing external .data in smoother temp dir ──
-          import shutil
-          from onnx_neural_compressor.algorithms.smoother import core as smoother_core
-
-          _orig_smoother_init = smoother_core.Smoother.__init__
-
-          def _patched_smoother_init(self, model, *args, **kwargs):
-              # Figure out the directory the smoother will load the model from
-              model_path = None
-              if isinstance(model, str):
-                  model_path = model
-              elif hasattr(model, "_model_path"):
-                  model_path = model._model_path
-
-              if model_path:
-                  model_dir = os.path.dirname(os.path.abspath(model_path))
-                  src_data = os.path.abspath("dreamlite_onnx/text_encoder_fp16.onnx.data")
-                  dst_data = os.path.join(model_dir, "text_encoder_fp16.onnx.data")
-                  if os.path.exists(src_data) and not os.path.exists(dst_data):
-                      shutil.copy2(src_data, dst_data)
-                      print(f"  copied external .data to {dst_data}")
-
-              return _orig_smoother_init(self, model, *args, **kwargs)
-
-          smoother_core.Smoother.__init__ = _patched_smoother_init
-          print("  patched Smoother.__init__ to copy external .data into temp dir")
-          
-          quantize(src, dst, qconfig)
-          gc.collect()
-
-          
-          # ── Neural-compressor writes external data as <name>.onnx_data
-          #    (underscore), but ONNX Runtime / Kotlin expects
-          #    <name>.onnx.data (dot). Re-save so the companion file uses
-          #    the correct extension.
-          import onnx
-          legacy_data = dst + "_data"
-          if os.path.exists(legacy_data):
-              print(f"  re-saving external data: {legacy_data} → {dst}.data")
-              m = onnx.load(dst, load_external_data=False)
-              onnx.external_data_helper.load_external_data_for_model(
-                  m, os.path.dirname(os.path.abspath(dst)))
-              onnx.save_model(
-                  m, dst,
-                  save_as_external_data=True,
-                  all_tensors_to_one_file=True,
-                  location=os.path.basename(dst) + ".data",
-                  size_threshold=1024,
-                  convert_attribute=False,
-              )
-              os.remove(legacy_data)
-              print(f"✓ re-saved with {dst}.data")
-          else:
-              print(f"  no legacy _data file found; checking {dst}.data")
-              
-          print(f"✓ {dst}: {os.path.getsize(dst)//1024//1024} MB")
-          if os.path.exists(dst + ".data"):
-              print(f"✓ {dst}.data: {os.path.getsize(dst + '.data')//1024//1024} MB")
-
-          # Update manifest
-          with open("dreamlite_onnx/manifest.json") as f:
-              m = json.load(f)
-          files = [f for f in os.listdir("dreamlite_onnx") if f.endswith(".onnx")]
-          m["components"] = files
-          m["has_encoder"] = "text_encoder.onnx" in files
-          with open("dreamlite_onnx/manifest.json", "w") as f:
-              json.dump(m, f, indent=2)
-          PYEOF
-
-      
-      # FIX: Copy ONNX files DIRECTLY into assets — no zip container.
-      # Previously the workflow ran "zip -r assets/dreamlite.zip ." which caused
-      # double-compression: aapt re-compressed the zip inside the APK even with
-      # noCompress set, because noCompress only covers the outer file extension.
-      # Storing files flat in assets/ with noCompress += "onnx" means aapt stores
-      # each .onnx uncompressed, and ImageGenerator.kt copies them to filesDir
-      # on first launch for ONNX Runtime to read as normal files.
-      - name: Copy ONNX files directly into assets (no zip container)
+      - name: "Copy ONNX files directly into assets (single-file models, no zip container)"
         run: |
           mkdir -p lfm25/app/src/main/assets
+          if ls dreamlite_onnx/out/*.onnx.data >/dev/null 2>&1; then echo "::error::an .onnx.data sidecar is present; the app never copies those"; exit 1; fi
           exported=0
-           for f in dreamlite_onnx/vae_decoder.onnx dreamlite_onnx/vae_decoder.onnx.data \
-           dreamlite_onnx/vae_encoder.onnx dreamlite_onnx/vae_encoder.onnx.data \
-           dreamlite_onnx/text_encoder.onnx dreamlite_onnx/text_encoder.onnx.data \
-           dreamlite_onnx/text_encoder_edit.onnx dreamlite_onnx/text_encoder_edit.onnx.data \
-           dreamlite_onnx/unet.onnx dreamlite_onnx/tokenizer.json \
-           dreamlite_onnx/manifest.json; do
-            if [ -f "$f" ]; then
-              cp "$f" lfm25/app/src/main/assets/
-              echo "✓ Copied $(basename $f): $(du -sh $f | cut -f1)"
-              exported=$((exported+1))
-            else
-              echo "⚠ $(basename $f) not available"
-            fi
+          for f in dreamlite_onnx/out/*; do
+            [ -f "$f" ] || continue
+            cp "$f" lfm25/app/src/main/assets/
+            echo "✓ Copied $(basename $f): $(du -sh $f | cut -f1)"
+            exported=$((exported+1))
           done
-          echo "Total ONNX components copied: $exported"
-          echo "Assets:"
-          ls -lh lfm25/app/src/main/assets/
+          echo "Total components copied: $exported"
+          echo "Assets:"; ls -lh lfm25/app/src/main/assets/
+          TOTAL=$(du -sb lfm25/app/src/main/assets | cut -f1); echo "assets total bytes: $TOTAL"
+          if [ "$TOTAL" -gt 3900000000 ]; then echo "::error::assets exceed ~3.9 GB; an APK cannot exceed 4 GiB"; exit 1; fi
 
       - name: Install NDK and CMake
         run: |
@@ -1284,14 +2406,20 @@ jobs:
             APK="lfm25/app/build/outputs/apk/debug/app-debug.apk"
             echo "Using debug APK"
           fi
-          cp "$APK" "output/ThunderAGI-الرعد-v3.apk"
-          echo "APK size: $(du -sh output/ThunderAGI-الرعد-v3.apk)"
+          cp "$APK" "output/ThunderAGI-الرعد-v6-quantized.apk"
+          echo "APK size: $(du -sh output/ThunderAGI-الرعد-v6-quantized.apk)"
+
+      - name: "Check APK size limits"
+        run: |
+          SZ=$(stat -c%s "output/ThunderAGI-الرعد-v6-quantized.apk"); echo "APK bytes: $SZ ($((SZ/1024/1024)) MB)"
+          if [ "$SZ" -gt 4294967295 ]; then echo "::error::APK exceeds the 4 GiB zip limit"; exit 1; fi
+          if [ "$SZ" -gt 3900000000 ]; then echo "::warning::APK is within ~5% of the 4 GiB limit"; fi
 
       - name: Verify APK
         run: |
           python3 -c "
           import zipfile, sys
-          with zipfile.ZipFile('output/ThunderAGI-الرعد-v3.apk') as z:
+          with zipfile.ZipFile('output/ThunderAGI-الرعد-v6-quantized.apk') as z:
               files = z.namelist()
               onnx = [f for f in files if f.endswith('.onnx')]
               print(f'APK OK: {len(files)} files, ONNX={onnx}')
@@ -1302,14 +2430,14 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ThunderAGI-الرعد-v3
-          path: output/ThunderAGI-الرعد-v3.apk
+          name: ThunderAGI-الرعد-v6-quantized
+          path: output/ThunderAGI-الرعد-v6-quantized.apk
           retention-days: 30
 
       - name: Show install instructions
         run: |
           echo "=== HOW TO INSTALL ==="
           echo "1. Download the artifact ZIP from GitHub Actions"
-          echo "2. EXTRACT the ZIP — you will find ThunderAGI-الرعد-v3.apk inside"
+          echo "2. EXTRACT the ZIP — you will find ThunderAGI-الرعد-v6-quantized.apk inside"
           echo "3. Copy the .apk to your phone and tap to install"
-          echo "APK size: $(du -sh output/ThunderAGI-الرعد-v3.apk)"
+          echo "APK size: $(du -sh output/ThunderAGI-الرعد-v6-quantized.apk)"
