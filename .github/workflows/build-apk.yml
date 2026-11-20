@@ -1651,9 +1651,9 @@ jobs:
                       else:                                                    # prove the shared-weight models still behave identically on the device runtime
                           good = True
                           for key, fn, kind, dr in (("gen", FINAL["gen"], "tok", int(P["params"].get("prompt_template_drop_idx", 34))), ("edit", FINAL["edit"], "tok", 0)):
-                              before = next((r.get("metrics") for r in rep.get(key, {}).get("results", []) if str(rep[key].get("shipped", "")).startswith(r.get("rung", "~"))), None) or {}
+                              before = next((r.get("metrics") for r in rep.get(key, {}).get("results", []) if r.get("rung") == rep.get(key, {}).get("shipped_rung")), None) or {}
                               ok, mt = make_eval(key, kind, dr)(f"{OUT}/{fn}")
-                              drift = abs(mt.get("cos_mean", 1.0) - before.get("cos_mean", mt.get("cos_mean", 1.0))) if before else 0.0
+                              drift = max(0.0, before.get("cos_mean", mt.get("cos_mean", 1.0)) - mt.get("cos_mean", 1.0)) if before else 0.0   # only a DROP counts
                               log(f"post-sharing check {key}: ok={ok} metrics={mt} drift={drift:.6f}")
                               good = good and ok and drift < 1e-3
                           if not good:
@@ -1685,7 +1685,8 @@ jobs:
               L = ["## Quantization report", "", "| component | shipped | MB |", "|---|---|---:|"]
               for k in ("unet", "vae_dec", "vae_enc", "gen", "edit"):
                   v = rep.get(k)
-                  L.append(f"| {k} | {v.get('shipped') if v and v.get('shipped') else '**NOT SHIPPED**'} | {v.get('out_mb') if v else '-'} |")
+                  fp_ = f"{OUT}/{FINAL[k]}"; ok_ = have(fp_)
+                  L.append(f"| {k} | {v.get('shipped') if (v and v.get('shipped') and ok_) else '**NOT SHIPPED**'} | {round(os.path.getsize(fp_) / 1e6, 1) if ok_ else '-'} |")
               L += ["", "### every rung tried", "", "| component | rung | MB | ran | accepted | metrics / error | s |", "|---|---|---:|---|---|---|---:|"]
               for k in ("unet", "vae_dec", "vae_enc", "gen", "edit"):
                   for r in (rep.get(k) or {}).get("results", []):
@@ -1713,7 +1714,7 @@ jobs:
               cmd = sys.argv[1] if len(sys.argv) > 1 else ""
               {"prep": cmd_prep, "vae": cmd_vae, "unet": cmd_unet, "gen": lambda: cmd_enc("gen"), "edit": lambda: cmd_enc("edit"), "pack": cmd_pack}[cmd]()
           PYEOF_QUANTPIPELINE_2
-          python3 -m py_compile quant/quant_pipeline.py && echo 'quant/quant_pipeline.py: 522 lines written, compiles OK'
+          python3 -m py_compile quant/quant_pipeline.py && echo 'quant/quant_pipeline.py: 523 lines written, compiles OK'
 
 
       - name: Generate mipmap icon sizes
