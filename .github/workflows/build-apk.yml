@@ -17,6 +17,8 @@ name: Build Thunder AGI APK
 #           destroyed the encoder (cos 0.57 gen / 0.24 edit): per-group errors compound over 28 layers
 #  Every model is judged against FP32 outputs on REAL inputs on an ORT 1.17.0 sandbox.  A rung that fails its gate falls to
 #  the next-safer one, finally to the original FP16/FP32 model (inlined).  An encoder below the hard floor is NOT shipped.
+#  TOOLCHAIN: the runner image is pinned to ubuntu-24.04 (Python 3.12) because the dependency pins (onnxruntime==1.18.0, numpy<2,
+#  torch 2.14.1 ...) only have wheels up to cp312; the first step fails fast if the Python version ever differs.
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 
 on:
@@ -35,13 +37,23 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04            # PINNED (Python 3.12). 'ubuntu-latest' moved to Ubuntu 26.04 / Python 3.14 on 2026-10-19, where onnxruntime==1.18.0 and numpy<2 have no wheels
     env:
       SHARE_LM: ${{ (github.event_name != 'workflow_dispatch' || inputs.share_lm_weights) && '1' || '0' }}
       ENABLE_BS: ${{ (github.event_name == 'workflow_dispatch' && inputs.basis_sharing) && '1' || '0' }}
       ENABLE_IMP: '1'
 
     steps:
+
+      - name: "Check pinned toolchain (the dependency pins only have wheels for Python 3.12)"
+        run: |
+          PYV=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+          echo "runner OS: $(. /etc/os-release; echo "$PRETTY_NAME") | $(python3 --version)"
+          if [ "$PYV" != "3.12" ]; then
+            echo "::error::Python $PYV found, but the pinned dependencies (onnxruntime==1.18.0, numpy<2, ...) only have wheels up to cp312. This workflow pins runs-on: ubuntu-24.04 (Python 3.12) so the toolchain cannot drift; do not change it back to ubuntu-latest."
+            exit 1
+          fi
+          echo "toolchain OK: Python $PYV"
 
       - name: Free Disk Space (Ubuntu)
         uses: jlumbroso/free-disk-space@main
