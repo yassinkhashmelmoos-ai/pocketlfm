@@ -2625,6 +2625,34 @@ jobs:
           yes | $SDKMANAGER --licenses > /dev/null 2>&1 || true
           $SDKMANAGER "ndk;25.2.9519653" "cmake;3.22.1" "build-tools;34.0.0"
 
+      # FIX (build 17 -> 18): with LM-weight sharing working, lm_shared.bin is ~2.9 GB. AGP's :app:compressReleaseAssets
+      # reads each non-"noCompress" asset into ONE Java byte[] (max 2 GiB) -> "Required array size too large".
+      # ONNX/GGUF weights are already dense (int4/int8) so deflate gains ~nothing; storing them uncompressed skips that
+      # task for them entirely, makes the APK build faster and lets the device read them without inflating.
+      - name: "Store model assets uncompressed (noCompress) so AGP does not load >2 GB files into a byte[]"
+        run: |
+          F=lfm25/app/build.gradle.kts
+          [ -f "$F" ] || F=lfm25/app/build.gradle
+          echo "patching $F"
+          if [ "${F##*.}" = "kts" ]; then
+            printf '%s\n' '' \
+              '// ---- CI-injected: never deflate model assets (AGP compressAssets cannot handle files > 2 GiB) ----' \
+              'android {' \
+              '    androidResources {' \
+              '        noCompress += listOf("onnx", "bin", "gguf", "json", "data")' \
+              '    }' \
+              '}' >> "$F"
+          else
+            printf '%s\n' '' \
+              '// ---- CI-injected: never deflate model assets (AGP compressAssets cannot handle files > 2 GiB) ----' \
+              'android {' \
+              '    androidResources {' \
+              "        noCompress 'onnx', 'bin', 'gguf', 'json', 'data'" \
+              '    }' \
+              '}' >> "$F"
+          fi
+          tail -n 9 "$F"
+
       - name: Make gradlew executable
         run: chmod +x lfm25/gradlew
 
