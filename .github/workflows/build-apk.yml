@@ -1021,13 +1021,22 @@ jobs:
 
 
           # ───────────────────────────── LM weight sharing across the two encoders ────
-          def dedupe_models(paths, out_dir, shared_name="lm_shared.bin", min_bytes=1 << 20):
-              """Store every large initializer that is byte-identical across the given single-file models ONCE, in `shared_name`
-              (ONNX external-data, 4 KiB aligned).  Lossless.  The app must copy `shared_name` next to the models."""
+          def dedupe_models(paths, out_dir, shared_name="lm_shared.bin", min_bytes=1 << 20, shard_bytes=None):
+              """Store every large initializer that is byte-identical across the given single-file models ONCE, in 4 KiB-aligned shard files
+              lm_shared.0.bin, lm_shared.1.bin, ... (ONNX external data; lossless).  Every shard stays below `shard_bytes`: Android Gradle's
+              compressReleaseAssets reads a whole asset into ONE Java array, so a single asset above 2 GiB fails with 'Required array size too large'.
+              The app must copy the shard files next to the models."""
               from onnx.external_data_helper import set_external_data
-              shared_path = os.path.join(out_dir, shared_name)
-              index, before, after = {}, 0, 0
-              with open(shared_path, "wb") as f:
+              shard_bytes = int(shard_bytes or os.environ.get("SHARD_BYTES", 1_000_000_000))
+              stem = shared_name[:-4] if shared_name.endswith(".bin") else shared_name
+              index, before, after, shards = {}, 0, 0, []
+
+              def new_shard():
+                  name = f"{stem}.{len(shards)}.bin"
+                  shards.append([name, open(os.path.join(out_dir, name), "wb")])
+                  return shards[-1]
+              cur = new_shard()
+              try:
                   for p in paths:
                       before += model_nbytes(p)
                       m = onnx.load(p)                                  # (pulls a sidecar in, if the model has one)
@@ -1037,21 +1046,32 @@ jobs:
                               continue
                           key = hashlib.sha1(raw).digest() + len(raw).to_bytes(8, "little")
                           if key not in index:
-                              f.write(b"\0" * ((-f.tell()) % 4096)); off = f.tell(); f.write(raw); index[key] = (off, len(raw))
-                          off, ln = index[key]
-                          set_external_data(t, location=shared_name, offset=off, length=ln)      # needs raw_data present ...
-                          t.ClearField("raw_data")                                               # ... then drop the inline copy
+                              f = cur[1]; pad = (-f.tell()) % 4096
+                              if f.tell() > 0 and f.tell() + pad + len(raw) > shard_bytes:
+                                  cur = new_shard(); f = cur[1]; pad = 0
+                              f.write(b"\0" * pad); off = f.tell(); f.write(raw); index[key] = (cur[0], off, len(raw))
+                          nm, off, ln = index[key]
+                          set_external_data(t, location=nm, offset=off, length=ln)      # needs raw_data present ...
+                          t.ClearField("raw_data")                                        # ... then drop the inline copy
                       onnx.save_model(m, p + ".tmp", save_as_external_data=False)
                       os.replace(p + ".tmp", p)
                       if os.path.exists(p + ".data"):
-                          os.remove(p + ".data")                       # its tensors now live in the shared file
+                          os.remove(p + ".data")                       # its tensors now live in the shard files
                       after += os.path.getsize(p)
                       del m; gc.collect()
-              shared_sz = os.path.getsize(shared_path)
-              if not index:                                    # nothing big enough to share -> do not ship an empty asset
-                  os.remove(shared_path)
-                  return dict(shared_mb=0.0, saved_mb=0.0, tensors=0)
-              return dict(shared_mb=round(shared_sz / 1e6, 1), saved_mb=round((before - after - shared_sz) / 1e6, 1), tensors=len(index))
+              finally:
+                  for _, fh in shards:
+                      fh.close()
+              total, names = 0, []
+              for name, _ in shards:
+                  fp = os.path.join(out_dir, name); sz = os.path.getsize(fp)
+                  if sz == 0 or not index:
+                      os.remove(fp)
+                  else:
+                      total += sz; names.append(name)
+              if not index:
+                  return dict(shared_mb=0.0, saved_mb=0.0, tensors=0, shards=[])
+              return dict(shared_mb=round(total / 1e6, 1), saved_mb=round((before - after - total) / 1e6, 1), tensors=len(index), shards=names)
 
 
           # ───────────────────────────── Basis Sharing (Wang et al., ICLR 2025) ───────
@@ -1172,7 +1192,7 @@ jobs:
               items.sort(reverse=True)
               return dict(residual_float_mb=round(sum(b for b, _ in items) / 1e6, 1), largest=[(nm[:70], round(b / 1e6, 1)) for b, nm in items[:top]])
           PYEOF_QUANTLIB_2
-          python3 -m py_compile quant/quantlib.py && echo 'quant/quantlib.py: 935 lines written, compiles OK'
+          python3 -m py_compile quant/quantlib.py && echo 'quant/quantlib.py: 955 lines written, compiles OK'
 
       - name: "Write quantization toolkit — quant_pipeline.py (part 1/3)"
         run: |
@@ -1645,8 +1665,16 @@ jobs:
                       for nm, f_ in (("gen", a), ("edit", b)):
                           shutil.copy(f_, f"{bk}/{nm}.onnx")
                           if have(f_ + ".data"): shutil.copy(f_ + ".data", f"{bk}/{nm}.onnx.data")
-                      shared = ql.dedupe_models([a, b], OUT, "lm_shared.bin", min_bytes=int(os.environ.get("DEDUPE_MIN_BYTES", 1 << 20))); log("LM weight sharing:", shared)
-                      if not shared["tensors"]:
+                      try:
+                          shared = ql.dedupe_models([a, b], OUT, "lm_shared.bin", min_bytes=int(os.environ.get("DEDUPE_MIN_BYTES", 1 << 20))); log("LM weight sharing:", shared)
+                      except Exception as e:                                   # fail-safe: never let sharing break the build
+                          log(f"::warning::LM weight sharing failed ({type(e).__name__}: {e}) -> reverted, models stay self-contained"); shared = None
+                          for nm, f_ in (("gen", a), ("edit", b)):
+                              shutil.copy(f"{bk}/{nm}.onnx", f_)
+                              if have(f"{bk}/{nm}.onnx.data"): shutil.copy(f"{bk}/{nm}.onnx.data", f_ + ".data")
+                          for x_ in os.listdir(OUT):
+                              if x_.startswith("lm_shared"): os.remove(f"{OUT}/{x_}")
+                      if (not shared) or (not shared["tensors"]):
                           shared = None
                       else:                                                    # prove the shared-weight models still behave identically on the device runtime
                           good = True
@@ -1661,7 +1689,7 @@ jobs:
                               for nm, f_ in (("gen", a), ("edit", b)):
                                   shutil.copy(f"{bk}/{nm}.onnx", f_)
                                   if have(f"{bk}/{nm}.onnx.data"): shutil.copy(f"{bk}/{nm}.onnx.data", f_ + ".data")
-                              os.remove(f"{OUT}/lm_shared.bin"); shared = None
+                              [os.remove(f"{OUT}/{x_}") for x_ in os.listdir(OUT) if x_.startswith("lm_shared")]; shared = None
               for fn in sorted(os.listdir(OUT)):                              # a sidecar left here (no sharing / sharing reverted): inline it if it fits, else the model cannot ship
                   if fn.endswith(".onnx.data"):
                       mp = f"{OUT}/{fn[:-5]}"
@@ -1714,7 +1742,7 @@ jobs:
               cmd = sys.argv[1] if len(sys.argv) > 1 else ""
               {"prep": cmd_prep, "vae": cmd_vae, "unet": cmd_unet, "gen": lambda: cmd_enc("gen"), "edit": lambda: cmd_enc("edit"), "pack": cmd_pack}[cmd]()
           PYEOF_QUANTPIPELINE_2
-          python3 -m py_compile quant/quant_pipeline.py && echo 'quant/quant_pipeline.py: 523 lines written, compiles OK'
+          python3 -m py_compile quant/quant_pipeline.py && echo 'quant/quant_pipeline.py: 531 lines written, compiles OK'
 
 
       - name: Generate mipmap icon sizes
@@ -2594,12 +2622,14 @@ jobs:
       - name: "Patch the app's asset copy-list for the shared LM-weights file (CI-only, not committed)"
         if: env.SHARE_LM == '1'
         run: |
-          if [ -f dreamlite_onnx/out/lm_shared.bin ]; then
+          if ls dreamlite_onnx/out/lm_shared*.bin >/dev/null 2>&1; then
             F=lfm25/app/src/main/java/com/thunder/agi/imaging/ImageGenerator.kt
-            sed -i 's/"text_encoder_edit.onnx", "unet.onnx", "tokenizer.json")/"text_encoder_edit.onnx", "unet.onnx", "tokenizer.json", "lm_shared.bin")/' "$F"
-            grep -n 'lm_shared.bin' "$F" || { echo "::error::copy-list patch did not apply"; exit 1; }
+            NAMES=""
+            for f in dreamlite_onnx/out/lm_shared*.bin; do NAMES="$NAMES, \"$(basename "$f")\""; done
+            sed -i "s|\"text_encoder_edit.onnx\", \"unet.onnx\", \"tokenizer.json\")|\"text_encoder_edit.onnx\", \"unet.onnx\", \"tokenizer.json\"$NAMES)|" "$F"
+            grep -n 'lm_shared' "$F" || { echo "::error::copy-list patch did not apply"; exit 1; }
           else
-            echo "no lm_shared.bin produced -> app source untouched"
+            echo "no shared LM-weight files produced -> app source untouched"
           fi
 
       - name: "Copy ONNX files directly into assets (single-file models, no zip container)"
@@ -2624,34 +2654,6 @@ jobs:
           SDKMANAGER=$(find /usr/local/lib/android/sdk -name "sdkmanager" | head -1)
           yes | $SDKMANAGER --licenses > /dev/null 2>&1 || true
           $SDKMANAGER "ndk;25.2.9519653" "cmake;3.22.1" "build-tools;34.0.0"
-
-      # FIX (build 17 -> 18): with LM-weight sharing working, lm_shared.bin is ~2.9 GB. AGP's :app:compressReleaseAssets
-      # reads each non-"noCompress" asset into ONE Java byte[] (max 2 GiB) -> "Required array size too large".
-      # ONNX/GGUF weights are already dense (int4/int8) so deflate gains ~nothing; storing them uncompressed skips that
-      # task for them entirely, makes the APK build faster and lets the device read them without inflating.
-      - name: "Store model assets uncompressed (noCompress) so AGP does not load >2 GB files into a byte[]"
-        run: |
-          F=lfm25/app/build.gradle.kts
-          [ -f "$F" ] || F=lfm25/app/build.gradle
-          echo "patching $F"
-          if [ "${F##*.}" = "kts" ]; then
-            printf '%s\n' '' \
-              '// ---- CI-injected: never deflate model assets (AGP compressAssets cannot handle files > 2 GiB) ----' \
-              'android {' \
-              '    androidResources {' \
-              '        noCompress += listOf("onnx", "bin", "gguf", "json", "data")' \
-              '    }' \
-              '}' >> "$F"
-          else
-            printf '%s\n' '' \
-              '// ---- CI-injected: never deflate model assets (AGP compressAssets cannot handle files > 2 GiB) ----' \
-              'android {' \
-              '    androidResources {' \
-              "        noCompress 'onnx', 'bin', 'gguf', 'json', 'data'" \
-              '    }' \
-              '}' >> "$F"
-          fi
-          tail -n 9 "$F"
 
       - name: Make gradlew executable
         run: chmod +x lfm25/gradlew
