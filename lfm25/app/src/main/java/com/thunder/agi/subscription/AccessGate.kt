@@ -7,16 +7,18 @@ import java.util.Locale
 import java.util.TimeZone
 
 /**
- * "May the model run right now?", asked at the moment the user presses send.
+ * "May the model run right now?" - asked once at launch (to decide between loading the model and showing the
+ * activation window first) and again whenever the user presses send.
  *
- * The app opens for everyone and the chat history is always readable; only RUNNING the model needs access.
+ * The chat history is always readable; only RUNNING the model needs access.
  * Access is any of: a valid license key, a verified-receipt month, a reset-key month, or admin.
  *
  *  - Subscription state is read live from SharedPreferences (cheap), so a month that ends while the app is
  *    open is noticed on the very next send.
- *  - LicenseValidator.check() is NOT called here: it rebuilds a MasterKey + EncryptedSharedPreferences every
- *    time (a slow Keystore operation) and has no error handling, which is not something to do on the main
- *    thread on every tap. MainActivity runs it, and hands the RESULT over through [updateLicense].
+ *  - The license is NOT checked here: that is a Keystore operation (slow, and it can fail), which is not something
+ *    to do on the main thread. MainActivity runs LicenseValidator.checkSafely() once, off the main thread, and hands
+ *    the RESULT over through [updateLicense] BEFORE anything asks [isUnlocked] - the launch order depends on that:
+ *    asking earlier would see "no license" for a licensed user and flash the activation window.
  */
 object AccessGate {
     private const val DAY_MS = 24L * 60 * 60 * 1000
