@@ -45,6 +45,7 @@
     <uses-feature android:name="android.hardware.wifi.aware" android:required="false" />
 
     <application
+        android:name=".ThunderApp"
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
