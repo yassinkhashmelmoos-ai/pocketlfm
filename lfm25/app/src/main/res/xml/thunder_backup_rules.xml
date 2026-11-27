@@ -10,4 +10,23 @@
     <exclude domain="database" path="thunder_ledger.db-wal" />
     <exclude domain="database" path="thunder_ledger.db-shm" />
     <exclude domain="file" path="transfers/" />
+    <!-- Re-creatable from the APK (the ONNX payload alone is ~3.4 GB) or meaningless on another install: never back up / transfer. -->
+    <exclude domain="file" path="model.gguf" />
+    <exclude domain="file" path="model.gguf.ok" />
+    <exclude domain="file" path="model.gguf.partial" />
+    <exclude domain="file" path="engine_state.txt" />
+    <exclude domain="file" path="engine_attempt.txt" />
+    <exclude domain="file" path="engine_trace.log" />
+    <exclude domain="file" path="text_encoder.onnx" />
+    <exclude domain="file" path="text_encoder_edit.onnx" />
+    <exclude domain="file" path="unet.onnx" />
+    <exclude domain="file" path="vae_decoder.onnx" />
+    <exclude domain="file" path="vae_encoder.onnx" />
+    <exclude domain="file" path="tokenizer.json" />
+    <exclude domain="file" path="manifest.json" />
+    <exclude domain="file" path="lm_shared.0.bin" />
+    <exclude domain="file" path="lm_shared.1.bin" />
+    <exclude domain="file" path="lm_shared.2.bin" />
+    <!-- Encrypted with a hardware Keystore key that cannot be restored: a restored copy is unreadable and used to crash the license check. -->
+    <exclude domain="sharedpref" path="thunder_license_prefs.xml" />
 </full-backup-content>
