@@ -12,8 +12,8 @@ android {
         applicationId = "com.thunder.agi"
         minSdk = 26
         targetSdk = 36
-        versionCode = 5          // FIX: incremented — must be higher than any previously installed APK
-        versionName = "1.5"      // human-readable version shown in About / Play Store
+        versionCode = 4          // FIX: incremented — must be higher than any previously installed APK
+        versionName = "1.4"      // human-readable version shown in About / Play Store
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
