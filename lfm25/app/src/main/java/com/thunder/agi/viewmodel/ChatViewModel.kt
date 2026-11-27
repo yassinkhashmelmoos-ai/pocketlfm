@@ -14,6 +14,7 @@ import androidx.lifecycle.viewModelScope
 import com.thunder.agi.data.ChatDatabase
 import com.thunder.agi.data.MessageEntity
 import com.thunder.agi.data.SessionEntity
+import com.thunder.agi.diag.StartupDiagnostics
 import com.thunder.agi.intelligence.KnowledgeGraph
 import com.thunder.agi.intelligence.NightlyTrainer
 import com.thunder.agi.intelligence.TinyRL
@@ -141,7 +142,10 @@ data class ChatUiState(
     val lastImageId:        Int?              = null,
     // NEW: set when the user presses send without access; MainActivity then shows the activation
     // pop-up. The chat itself (and its history) is always visible.
-    val paywallRequested:   Boolean           = false
+    val paywallRequested:   Boolean           = false,
+    // NEW: true while the app is not activated. The model is NOT loaded (no 218 MB copy, no native engine start), the
+    // history stays readable and the input bar is shown; pressing send opens the activation window.
+    val modelLocked:        Boolean           = false
 )
 
 // ── ViewModel ─────────────────────────────────────────────────────────────────
@@ -195,10 +199,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     init {
         _ui.update { it.copy(userName = userName) }
         observeSessions()
-        ensureModelLoaded()
+        // The model is deliberately NOT loaded here any more. It used to start loading right now, for everybody,
+        // before anything had checked access: the activation window never got to appear first, and any failure inside
+        // the engine happened before the user could do anything at all. MainActivity calls onAccessResolved() once the
+        // (off-main-thread) license check has finished, and only an unlocked app loads the model.
         nightlyTrainer.schedule()
         checkNotifPermission()
         checkImageGenAvailable()  // quick flag read
+        loadStartupReport()       // "why did the app close last time?" - shown once, copyable
 
         // FIX: this used to also call imageGenerator.preload() here, in the
         // background, right after launch. That's no longer safe to do eagerly:
@@ -214,22 +222,73 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ── Model ──────────────────────────────────────────────────────────────────
-    private fun ensureModelLoaded() {
+    private var loadJob: Job? = null
+
+    private fun ensureModelLoaded(force: Boolean = false) {
+        // Defence in depth: whoever calls this, the heavy work never starts while the app is locked.
+        if (!isAccessAllowed()) {
+            _ui.update { it.copy(modelLocked = true) }
+            return
+        }
         if (model.isLoaded()) {
-            _ui.update { it.copy(modelLoaded = true) }
+            _ui.update { it.copy(modelLoaded = true, modelLocked = false) }
             ensureSession()
             return
         }
-        viewModelScope.launch {
-            _ui.update { it.copy(isModelLoading = true, error = null) }
-            val ok = model.loadModel(getApplication())
+        // Single flight: a second call while a load is running must not start another one.
+        if (loadJob?.isActive == true) return
+        loadJob = viewModelScope.launch {
+            _ui.update { it.copy(isModelLoading = true, modelLocked = false, error = null) }
+            val ok = try {
+                model.loadModel(getApplication(), force)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {              // loading must never be able to take the whole app down
+                Log.e(TAG, "Model load threw", t)
+                false
+            }
             _ui.update { it.copy(isModelLoading = false, modelLoaded = ok,
-                error = if (!ok) "Failed to load model." else null) }
+                error = if (ok) null else (model.lastError ?: "Failed to load model.")) }
             if (ok) ensureSession()
         }
     }
 
-    fun retryLoadModel() = ensureModelLoaded()
+    // Retry button: also lifts the "crashed 3 times in a row" stop for one more attempt.
+    fun retryLoadModel() = ensureModelLoaded(force = true)
+
+    // ── Access gate → model ────────────────────────────────────────────────────
+    private var gateResolvedOnce = false
+
+    /**
+     * MainActivity calls this when the access check has finished (and again whenever access is granted).
+     *  - unlocked: start loading the model (spinner, then chat);
+     *  - locked:   load NOTHING. Show the activation window first - once per launch, so returning from the About
+     *              screen does not pop it up again - and keep the history readable behind it.
+     */
+    fun onAccessResolved(unlocked: Boolean) {
+        if (unlocked) {
+            ensureModelLoaded()
+            return
+        }
+        _ui.update { it.copy(modelLocked = true, isModelLoading = false) }
+        ensureSession()
+        if (!gateResolvedOnce) {
+            gateResolvedOnce = true
+            requestPaywall()
+        }
+    }
+
+    /** After activation (license key, receipt or reset key): re-evaluate the gate and start loading if it opened. */
+    fun onAccessGranted() = onAccessResolved(isAccessAllowed())
+
+    // "Why did the app close last time?" - native engine death, Android's exit reason, saved Java crash. Shown once in the
+    // existing Error Report dialog, where the user can copy it, instead of the app just silently closing.
+    private fun loadStartupReport() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val report = StartupDiagnostics.collect(getApplication())
+            if (report != null) _ui.update { it.copy(crashLog = report) }
+        }
+    }
 
     // ── Sessions ───────────────────────────────────────────────────────────────
     private fun observeSessions() {
@@ -241,10 +300,31 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private var sessionInitJob: Job? = null
+
     private fun ensureSession() {
         if (_ui.value.currentSessionId != null) return
-        val first = _ui.value.sessions.firstOrNull()
-        if (first != null) switchSession(first.id) else newSession()
+        if (sessionInitJob?.isActive == true) return
+        sessionInitJob = viewModelScope.launch {
+            // Ask the database, not the UI state: the sessions list in the UI is filled asynchronously by
+            // observeSessions() and can still be empty at this moment - which used to create an extra empty "New Chat"
+            // every time the app was re-opened.
+            val first = try {
+                db.sessionDao().latest()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                null
+            }
+            if (_ui.value.currentSessionId != null) return@launch
+            if (first != null) {
+                switchSession(first.id)
+            } else {
+                val id = UUID.randomUUID().toString()
+                db.sessionDao().insert(SessionEntity(id = id, title = "New Chat"))
+                switchSession(id)
+            }
+        }
     }
 
     fun newSession() {
@@ -888,7 +968,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ── Crash / export ────────────────────────────────────────────────────────
-    fun clearCrashLog() = _ui.update { it.copy(crashLog = null) }
+    fun clearCrashLog() {
+        _ui.update { it.copy(crashLog = null) }
+        // the saved Java crash reports are part of what the dialog showed: drop them so they are not reported again
+        viewModelScope.launch(Dispatchers.IO) {
+            try { CrashReporter(getApplication()).clearAll() } catch (e: Exception) { Log.w(TAG, "clearAll failed", e) }
+        }
+    }
 
     fun exportLastResponse(format: FileExporter.ExportFormat = FileExporter.ExportFormat.TXT) {
         val lastAI = _ui.value.messages.lastOrNull { !it.isUser && !it.isLoading } ?: run {
