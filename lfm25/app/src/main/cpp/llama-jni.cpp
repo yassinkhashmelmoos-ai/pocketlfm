@@ -8,9 +8,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>      // strstr(): was only reachable through libc++ transitive includes
 #include <sys/sysinfo.h>
 
 #include "llama.h"
+#include "load_profile.h"
 
 #define LOG_TAG "ThunderAGI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -38,10 +40,11 @@ static llama_sampler* g_sampler  = nullptr;
 static bool           g_loaded   = false;
 static int            g_ctx_size = 4096;
 static bool           g_is_dream = false;  // DREAM diffusion model flag
-
-static int detect_threads() {
-    return std::min(std::max((int)std::thread::hardware_concurrency(), 2), 8);
-}
+// Prompt chunk size in use (profile dependent). llama_decode() ABORTS the process if it is handed more tokens than
+// n_batch (GGML_ASSERT in llama_context::decode), so every prompt chunk must be sized from this / llama_n_batch().
+static int            g_batch    = BATCH_SIZE;
+// Breadcrumb file written during loading (see load_profile.h). Empty = tracing off.
+static std::string    g_trace_path;
 
 static long get_free_ram_mb() {
     struct sysinfo info;
@@ -221,66 +224,125 @@ static jstring generate_dream_diffusion(JNIEnv* env,
 
 extern "C" {
 
-JNIEXPORT jboolean JNICALL
-Java_com_thunder_agi_llama_ThunderModel_nativeLoadModel(
-        JNIEnv* env, jclass, jstring model_path) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_loaded) { LOGI("Already loaded"); return JNI_TRUE; }
+// ── model loading ─────────────────────────────────────────────────────────────────────────────────────────────
+// Frees whatever a (possibly half-finished) load created. Caller holds g_mutex.
+static void release_all_locked() {
+    if (g_sampler) { llama_sampler_free(g_sampler); g_sampler = nullptr; }
+    if (g_ctx)     { llama_free(g_ctx);             g_ctx     = nullptr; }
+    if (g_model)   { llama_model_free(g_model);     g_model   = nullptr; }
+    g_loaded   = false;
+    g_is_dream = false;
+}
 
-    const char* path = env->GetStringUTFChars(model_path, nullptr);
-    LOGI("Loading: %s", path);
+// Does the real work. Every step leaves a breadcrumb line in the trace file BEFORE it runs, so if the process dies
+// natively (abort(), SIGSEGV, OOM kill) the app can tell on the next start exactly how far the load got.
+// Caller holds g_mutex.
+static int load_model_locked(const std::string& path, int profile) {
+    using namespace thunder;
+    profile = std::min(std::max(profile, 0), 2);
+    trace_line(g_trace_path, "load begin profile=%d", profile);
+    LOGI("Loading: %s (profile %d)", path.c_str(), profile);
+
     llama_backend_init();
+    trace_line(g_trace_path, "backend ready");
 
-    long free_mb = get_free_ram_mb();
-    if      (free_mb > 4000) g_ctx_size = 8192;
-    else if (free_mb > 2000) g_ctx_size = 4096;
-    else                     g_ctx_size = 2048;
-    LOGI("RAM: %ld MB → ctx: %d", free_mb, g_ctx_size);
+    const long free_mb = get_free_ram_mb();
+    const LoadParams lp = params_for_profile(profile, free_mb, (int)std::thread::hardware_concurrency(), BATCH_SIZE);
+    g_ctx_size = lp.n_ctx;
+    g_batch    = lp.n_batch;
+    LOGI("RAM: %ld MB -> ctx=%d batch=%d threads=%d flash=%d mmap=%d",
+         free_mb, lp.n_ctx, lp.n_batch, lp.n_threads, (int)lp.flash_attn, (int)lp.use_mmap);
+    trace_line(g_trace_path, "params ctx=%d batch=%d threads=%d flash=%d mmap=%d free_mb=%ld",
+               lp.n_ctx, lp.n_batch, lp.n_threads, (int)lp.flash_attn, (int)lp.use_mmap, free_mb);
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
-    mp.use_mmap  = true;
-    mp.use_mlock = false;
+    mp.use_mmap     = lp.use_mmap;
+    mp.use_mlock    = false;
 
-    g_model = llama_model_load_from_file(path, mp);
-    env->ReleaseStringUTFChars(model_path, path);
-    if (!g_model) { LOGE("Failed to load"); llama_backend_free(); return JNI_FALSE; }
+    trace_line(g_trace_path, "model load begin");
+    g_model = llama_model_load_from_file(path.c_str(), mp);
+    if (!g_model) {
+        LOGE("Failed to load model");
+        trace_line(g_trace_path, "model load FAILED");
+        llama_backend_free();
+        return LOAD_MODEL_FAILED;
+    }
+    trace_line(g_trace_path, "model loaded");
 
     // Detect if this is a DREAM diffusion model
     char arch_buf[64] = {};
     llama_model_meta_val_str(g_model, "general.architecture", arch_buf, sizeof(arch_buf));
     g_is_dream = (strstr(arch_buf, "dream") != nullptr || strstr(arch_buf, "mdlm") != nullptr);
     LOGI("Architecture: %s  is_dream=%d", arch_buf, (int)g_is_dream);
+    trace_line(g_trace_path, "arch=%s", arch_buf);
 
-    int n_threads = detect_threads();
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx           = g_ctx_size;
-    cp.n_batch         = BATCH_SIZE;
-    cp.n_ubatch        = BATCH_SIZE;
-    cp.n_threads       = n_threads;
-    cp.n_threads_batch = n_threads;
-    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    cp.n_ctx           = lp.n_ctx;
+    cp.n_batch         = lp.n_batch;
+    cp.n_ubatch        = lp.n_batch;
+    cp.n_threads       = lp.n_threads;
+    cp.n_threads_batch = lp.n_threads;
+    cp.flash_attn_type = lp.flash_attn ? LLAMA_FLASH_ATTN_TYPE_AUTO : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cp.offload_kqv     = false;
     cp.type_k = GGML_TYPE_F16;
     cp.type_v = GGML_TYPE_F16;
 
+    // This is the step that reserves the compute graph: a bad graph (see models/lfm2.cpp) aborts right here.
+    trace_line(g_trace_path, "context create begin");
     g_ctx = llama_init_from_model(g_model, cp);
     if (!g_ctx) {
+        LOGE("Failed to create context");
+        trace_line(g_trace_path, "context create FAILED");
         llama_model_free(g_model); g_model = nullptr;
-        llama_backend_free(); return JNI_FALSE;
+        llama_backend_free();
+        return LOAD_CONTEXT_FAILED;
     }
+    trace_line(g_trace_path, "context created");
 
     // FIX 5: default temp 0.7 (above Q4_K_M noise floor), wider top_p, tighter rep window
     init_sampler(0.7f, 0.92f, 50, 1.15f);
     g_loaded = true;
-    LOGI("Ready. threads=%d ctx=%d dream=%d", n_threads, g_ctx_size, (int)g_is_dream);
+    LOGI("Ready. threads=%d ctx=%d dream=%d", lp.n_threads, g_ctx_size, (int)g_is_dream);
     LOGI("Sys: %s", llama_print_system_info());
-    return JNI_TRUE;
+    trace_line(g_trace_path, "ready");
+    return LOAD_OK;
 }
 
-JNIEXPORT jstring JNICALL
-Java_com_thunder_agi_llama_ThunderModel_nativeGenerate(
-        JNIEnv* env, jclass,
+// Returns thunder::LoadResult as an int (0 = OK). `profile` and `trace_path` are chosen by LoadAttemptTracker.kt.
+JNIEXPORT jint JNICALL
+Java_com_thunder_agi_llama_ThunderModel_nativeLoadModel(
+        JNIEnv* env, jclass, jstring model_path, jint profile, jstring trace_path) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_loaded) { LOGI("Already loaded"); return thunder::LOAD_OK; }
+
+    std::string path;
+    if (model_path) {
+        if (const char* p = env->GetStringUTFChars(model_path, nullptr)) { path = p; env->ReleaseStringUTFChars(model_path, p); }
+    }
+    g_trace_path.clear();
+    if (trace_path) {
+        if (const char* t = env->GetStringUTFChars(trace_path, nullptr)) { g_trace_path = t; env->ReleaseStringUTFChars(trace_path, t); }
+    }
+    if (path.empty()) { LOGE("nativeLoadModel: empty model path"); return thunder::LOAD_MODEL_FAILED; }
+
+    // A C++ exception that escapes a JNI function terminates the whole process (std::terminate -> abort()).
+    try {
+        return load_model_locked(path, (int)profile);
+    } catch (const std::exception& e) {
+        LOGE("Exception while loading: %s", e.what());
+        thunder::trace_line(g_trace_path, "EXCEPTION %s", e.what());
+    } catch (...) {
+        LOGE("Unknown exception while loading");
+        thunder::trace_line(g_trace_path, "EXCEPTION (unknown)");
+    }
+    release_all_locked();
+    llama_backend_free();
+    return thunder::LOAD_EXCEPTION;
+}
+
+static jstring generate_locked(
+        JNIEnv* env,
         jstring j_prompt,
         jfloat temperature, jfloat top_p, jint top_k,
         jfloat repeat_penalty, jint max_tokens) {
@@ -398,10 +460,12 @@ Java_com_thunder_agi_llama_ThunderModel_nativeGenerate(
     // FIX 2: use n_past + j (global position), NOT n_past + (j-i)
     // The old code reset positions to 0 at the start of each chunk,
     // corrupting RoPE embeddings and LFM2 conv state position tracking.
-    llama_batch batch = llama_batch_init(BATCH_SIZE, 0, 1);
+    // The chunk must never exceed the context's real n_batch: llama_decode() aborts the process otherwise.
+    const int chunk = std::max(1, (int)std::min<uint32_t>((uint32_t)g_batch, llama_n_batch(g_ctx)));
+    llama_batch batch = llama_batch_init(chunk, 0, 1);
     for (int i = 0; i < n_tokens; ) {
         batch.n_tokens = 0;
-        int end = std::min(i + BATCH_SIZE, n_tokens);
+        int end = std::min(i + chunk, n_tokens);
         for (int j = i; j < end; j++)
             // FIX 2: global position = n_past + j  (NOT n_past + j - i)
             batch_add(batch, tokens[j], n_past + j, j == n_tokens - 1);
@@ -448,6 +512,23 @@ Java_com_thunder_agi_llama_ThunderModel_nativeGenerate(
     if (response.empty()) response = "...";
     LOGI("Done: %zu chars", response.size());
     return env->NewStringUTF(response.c_str());
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_thunder_agi_llama_ThunderModel_nativeGenerate(
+        JNIEnv* env, jclass,
+        jstring j_prompt,
+        jfloat temperature, jfloat top_p, jint top_k,
+        jfloat repeat_penalty, jint max_tokens) {
+    // Never let a C++ exception (std::bad_alloc, ...) escape into the JVM: that aborts the whole app.
+    try {
+        return generate_locked(env, j_prompt, temperature, top_p, top_k, repeat_penalty, max_tokens);
+    } catch (const std::exception& e) {
+        LOGE("Exception while generating: %s", e.what());
+    } catch (...) {
+        LOGE("Unknown exception while generating");
+    }
+    return env->NewStringUTF("Error: the engine failed while generating.");
 }
 
 JNIEXPORT void JNICALL
