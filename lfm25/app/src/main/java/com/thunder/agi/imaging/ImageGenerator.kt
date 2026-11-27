@@ -122,7 +122,10 @@ class ImageGenerator(private val context: Context) {
     }
 
     private val outputDir = File(context.filesDir, OUTPUT_DIR).also { it.mkdirs() }
-    private val onnxEnv   = OrtEnvironment.getEnvironment()
+    // Lazy: OrtEnvironment.getEnvironment() loads libonnxruntime.so (15 MB) and starts ONNX Runtime's global thread
+    // pools. It used to run for every launch - including launches that never generate an image, and launches where the
+    // user has not activated the app yet - because ChatViewModel constructs this class eagerly.
+    private val onnxEnv by lazy { OrtEnvironment.getEnvironment() }
     // FIX (new): currentGuidanceScale/currentImageGuidanceScale previously lived
     // only in memory — the self-improvement nudging (see launchSelfImprovementComparison)
     // was silently thrown away every app restart. Persisting it is a one-line change
