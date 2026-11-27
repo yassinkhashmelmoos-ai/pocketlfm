@@ -158,7 +158,8 @@ fun ChatScreen(
             onDismissRequest = onClearCrash,
             title = { Text("⚠️ Error Report") },
             text = {
-                Column {
+                // scrollable: startup reports (engine step, exit reason, Java crash) can be longer than the dialog
+                Column(Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState())) {
                     Text("An error occurred. Copy and send to developer:",
                         style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(8.dp))
@@ -250,7 +251,9 @@ fun ChatScreen(
             )
         },
         bottomBar = {
-            if (uiState.modelLoaded) {
+            // Locked (not activated yet): the history stays readable and the input bar is shown; pressing send opens the
+            // activation window instead of loading the model.
+            if (uiState.modelLoaded || uiState.modelLocked) {
                 InputSection(
                     text        = uiState.inputText,
                     generating  = uiState.isGenerating,
@@ -270,7 +273,7 @@ fun ChatScreen(
         Box(modifier.fillMaxSize().padding(padding)) {
             when {
                 uiState.isModelLoading -> LoadingView()
-                !uiState.modelLoaded   -> ErrorView(uiState.error ?: "Unknown error", onRetryLoadModel)
+                !uiState.modelLoaded && !uiState.modelLocked -> ErrorView(uiState.error ?: "Unknown error", onRetryLoadModel)
                 else -> MessageList(
                     messages        = uiState.messages,
                     listState       = listState,
