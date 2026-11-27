@@ -1,7 +1,9 @@
 package com.thunder.agi.license
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.util.Base64
+import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import org.json.JSONObject
@@ -18,6 +20,7 @@ object LicenseValidator {
     // Must match the secret key in the Generator App
     private const val SECRET_KEY = "123456789"
 
+    private const val TAG           = "LicenseValidator"
     private const val PREFS_FILE    = "thunder_license_prefs"
     private const val KEY_USERNAME  = "lv_username"
     private const val KEY_TOKEN     = "lv_token"
@@ -36,18 +39,33 @@ object LicenseValidator {
         val daysRemaining: Long = 0
     )
 
-    /** Activate with a username + license key. Returns true if genuine and not expired. */
+    /** Activate with a username + license key. Returns true if genuine and not expired. Never throws. */
     fun activate(context: Context, username: String, licenseKey: String): Boolean {
         val payload = decodeAndVerify(username, licenseKey) ?: return false
-        val prefs = getPrefs(context)
-        prefs.edit()
-            .putString(KEY_USERNAME, username)
-            .putString(KEY_TOKEN, licenseKey)
-            .apply()
-        return !isExpired(payload.getString("exp"))
+        return try {
+            getPrefs(context).edit()
+                .putString(KEY_USERNAME, username)
+                .putString(KEY_TOKEN, licenseKey)
+                .apply()
+            !isExpired(payload.optString("exp"))
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not store the license (Keystore problem?)", e)
+            false
+        }
     }
 
-    /** Call on every app launch to check stored credentials. */
+    /**
+     * Like [check] but NEVER throws: any Keystore / storage failure is reported as NOT_ACTIVATED, so a broken Keystore
+     * can no longer take the whole app down. Does Keystore I/O - call it off the main thread.
+     */
+    fun checkSafely(context: Context): LicenseInfo = try {
+        check(context)
+    } catch (e: Exception) {
+        Log.e(TAG, "License check failed; treating as not activated", e)
+        LicenseInfo(Status.NOT_ACTIVATED)
+    }
+
+    /** Call on every app launch to check stored credentials. Prefer [checkSafely]. */
     fun check(context: Context): LicenseInfo {
         val prefs  = getPrefs(context)
         val user   = prefs.getString(KEY_USERNAME, null) ?: return LicenseInfo(Status.NOT_ACTIVATED)
@@ -56,7 +74,7 @@ object LicenseValidator {
         val payload = decodeAndVerify(user, token)
             ?: return LicenseInfo(Status.INVALID, username = user)
 
-        val expiry = payload.getString("exp")
+        val expiry = payload.optString("exp")      // optString: a signed payload without "exp" is "expired", not an exception
         val days   = daysUntil(expiry)
 
         return if (days < 0) {
@@ -67,11 +85,14 @@ object LicenseValidator {
     }
 
     /** Returns stored username, or empty string if not activated. */
-    fun getUsername(context: Context): String =
+    fun getUsername(context: Context): String = try {
         getPrefs(context).getString(KEY_USERNAME, "") ?: ""
+    } catch (e: Exception) { "" }
 
     /** Clear stored credentials (e.g. user wants to enter a new key). */
-    fun clear(context: Context) { getPrefs(context).edit().clear().apply() }
+    fun clear(context: Context) {
+        try { getPrefs(context).edit().clear().apply() } catch (e: Exception) { Log.w(TAG, "clear failed", e) }
+    }
 
     // ── Internal helpers ───────────────────────────────────────────────────
 
@@ -110,16 +131,46 @@ object LicenseValidator {
         }
     }
 
-    private fun getPrefs(context: Context): android.content.SharedPreferences {
-        val masterKey = MasterKey.Builder(context)
+    // Creating EncryptedSharedPreferences does Keystore work and is slow-ish: do it once per process.
+    @Volatile private var cachedPrefs: SharedPreferences? = null
+
+    private fun getPrefs(context: Context): SharedPreferences {
+        cachedPrefs?.let { return it }
+        synchronized(this) {
+            cachedPrefs?.let { return it }
+            val app = context.applicationContext
+            // This used to be a bare create(): when the encrypted file and the Keystore key were out of sync (a restored
+            // backup, a wiped key, a buggy OEM Keystore) it threw - on the MAIN thread, during the first composition -
+            // and the app died on every launch. Now an unreadable store is reset once and the user simply re-enters the key.
+            val prefs = createWithSingleReset(
+                create = { createPrefs(app) },
+                reset = { resetStorage(app) },
+                onFirstFailure = { Log.w(TAG, "Encrypted license prefs unreadable (${it.javaClass.simpleName}); resetting", it) }
+            )
+            cachedPrefs = prefs
+            return prefs
+        }
+    }
+
+    private fun createPrefs(app: Context): SharedPreferences {
+        val masterKey = MasterKey.Builder(app)
             .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
             .build()
         return EncryptedSharedPreferences.create(
-            context,
+            app,
             PREFS_FILE,
             masterKey,
             EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
             EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
         )
+    }
+
+    private fun resetStorage(app: Context) {
+        try { app.deleteSharedPreferences(PREFS_FILE) } catch (e: Exception) { Log.w(TAG, "could not delete prefs file", e) }
+        try {
+            val ks = java.security.KeyStore.getInstance("AndroidKeyStore")
+            ks.load(null)
+            ks.deleteEntry(MasterKey.DEFAULT_MASTER_KEY_ALIAS)
+        } catch (e: Exception) { Log.w(TAG, "could not delete master key", e) }
     }
 }
