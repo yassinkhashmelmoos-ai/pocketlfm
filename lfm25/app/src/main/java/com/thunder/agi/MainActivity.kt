@@ -27,8 +27,10 @@ import com.thunder.agi.ui.WalletScreen
 import com.thunder.agi.ui.components.ChatScreen
 import com.thunder.agi.ui.theme.ThunderAGITheme
 import com.thunder.agi.viewmodel.ChatViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -56,21 +58,37 @@ fun ThunderAGIApp() {
     // with), or a verified Bankak receipt. registerUser() / the 30-day trial it
     // starts is intentionally never called from here.
     //
-    // The app now OPENS FOR EVERYONE (first launch, an ended month, never activated) and the chat
-    // history is always readable. Access is only asked for when the user presses send: ChatViewModel
-    // then raises ui.paywallRequested and the activation pop-up at the bottom of this function
-    // appears, with a "Not now" button that simply returns to the chat.
+    // LAUNCH ORDER - what the activation window depends on:
+    //   1. the license check runs ONCE, off the main thread (it is a Keystore call; it used to run - and could throw -
+    //      during composition), and its result is handed to AccessGate BEFORE anything reads the gate;
+    //   2. only then is the decision made: unlocked -> the model starts loading; locked -> the activation window is
+    //      shown FIRST and NOTHING is loaded (ChatViewModel.onAccessResolved). "Not now" still returns to the chat,
+    //      whose history stays readable; pressing send then opens the activation window again.
+    // Before this, the model started loading for everybody the moment the ViewModel was created: a locked user saw
+    // "Loading Thunder AGI…" instead of the activation window, and a failure inside the engine killed the app first.
     val sub         = remember { SubscriptionManager(context) }
-    var licenseInfo by remember { mutableStateOf(LicenseValidator.check(context)) }
+    var licenseInfo by remember { mutableStateOf<LicenseValidator.LicenseInfo?>(null) }   // null = check not finished
     var subState    by remember { mutableStateOf(sub.getState()) }
 
     var showAbout     by remember { mutableStateOf(false) }
     var verifyMessage by remember { mutableStateOf("") }
     var isVerifying   by remember { mutableStateOf(false) }
 
-    // LicenseValidator.check() is a slow Keystore call, so it runs here, and only its RESULT is
-    // handed to AccessGate, which the ViewModel asks at the moment the user presses send.
-    LaunchedEffect(licenseInfo) { AccessGate.updateLicense(licenseInfo) }
+    // 1. The access check - once, first, off the main thread. checkSafely() never throws.
+    LaunchedEffect(Unit) {
+        val info = withContext(Dispatchers.IO) { LicenseValidator.checkSafely(context) }
+        AccessGate.updateLicense(info)     // the gate knows the answer BEFORE anything can ask it ...
+        licenseInfo = info                 // ... and only then does the UI move on
+    }
+
+    val license = licenseInfo
+    if (license == null) {
+        // first frame(s): nothing is decided yet, so show no chat and start no work
+        Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.Alignment.Center) {
+            androidx.compose.material3.CircularProgressIndicator()
+        }
+        return
+    }
 
     if (showAbout) {
         AboutScreen(onDismiss = { showAbout = false })
@@ -89,7 +107,7 @@ fun ThunderAGIApp() {
 
     // FIX: only seed username once — LaunchedEffect(Unit) prevents overwriting
     // the user's manually-changed name on every recomposition
-    val activatedUsername = licenseInfo.username.ifBlank { sub.getUsername() }
+    val activatedUsername = license.username.ifBlank { sub.getUsername() }
     LaunchedEffect(Unit) {
         if (activatedUsername.isNotBlank() && ui.userName == "You") {
             vm.saveUserName(activatedUsername)
@@ -98,6 +116,13 @@ fun ThunderAGIApp() {
 
     // Thunder wallet: resume the opt-in background service if the user enabled it before
     LaunchedEffect(Unit) { ThunderService.restoreIfEnabled(context) }
+
+    // 2. The decision. Unlocked -> the model loads (spinner, then chat). Locked -> the activation window comes FIRST and
+    //    nothing heavy starts. Idempotent: it can run again when the About screen is closed.
+    LaunchedEffect(Unit) {
+        subState = sub.getState()
+        vm.onAccessResolved(AccessGate.isUnlocked(context))
+    }
 
     // ── activation pop-up wiring ─────────────────────────────────────────────
     LaunchedEffect(ui.paywallRequested) {
@@ -115,6 +140,7 @@ fun ThunderAGIApp() {
                 isVerifying   = false
                 if (result.valid) {
                     subState = sub.getState()
+                    vm.onAccessGranted()                         // start loading the model while the user reads the result
                     delay(2500)                                  // let the user read what was verified
                     vm.dismissPaywall()
                 }
@@ -124,9 +150,11 @@ fun ThunderAGIApp() {
     val activateLicense: (String, String) -> Boolean = { username, key ->
         val ok = LicenseValidator.activate(context, username, key)
         if (ok) {
-            licenseInfo = LicenseValidator.check(context)
-            AccessGate.updateLicense(licenseInfo)
+            val info = LicenseValidator.checkSafely(context)
+            AccessGate.updateLicense(info)
+            licenseInfo = info
             vm.dismissPaywall()
+            vm.onAccessGranted()                                 // the gate is open: start loading the model
             vm.showSnackbar("✅ تم التفعيل — Activated")
         }
         ok
@@ -135,6 +163,7 @@ fun ThunderAGIApp() {
         if (sub.applyResetKey(key)) {
             subState = sub.getState()
             vm.dismissPaywall()
+            vm.onAccessGranted()
             vm.showSnackbar("✅ تم إعادة التفعيل! Reactivated!")
         } else {
             verifyMessage = "مفتاح غير صحيح — Invalid reset key"
@@ -189,7 +218,7 @@ fun ThunderAGIApp() {
         // remaining" regardless of their actual trial. Use SubscriptionManager's
         // own count while a trial is active.
         trialDaysRemaining   = if (subState == SubscriptionManager.SubscriptionState.TRIAL_ACTIVE)
-            sub.getDaysRemaining() else licenseInfo.daysRemaining,
+            sub.getDaysRemaining() else license.daysRemaining,
         isAdmin              = subState == SubscriptionManager.SubscriptionState.ADMIN
     )
     }
