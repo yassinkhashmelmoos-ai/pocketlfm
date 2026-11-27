@@ -28,6 +28,12 @@ interface SessionDao {
     @Query("SELECT * FROM sessions ORDER BY updatedAt DESC")
     fun getAllSessions(): Flow<List<SessionEntity>>
 
+    // One-shot "most recent session". ChatViewModel.ensureSession() asks the database itself instead of reading the
+    // sessions list in the UI state, which is filled asynchronously by the Flow above and can still be empty at that
+    // moment (that race created an extra empty "New Chat" every time the app was re-opened).
+    @Query("SELECT * FROM sessions ORDER BY updatedAt DESC LIMIT 1")
+    suspend fun latest(): SessionEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(session: SessionEntity)
 
@@ -69,7 +75,8 @@ abstract class ChatDatabase : RoomDatabase() {
 
         fun getInstance(context: Context): ChatDatabase =
             INSTANCE ?: synchronized(this) {
-                Room.databaseBuilder(
+                // re-check inside the lock: two threads that both saw null must not each build a database
+                INSTANCE ?: Room.databaseBuilder(
                     context.applicationContext,
                     ChatDatabase::class.java,
                     "thunder_agi_db"
