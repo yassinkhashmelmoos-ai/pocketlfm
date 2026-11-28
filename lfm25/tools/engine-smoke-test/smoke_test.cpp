@@ -87,8 +87,9 @@ int main(int argc, char** argv) {
         // THIS is the call that used to abort(): it builds and reserves the compute graph of the model.
         CHECK(load(model, profile, trace) == 0, "nativeLoadModel -> LOAD_OK (a broken graph would abort the process here)");
         auto t = lines(trace);
-        for (const char* stage : {"backend ready", "model loaded", "context create begin", "context created"})
+        for (const char* stage : {"backend ready", "graph variant=", "model loaded", "context create begin", "context created"})
             CHECK(has(t, stage), "breadcrumb '%s'", stage);
+        if (profile >= 1) CHECK(has(t, "graph variant=0"), "safe-mode profile %d builds the stock upstream graph", profile);
         CHECK(!t.empty() && t.back().size() >= 6 && t.back().compare(t.back().size() - 6, 6, " ready") == 0, "last breadcrumb = ready");
         CHECK(load(model, profile, trace) == 0, "a second load is a harmless no-op");
 

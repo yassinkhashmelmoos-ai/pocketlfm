@@ -29,7 +29,7 @@ with code 134 and prints the assertion.
 * `make_tiny_lfm2.py` - writes the tiny GGUF files (4 layers: 2 short-conv + 2 attention, 64-wide, byte-level BPE vocab
   with the ChatML control tokens the app's prompt builder uses).
 * `shim/` - two tiny host-only headers (`android/log.h`, `amx/amx.h`); nothing here ships in the APK.
-* `.github/workflows/engine-smoke-test.yml` runs it on every change to the engine sources.
+* `.github/workflows/engine-smoke-test.yml` runs it on demand (Actions tab -> Run workflow); it never runs on pushes.
 
 It is not a quality test: the weights are random, the output is noise. It only proves that the engine loads the
 architecture, builds and runs its compute graph, and survives prompts longer than its batch size without aborting.
