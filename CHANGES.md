@@ -1,3 +1,12 @@
+> **Update - supersedes the "Engine" and CI statements further down.**
+> * `models/lfm2.cpp` is **not** replaced by upstream any more. All of your edits are kept; only the broken parts are fixed: the GeGLU edit now uses
+>   `LLM_FFN_GELU` + `LLM_FFN_PAR` (the real GeGLU path of `build_ffn`; the fused `LLM_FFN_GEGLU` is what aborted), and one assert that could only abort was removed.
+>   Each edit sits behind `thunder_lfm2_variant()` (`thunder_variant.h`): load profile 0 builds YOUR graph, the safe-mode profiles 1/2 build the stock upstream
+>   graph, so if an edit ever kills a launch the next start can no longer hit it. Verified on a tiny LFM2: loads, deterministic, finite logits, numerically different from stock.
+>   Not verified: whether the two math-changing edits (GeGLU, extra SiLU on the conv gate) help or hurt quality on the real model - compare on the phone.
+> * `engine-smoke-test.yml` is manual-only now (it can no longer run alongside the APK build).
+> * `build-apk.yml`: one extra non-fatal step ("Protect the runner agent ...") after the swap step; nothing else in that file changed.
+
 # Launch-crash fix (v1.5)
 
 ## What was wrong
