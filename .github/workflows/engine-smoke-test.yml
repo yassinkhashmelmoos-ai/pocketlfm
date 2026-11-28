@@ -7,21 +7,13 @@ name: Engine smoke test
 # EVERY launch of the app. A native abort cannot be caught or logged by the app, and it was only discovered after the
 # multi-hour APK build, on a phone. This catches that class of bug in a few minutes. It is independent of build-apk.yml.
 #
+# MANUAL ONLY (Actions tab -> Engine smoke test -> Run workflow): it is deliberately not triggered by pushes, so it can never run
+# at the same time as the APK build. Run it after you edit anything under lfm25/app/src/main/cpp.
+#
 # Run it locally:  pip install gguf numpy && bash lfm25/tools/engine-smoke-test/run.sh
 
 on:
-  push:
-    branches: [ main, master ]
-    paths:
-      - 'lfm25/app/src/main/cpp/**'
-      - 'lfm25/tools/engine-smoke-test/**'
-      - '.github/workflows/engine-smoke-test.yml'
-  pull_request:
-    paths:
-      - 'lfm25/app/src/main/cpp/**'
-      - 'lfm25/tools/engine-smoke-test/**'
-      - '.github/workflows/engine-smoke-test.yml'
-  workflow_dispatch:
+  workflow_dispatch:      # manual only: Actions tab -> Engine smoke test -> Run workflow
 
 jobs:
   smoke:

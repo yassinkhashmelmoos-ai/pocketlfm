@@ -77,6 +77,24 @@ jobs:
           free -h
           
 
+      - name: Protect the runner agent from memory / CPU starvation (non-fatal)
+        continue-on-error: true
+        run: |
+          # "The hosted runner lost communication with the server" = the runner agent was starved of CPU / RAM (or killed by the
+          # kernel's OOM killer) while a heavy step - model export, quantization - used everything. Make the agent the LAST thing
+          # the OOM killer picks and the FIRST thing the scheduler serves, so a hungry step fails WITH A LOG instead of the whole
+          # job vanishing. Best effort: it changes nothing any step computes, and a problem in here never fails the job.
+          PIDS=$(pgrep -f 'Runner\.Listener|Runner\.Worker|hosted-compute-agent|runner/provisioner' || true)
+          for p in $PIDS; do
+            echo -1000 | sudo tee "/proc/$p/oom_score_adj" > /dev/null || true
+            for t in /proc/$p/task/*; do
+              sudo renice -n -15 -p "$(basename "$t")" > /dev/null 2>&1 || true
+              sudo ionice -c 2 -n 0 -p "$(basename "$t")" > /dev/null 2>&1 || true
+            done
+          done
+          echo "protected processes:"
+          for p in $PIDS; do printf '  %s  oom_score_adj=%s  %s\n' "$p" "$(cat /proc/$p/oom_score_adj 2>/dev/null)" "$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | cut -c1-90)"; done
+          free -m
       - name: Checkout code
         uses: actions/checkout@v4
 
