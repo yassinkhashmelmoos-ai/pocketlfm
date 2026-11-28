@@ -13,6 +13,7 @@
 
 #include "llama.h"
 #include "load_profile.h"
+#include "thunder_variant.h"
 
 #define LOG_TAG "ThunderAGI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -242,6 +243,11 @@ static int load_model_locked(const std::string& path, int profile) {
     profile = std::min(std::max(profile, 0), 2);
     trace_line(g_trace_path, "load begin profile=%d", profile);
     LOGI("Loading: %s (profile %d)", path.c_str(), profile);
+
+    // Which LFM2 graph to build (models/lfm2.cpp): the project's edits for the normal profile, stock upstream for the
+    // safe-mode profiles - so if the edited graph ever kills a launch, the next start (profile 1) cannot hit it again.
+    thunder_lfm2_variant() = (profile == 0) ? THUNDER_LFM2_EDITS_DEFAULT : 0;
+    trace_line(g_trace_path, "graph variant=%d", thunder_lfm2_variant());
 
     llama_backend_init();
     trace_line(g_trace_path, "backend ready");
